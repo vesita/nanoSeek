@@ -1,7 +1,0 @@
-# evaluate the base gpt2
-# n_layer=12, n_head=12, n_embd=768, 124M params
-batch_size: 8
-eval_iters: 500   # 用更多 iter 让评估更准确
-eval_only: true
-wandb_log: false
-init_from: gpt2

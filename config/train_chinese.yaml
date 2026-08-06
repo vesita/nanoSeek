@@ -1,0 +1,30 @@
+# 中文配置：small 模型（~0.9M 参数）在《西游记》上训练
+# 与 train_shakespeare_char.yaml 超参一致，仅数据集换成中文。
+# 词表大小 ~4507（由 data/chinese/meta.pkl 自动读取，无需手写）。
+# 提示：中文 token 随机预测的初始 loss ≈ ln(4507) ≈ 8.4，
+#       远高于英文 65 词表的 ~4.2，这是正常现象。
+out_dir: out/chinese
+eval_interval: 250
+eval_iters: 200
+log_interval: 10
+always_save_checkpoint: false
+wandb_log: false
+wandb_project: chinese
+wandb_run_name: mini-gpt
+dataset: chinese
+gradient_accumulation_steps: 1
+batch_size: 64
+block_size: 256
+
+# small 模型（默认配置）
+n_layer: 4
+n_head: 4
+n_embd: 128
+dropout: 0.2
+
+learning_rate: 0.001
+max_iters: 5000
+lr_decay_iters: 5000
+min_lr: 0.0001
+beta2: 0.99
+warmup_iters: 100

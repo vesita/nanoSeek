@@ -19,7 +19,7 @@ nanoGPT 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 
 **YAML 配置系统**（替代原版 exec Python 配置）：
 - 实验配置放 `config/*.yaml`，由 `config_loader.py` 加载
-- 命令行覆盖：`python train.py config/xxx.yaml --n_layer=4`
+- 命令行覆盖：`uv run python train.py config/xxx.yaml --n_layer=4`
 - 配置值带类型检查，写错类型直接报错（比如 YAML 里 `1e-3` 会被解析成字符串，会立即被拦下）
 
 **默认 small 模型**：4 层 / 128 维 / 256 上下文 ≈ **0.83M 参数**，RTX 5060 上约 1 分钟一轮训练，适合快速迭代实验。
@@ -54,49 +54,53 @@ nanoGPT/
 ├── bench.py          # 性能基准
 ├── config_loader.py  # YAML 配置加载器（替代原 configurator）
 ├── config/           # 实验配置（YAML）
-│   ├── train_shakespeare_char.yaml     # 基线：原始 GPT-2 结构
-│   ├── train_shakespeare_modern.yaml   # modern：三件套全开
-│   ├── finetune_shakespeare.yaml       # 微调 GPT-2
-│   └── train_gpt2.yaml / eval_gpt2*.yaml   # 复现 GPT-2
+│   ├── train_shakespeare_char.yaml     # 基线：英文 small（原始 GPT-2 结构，65 词表）
+│   └── train_chinese.yaml              # 中文 small（西游记，4507 词表）
 ├── scripts/
 │   └── smoke_test.py # 冒烟测试
 ├── data/             # 数据集与预处理脚本
 └── out/              # 训练输出（git 忽略）
     ├── shakespeare-char/
-    └── shakespeare-char-modern/
+    └── chinese/
 ```
 
 ---
 
-## 快速开始：跑一次 A/B 实验
+## 快速开始
 
-以字符级莎士比亚为例，对比「原始 GPT-2」和「modern 三件套」两种架构：
+项目只有两个实验配置：**英文 small 基线**（做架构对比用，快）和**中文 small**（最终目标）。
 
 **① 准备数据**（一次性）
 
 ```sh
-uv run python data/shakespeare_char/prepare.py
+uv run python data/shakespeare_char/prepare.py   # 英文：65 词表，约 100 万 token
+uv run python data/chinese/prepare.py            # 中文《西游记》：4507 词表，约 68 万 token
 ```
 
-生成 `train.bin` / `val.bin`（65 个字符的 vocab，约 100 万 token）。
+**② 训练中文模型**
 
-**② 训练基线**
+```sh
+uv run python train.py config/train_chinese.yaml
+```
+
+约 5-10 分钟跑完（5000 步）。**注意**：中文初始 loss ≈ 8.4，不是英文的 ~4.2——那是 `ln(4507)` 词表难度的正常值，跨数据集比 loss 没有意义。
+
+**③ 采样看效果**
+
+```sh
+uv run python sample.py --out_dir=out/chinese --start="悟空" --num_samples=3 --max_new_tokens=300
+```
+
+**④ 架构 A/B（在英文基线上做）**
+
+对比「原始 GPT-2」和「modern 三件套」，用英文基线跑：速度快、loss 低、好比较。modern 用命令行覆盖开关即可，无需新建配置：
 
 ```sh
 uv run python train.py config/train_shakespeare_char.yaml
+uv run python train.py config/train_shakespeare_char.yaml --out_dir=out/shakespeare-char-modern --use_rmsnorm=true --use_rope=true --use_swiglu=true
 ```
 
-**③ 训练 modern**
-
-```sh
-uv run python train.py config/train_shakespeare_modern.yaml
-```
-
-两个配置超参完全一致，只是 modern 多了三个开关。各约 1 分钟跑完。
-
-**④ 对比结果**
-
-关键看训练途中出现的 **best val loss**（小数据集上模型会过拟合，最终 loss 会反弹，所以别比最后一轮）：
+各约 1 分钟。关键看训练途中出现的 **best val loss**（小数据集上模型会过拟合，最终 loss 会反弹，别比最后一轮）：
 
 ```sh
 uv run python -c "
@@ -107,17 +111,10 @@ for d in ['out/shakespeare-char', 'out/shakespeare-char-modern']:
 "
 ```
 
-**⑤ 采样对比生成质量**
+**⑤ 提交实验**（每个实验一个 commit，方便回退）
 
 ```sh
-uv run python sample.py --out_dir=out/shakespeare-char
-uv run python sample.py --out_dir=out/shakespeare-char-modern
-```
-
-**⑥ 提交这个实验**（每个实验一个 commit，方便回退）
-
-```sh
-git add -A && git commit -m "实验：shakespeare small 基线 vs modern 对比"
+git add -A && git commit -m "实验：..."
 ```
 
 ---
@@ -127,18 +124,16 @@ git add -A && git commit -m "实验：shakespeare small 基线 vs modern 对比"
 配置文件是 YAML，键对应 `train.py` 里的全局变量：
 
 ```yaml
-# config/train_shakespeare_modern.yaml
-out_dir: out/shakespeare-char-modern
+# config/train_chinese.yaml
+out_dir: out/chinese
+dataset: chinese
 n_layer: 4
 n_head: 4
 n_embd: 128
-use_rmsnorm: true    # ← modern 开关
-use_rope: true
-use_swiglu: true
 learning_rate: 0.001
 ```
 
-- **命令行覆盖**：`--key=value`，值和 `train.py` 默认值类型必须一致
+- **命令行覆盖**：`--key=value`，值和 `train.py` 默认值类型必须一致。布尔/浮点也能覆盖，比如 `--use_rmsnorm=true --use_rope=true --use_swiglu=true` 就相当于原来的 modern 配置
 - **类型检查**：YAML 里的值会和 `train.py` 全局变量比对类型，不一致立刻报错。比如 PyYAML 把 `1e-3` 解析成字符串，这种坑会被当场抓住
 - **浮点写法注意**：YAML 里写浮点记得带小数点（`0.001` 而不是 `1e-3`），否则会被解析成字符串
 

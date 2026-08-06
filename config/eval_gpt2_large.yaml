@@ -1,7 +1,0 @@
-# evaluate gpt2-large
-# n_layer=36, n_head=20, n_embd=1280, 774M params
-batch_size: 8
-eval_iters: 500
-eval_only: true
-wandb_log: false
-init_from: gpt2-large

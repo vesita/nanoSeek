@@ -31,29 +31,30 @@ from model import GPTConfig, GPT
 from config_loader import load_config
 
 # -----------------------------------------------------------------------------
-# 默认配置，用于在 OpenWebText 上训练一个 gpt2（124M 参数）
+# 默认配置：small 模型在字符级莎士比亚上训练（与 config/train_shakespeare_char.yaml 一致）。
+# 推荐通过 config/*.yaml 覆盖运行，这里只是不带配置裸跑时的兜底默认。
 # I/O
 out_dir = 'out'
-eval_interval = 2000
-log_interval = 1
+eval_interval = 250
+log_interval = 10
 eval_iters = 200
 eval_only = False # 如果为 True，脚本在第一次评估后立即退出
-always_save_checkpoint = True # 如果为 True，每次评估后总是保存 checkpoint
+always_save_checkpoint = False # 如果为 True，每次评估后总是保存 checkpoint；否则只在 val 变优时保存
 init_from = 'scratch' # 'scratch' 或 'resume' 或 'gpt2*'
 # wandb 日志记录
 wandb_log = False # 默认禁用
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_project = 'shakespeare-char'
+wandb_run_name = 'mini-gpt' # 'run' + str(time.time())
 # 数据
-dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # 用于模拟更大的 batch size
-batch_size = 12 # 如果 gradient_accumulation_steps > 1，这是微批（micro-batch）大小
-block_size = 1024
-# 模型
-n_layer = 12
-n_head = 12
-n_embd = 768
-dropout = 0.0 # 预训练时 0 就很好，微调时可以试试 0.1+
+dataset = 'shakespeare_char'
+gradient_accumulation_steps = 1 # 用于模拟更大的 batch size
+batch_size = 64 # 如果 gradient_accumulation_steps > 1，这是微批（micro-batch）大小
+block_size = 256
+# 模型（small）
+n_layer = 4
+n_head = 4
+n_embd = 128
+dropout = 0.2 # 预训练时 0 就很好，微调时可以试试 0.1+
 bias = False # 是否在 LayerNorm 和 Linear 层内部使用 bias？
 # --- 现代化架构开关（DeepSeek / LLaMA 风格），默认关闭 = 原始 GPT-2 ---
 use_rmsnorm = False # 用 RMSNorm 替代 LayerNorm
@@ -61,17 +62,17 @@ use_rope = False    # 用 RoPE 替代可学习的位置嵌入
 use_swiglu = False  # 用 SwiGLU 替代 GELU MLP
 rope_theta = 10000.0 # RoPE 基础频率
 # adamw 优化器
-learning_rate = 6e-4 # 最大学习率
-max_iters = 600000 # 训练总迭代次数
+learning_rate = 1e-3 # 最大学习率
+max_iters = 5000 # 训练总迭代次数
 weight_decay = 1e-1
 beta1 = 0.9
-beta2 = 0.95
+beta2 = 0.99
 grad_clip = 1.0 # 在此值处裁剪梯度，若为 0.0 则禁用
 # 学习率衰减设置
 decay_lr = True # 是否衰减学习率
-warmup_iters = 2000 # 预热多少步
-lr_decay_iters = 600000 # 根据 Chinchilla 论文，应约等于 max_iters
-min_lr = 6e-5 # 最小学习率，根据 Chinchilla 论文应约等于 learning_rate/10
+warmup_iters = 100 # 预热多少步
+lr_decay_iters = 5000 # 根据 Chinchilla 论文，应约等于 max_iters
+min_lr = 1e-4 # 最小学习率，根据 Chinchilla 论文应约等于 learning_rate/10
 # DDP 设置
 backend = 'nccl' # 'nccl'、'gloo' 等
 # 系统

@@ -1,7 +1,0 @@
-# evaluate gpt2-xl
-# n_layer=48, n_head=25, n_embd=1600, 1558M params
-batch_size: 8
-eval_iters: 500
-eval_only: true
-wandb_log: false
-init_from: gpt2-xl
