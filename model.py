@@ -393,16 +393,11 @@ class GPT(nn.Module):
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"参与衰减的参数张量数量: {len(decay_params)}, 共 {num_decay_params:,} 个参数")
-        print(f"不参与衰减的参数张量数量: {len(nodecay_params)}, 共 {num_nodecay_params:,} 个参数")
         # 创建 AdamW 优化器，如果可用就使用 fused 版本
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"正在使用 fused AdamW: {use_fused}")
 
         return optimizer
 

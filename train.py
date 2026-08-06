@@ -24,6 +24,7 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+from tqdm import tqdm
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -106,7 +107,6 @@ else:
     seed_offset = 0
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"每次迭代的 token 数将是: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -148,7 +148,6 @@ if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
-    print(f"找到 vocab_size = {meta_vocab_size}（位于 {meta_path}）")
 
 # 模型初始化
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
@@ -156,7 +155,6 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_rmsnorm=use_rmsnorm, use_rope=use_rope, use_swiglu=use_swiglu, rope_theta=rope_theta)
 if init_from == 'scratch':
     # 从零初始化一个新模型
-    print("正在从零初始化一个新模型")
     # 确定从零训练时使用的 vocab size
     if meta_vocab_size is None:
         print("默认把 GPT-2 的 vocab_size 设为 50304（50257 向上取整以提高效率）")
@@ -205,7 +203,7 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # 初始化 GradScaler。如果 enabled=False，scaler 是空操作
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
 
 # 优化器
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -213,9 +211,29 @@ if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # 释放内存
 
+# 打印训练启动摘要：把散落的启动日志收敛成一个信息框，再进入 tqdm 进度条
+def print_summary():
+    modern = " + ".join(name for name, on in
+                        [("RMSNorm", use_rmsnorm), ("RoPE", use_rope), ("SwiGLU", use_swiglu)] if on)
+    border = "─" * 46
+    print()
+    print(border)
+    print("  训练摘要")
+    print(border)
+    print(f"  数据集    {dataset} · {model.config.vocab_size} 词表 · 上下文 {block_size}")
+    print(f"  模型      {n_layer} 层 · {n_head} 头 · {n_embd} 维" + (f" · {modern}" if modern else ""))
+    print(f"  优化器    AdamW · lr {learning_rate:g} · wd {weight_decay:g} · betas ({beta1:g}, {beta2:g})")
+    print(f"  训练      {max_iters} 步 · batch {batch_size} · {tokens_per_iter:,} tokens/步")
+    print(f"  设备      {device} · {dtype} · compile {'开' if compile else '关'}")
+    print(border)
+    print()
+
+if master_process:
+    print_summary()
+
 # 编译模型
 if compile:
-    print("正在编译模型……（大约需要一分钟）")
+    print("正在编译模型……这一步比较耗时，请耐心等待")
     unoptimized_model = model
     model = torch.compile(model) # 需要 PyTorch 2.0
 
@@ -264,6 +282,8 @@ t0 = time.time()
 local_iter_num = 0 # 本进程生命周期内的迭代次数
 raw_model = model.module if ddp else model # 如果需要，解开 DDP 容器
 running_mfu = -1.0
+# tqdm 进度条：DDP 下只有主进程显示
+pbar = tqdm(total=max_iters, initial=iter_num, desc="训练中", dynamic_ncols=True) if master_process else None
 while True:
 
     # 确定并设置本次迭代的学习率
@@ -274,7 +294,8 @@ while True:
     # 在 train/val 集合上评估损失并保存 checkpoint
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train 损失 {losses['train']:.4f}, val 损失 {losses['val']:.4f}")
+        # 用 pbar.write 打印到进度条上方，不打断进度条
+        pbar.write(f"step {iter_num}: train 损失 {losses['train']:.4f}, val 损失 {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -294,7 +315,7 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                print(f"正在把 checkpoint 保存到 {out_dir}")
+                pbar.write(f"✓ 已保存 checkpoint 到 {out_dir}（best_val_loss {best_val_loss:.4f}）")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
@@ -325,7 +346,7 @@ while True:
     # 尽快清空梯度，不再需要这块内存
     optimizer.zero_grad(set_to_none=True)
 
-    # 计时与日志
+    # 计时与日志：更新 tqdm 进度条
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
@@ -336,13 +357,17 @@ while True:
         if local_iter_num >= 5: # 让训练循环先稳定一下
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"迭代 {iter_num}: 损失 {lossf:.4f}, 耗时 {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        pbar.set_postfix(损失=f"{lossf:.4f}", MFU=f"{running_mfu*100:.1f}%")
     iter_num += 1
     local_iter_num += 1
+    if pbar is not None:
+        pbar.update(1)
 
     # 终止条件
     if iter_num > max_iters:
         break
 
+if pbar is not None:
+    pbar.close()
 if ddp:
     destroy_process_group()

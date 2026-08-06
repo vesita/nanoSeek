@@ -27,8 +27,7 @@ def load_config(g):
     if config_file is not None:
         with open(config_file) as f:
             data = yaml.safe_load(f) or {}
-        print(f"Overriding config with {config_file}:")
-        print(yaml.safe_dump(data, default_flow_style=False, sort_keys=False).rstrip())
+        print(f"已加载配置 {config_file}")
         for k, v in data.items():
             if k in g:
                 # 类型必须一致，避免 yaml 里的 '2' 把 int 全局变量悄悄变成 str 之类的问题
@@ -51,11 +50,15 @@ def load_config(g):
             key = key[2:]
             if key not in g:
                 raise ValueError(f"Unknown config key: {key}")
-            try:
-                attempt = literal_eval(val)
-            except (SyntaxError, ValueError):
-                # 解析不了就当成字符串
-                attempt = val
+            if val.lower() in ('true', 'false'):
+                # 'true'/'false' 是 YAML 常用写法，但 literal_eval 只认 Python 的 True/False
+                attempt = val.lower() == 'true'
+            else:
+                try:
+                    attempt = literal_eval(val)
+                except (SyntaxError, ValueError):
+                    # 解析不了就当成字符串
+                    attempt = val
             if type(attempt) is not type(g[key]):
                 raise TypeError(
                     f"命令行覆盖 '{key}={val}' 类型是 {type(attempt).__name__}, "
