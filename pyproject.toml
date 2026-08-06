@@ -13,6 +13,8 @@ dependencies = [
     "tiktoken",
     "tqdm",
     "requests",
+    "datasets>=5.0.1",
+    "pyyaml>=6.0.3",
 ]
 
 [build-system]

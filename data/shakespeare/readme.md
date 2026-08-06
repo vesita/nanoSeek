@@ -1,9 +1,9 @@
 
 # tiny shakespeare
 
-Tiny shakespeare, of the good old char-rnn fame :)
+经典的 char-rnn 同款 tiny shakespeare :)
 
-After running `prepare.py`:
+运行 `prepare.py` 之后：
 
-- train.bin has 301,966 tokens
-- val.bin has 36,059 tokens
+- train.bin 有 301,966 个 token
+- val.bin 有 36,059 个 token

@@ -33,17 +33,17 @@ orig = make_model()
 # modern 结构（三个开关全开）
 modern = make_model(use_rmsnorm=True, use_rope=True, use_swiglu=True)
 
-print(f"original params: {count_params(orig):>8,}  (non-embedding {orig.get_num_params():,})")
-print(f"modern   params: {count_params(modern):>8,}  (non-embedding {modern.get_num_params():,})")
+print(f"原始参数量: {count_params(orig):>8,}  （非嵌入参数 {orig.get_num_params():,}）")
+print(f"现代参数量: {count_params(modern):>8,}  （非嵌入参数 {modern.get_num_params():,}）")
 
 x = torch.randint(0, 65, (4, 64))
 y = torch.randint(0, 65, (4, 64))
 
-for name, model in [("original", orig), ("modern", modern)]:
+for name, model in [("原始", orig), ("现代", modern)]:
     logits, loss = model(x, y)
     loss.backward()
     # 检查所有梯度都没有 NaN（常见 bug：位置编码维度对不上 / 广播错位）
     nan_free = all(not torch.isnan(p.grad).any() for p in model.parameters() if p.grad is not None)
-    print(f"{name:>8}: logits {tuple(logits.shape)}, loss {loss.item():.4f}, gradients NaN-free = {nan_free}")
+    print(f"{name:>8}: logits {tuple(logits.shape)}, 损失 {loss.item():.4f}, 梯度无 NaN = {nan_free}")
 
-print("\nSMOKE TEST PASSED ✅")
+print("\n冒烟测试通过 ✅")

@@ -1,0 +1,7 @@
+# evaluate gpt2-medium
+# n_layer=24, n_head=16, n_embd=1024, 350M params
+batch_size: 8
+eval_iters: 500
+eval_only: true
+wandb_log: false
+init_from: gpt2-medium

@@ -1,9 +1,9 @@
 
-# tiny shakespeare, character-level
+# tiny shakespeare，字符级
 
-Tiny shakespeare, of the good old char-rnn fame :) Treated on character-level.
+经典的 char-rnn 同款 tiny shakespeare :) 按字符级处理。
 
-After running `prepare.py`:
+运行 `prepare.py` 之后：
 
-- train.bin has 1,003,854 tokens
-- val.bin has 111,540 tokens
+- train.bin 有 1,003,854 个 token
+- val.bin 有 111,540 个 token

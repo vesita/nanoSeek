@@ -1,15 +1,15 @@
 
-## openwebtext dataset
+## openwebtext 数据集
 
-after running `prepare.py` (preprocess) we get:
+运行 `prepare.py`（预处理）之后，我们会得到：
 
-- train.bin is ~17GB, val.bin ~8.5MB
-- train has ~9B tokens (9,035,582,198)
-- val has ~4M tokens (4,434,897)
+- train.bin 约 17GB，val.bin 约 8.5MB
+- train 有约 90 亿个 token（9,035,582,198）
+- val 有约 400 万个 token（4,434,897）
 
-this came from 8,013,769 documents in total.
+总共来自 8,013,769 个文档。
 
-references:
+参考：
 
-- OpenAI's WebText dataset is discussed in [GPT-2 paper](https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf)
-- [OpenWebText](https://skylion007.github.io/OpenWebTextCorpus/) dataset
+- OpenAI 的 WebText 数据集在 [GPT-2 论文](https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) 中有讨论
+- [OpenWebText](https://skylion007.github.io/OpenWebTextCorpus/) 数据集

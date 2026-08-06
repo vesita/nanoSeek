@@ -1,0 +1,22 @@
+# 用 GPT-2 预训练权重微调 shakespeare
+out_dir: out/shakespeare
+eval_interval: 5
+eval_iters: 40
+wandb_log: false # 想开就开
+wandb_project: shakespeare
+wandb_run_name: ft-shakespeare   # 原 Python 配置用 time.time() 动态生成，YAML 写不了表达式，改为固定名
+dataset: shakespeare
+init_from: gpt2-xl               # 最大的 GPT-2 模型
+
+# 只在 val loss 改善时存 checkpoint
+always_save_checkpoint: false
+
+# 每 iter 的 token 数：1 batch * 32 gradaccum * 1024 tokens = 32,768
+# shakespeare 有 301,966 tokens，1 epoch 约 9.2 iters
+batch_size: 1
+gradient_accumulation_steps: 32
+max_iters: 20
+
+# 固定学习率微调
+learning_rate: 0.00003
+decay_lr: false

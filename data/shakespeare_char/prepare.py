@@ -1,15 +1,15 @@
 """
-Prepare the Shakespeare dataset for character-level language modeling.
-So instead of encoding with GPT-2 BPE tokens, we just map characters to ints.
-Will save train.bin, val.bin containing the ids, and meta.pkl containing the
-encoder and decoder and some other related info.
+为字符级语言建模准备莎士比亚数据集。
+所以不是用 GPT-2 BPE token 编码，而是直接把字符映射成整数。
+会保存包含 id 的 train.bin、val.bin，以及包含编码器、解码器和
+一些其它相关信息的 meta.pkl。
 """
 import os
 import pickle
 import requests
 import numpy as np
 
-# download the tiny shakespeare dataset
+# 下载 tiny shakespeare 数据集
 input_file_path = os.path.join(os.path.dirname(__file__), 'input.txt')
 if not os.path.exists(input_file_path):
     data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
@@ -18,40 +18,40 @@ if not os.path.exists(input_file_path):
 
 with open(input_file_path, 'r') as f:
     data = f.read()
-print(f"length of dataset in characters: {len(data):,}")
+print(f"数据集字符长度: {len(data):,}")
 
-# get all the unique characters that occur in this text
+# 获取这段文本中出现的所有不重复字符
 chars = sorted(list(set(data)))
 vocab_size = len(chars)
-print("all the unique characters:", ''.join(chars))
-print(f"vocab size: {vocab_size:,}")
+print("所有不重复字符:", ''.join(chars))
+print(f"词汇表大小: {vocab_size:,}")
 
-# create a mapping from characters to integers
+# 创建从字符到整数的映射
 stoi = { ch:i for i,ch in enumerate(chars) }
 itos = { i:ch for i,ch in enumerate(chars) }
 def encode(s):
-    return [stoi[c] for c in s] # encoder: take a string, output a list of integers
+    return [stoi[c] for c in s] # 编码器：输入字符串，输出整数列表
 def decode(l):
-    return ''.join([itos[i] for i in l]) # decoder: take a list of integers, output a string
+    return ''.join([itos[i] for i in l]) # 解码器：输入整数列表，输出字符串
 
-# create the train and test splits
+# 创建训练和测试划分
 n = len(data)
 train_data = data[:int(n*0.9)]
 val_data = data[int(n*0.9):]
 
-# encode both to integers
+# 把两者都编码成整数
 train_ids = encode(train_data)
 val_ids = encode(val_data)
-print(f"train has {len(train_ids):,} tokens")
-print(f"val has {len(val_ids):,} tokens")
+print(f"train 有 {len(train_ids):,} 个 token")
+print(f"val 有 {len(val_ids):,} 个 token")
 
-# export to bin files
+# 导出到 bin 文件
 train_ids = np.array(train_ids, dtype=np.uint16)
 val_ids = np.array(val_ids, dtype=np.uint16)
 train_ids.tofile(os.path.join(os.path.dirname(__file__), 'train.bin'))
 val_ids.tofile(os.path.join(os.path.dirname(__file__), 'val.bin'))
 
-# save the meta information as well, to help us encode/decode later
+# 同时保存 meta 信息，方便之后编码/解码
 meta = {
     'vocab_size': vocab_size,
     'itos': itos,
@@ -60,9 +60,9 @@ meta = {
 with open(os.path.join(os.path.dirname(__file__), 'meta.pkl'), 'wb') as f:
     pickle.dump(meta, f)
 
-# length of dataset in characters:  1115394
-# all the unique characters:
+# 数据集字符长度:  1115394
+# 所有不重复字符:
 #  !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
-# vocab size: 65
-# train has 1003854 tokens
-# val has 111540 tokens
+# 词汇表大小: 65
+# train 有 1003854 个 token
+# val 有 111540 个 token
