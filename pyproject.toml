@@ -1,0 +1,25 @@
+[project]
+name = "nanogpt"
+version = "0.1.0"
+description = "nanoGPT clone for learning deep learning"
+readme = "README.md"
+authors = [
+    { name = "vesita", email = "vesita164872@outlook.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "numpy",
+    "tiktoken",
+    "tqdm",
+    "requests",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+# 本项目是"应用"而不是"包"：所有脚本以扁平模块形式运行（from model import ...），
+# 不需要构建安装 src 包。package=false 让 uv 跳过构建步骤。
+[tool.uv]
+package = false
