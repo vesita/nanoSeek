@@ -1,0 +1,13 @@
+[package]
+name = "nanogpt-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "nanoGPT 对话推理运行时：用 Rust/candle 加载训练好的模型做对话式生成"
+
+[dependencies]
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+rand = "0.10.2"

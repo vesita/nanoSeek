@@ -62,6 +62,17 @@ use_rmsnorm = False # 用 RMSNorm 替代 LayerNorm
 use_rope = False    # 用 RoPE 替代可学习的位置嵌入
 use_swiglu = False  # 用 SwiGLU 替代 GELU MLP
 rope_theta = 10000.0 # RoPE 基础频率
+# --- DeepSeek 三大核心（MoE / MLA / MTP），默认关闭，可任意组合 ---
+use_moe = False        # 混合专家：MoE 替换 FFN
+n_experts = 8          # 专家总数
+n_top_k = 2            # 每个 token 激活的专家数
+moe_aux_weight = 0.01  # 负载均衡辅助损失权重
+use_mla = False        # 多头潜在注意力：低秩压缩 KV
+kv_lora_rank = 64      # KV 压缩后的潜在维度
+qk_rope_head_dim = 16  # 每头参与 RoPE 的维数
+use_mtp = False        # 多 token 预测
+n_mtp = 1              # 额外预测的 token 数
+mtp_weight = 1.0       # MTP 损失权重
 # adamw 优化器
 learning_rate = 1e-3 # 最大学习率
 max_iters = 5000 # 训练总迭代次数
@@ -152,7 +163,10 @@ if os.path.exists(meta_path):
 # 模型初始化
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,
-                  use_rmsnorm=use_rmsnorm, use_rope=use_rope, use_swiglu=use_swiglu, rope_theta=rope_theta)
+                  use_rmsnorm=use_rmsnorm, use_rope=use_rope, use_swiglu=use_swiglu, rope_theta=rope_theta,
+                  use_moe=use_moe, n_experts=n_experts, n_top_k=n_top_k, moe_aux_weight=moe_aux_weight,
+                  use_mla=use_mla, kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim,
+                  use_mtp=use_mtp, n_mtp=n_mtp, mtp_weight=mtp_weight)
 if init_from == 'scratch':
     # 从零初始化一个新模型
     # 确定从零训练时使用的 vocab size
@@ -171,8 +185,11 @@ elif init_from == 'resume':
     # 其余属性（如 dropout）可以按命令行里的期望值保持不变
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
-    # modern 开关：老 checkpoint 里可能没这些键，用命令行/默认值兜底
-    for k in ['use_rmsnorm', 'use_rope', 'use_swiglu', 'rope_theta']:
+    # modern/DeepSeek 开关：老 checkpoint 里可能没这些键，用命令行/默认值兜底
+    for k in ['use_rmsnorm', 'use_rope', 'use_swiglu', 'rope_theta',
+              'use_moe', 'n_experts', 'n_top_k', 'moe_aux_weight',
+              'use_mla', 'kv_lora_rank', 'qk_rope_head_dim',
+              'use_mtp', 'n_mtp', 'mtp_weight']:
         model_args[k] = checkpoint_model_args.get(k, model_args[k])
     # 创建模型
     gptconf = GPTConfig(**model_args)
@@ -194,7 +211,10 @@ elif init_from.startswith('gpt2'):
     model = GPT.from_pretrained(init_from, override_args)
     # 读取创建出的配置参数，以便正确地把它们存进 checkpoint
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size',
-              'use_rmsnorm', 'use_rope', 'use_swiglu', 'rope_theta']:
+              'use_rmsnorm', 'use_rope', 'use_swiglu', 'rope_theta',
+              'use_moe', 'n_experts', 'n_top_k', 'moe_aux_weight',
+              'use_mla', 'kv_lora_rank', 'qk_rope_head_dim',
+              'use_mtp', 'n_mtp', 'mtp_weight']:
         model_args[k] = getattr(model.config, k)
 # 如果需要，用模型“手术”把 block size 裁剪下来
 if block_size < model.config.block_size:

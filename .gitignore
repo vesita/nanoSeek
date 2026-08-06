@@ -11,6 +11,14 @@ input.txt
 env/
 venv/
 
+target/
+
+# Rust 推理框架转换产物（由 runtime/scripts/convert.py 从 checkpoint 重新生成）
+runtime/model.safetensors
+runtime/model_config.json
+runtime/vocab.json
+runtime/Cargo.lock
+
 # 训练 checkpoint 输出目录
 out/
 

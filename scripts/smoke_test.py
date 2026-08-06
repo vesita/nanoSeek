@@ -1,6 +1,6 @@
 """
-快速冒烟测试：验证魔改后的 model.py 在「原始 GPT-2」和「modern(DeepSeek风格)」两种
-配置下都能正常前向传播 + 反向传播，并对比两者的参数量。
+快速冒烟测试：验证 model.py 的各种架构配置（原始 GPT-2 / modern 三件套 /
+MoE / MLA / MTP / 全开组合）都能正常前向传播 + 反向传播，并对比参数量。
 
 用法（从项目根目录）：
     uv run python scripts/smoke_test.py
@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, MoE
 
 
 def make_model(**overrides):
@@ -28,22 +28,38 @@ def count_params(model):
     return sum(p.numel() for p in model.parameters())
 
 
-# 原始 GPT-2 结构（默认三个开关全关）
-orig = make_model()
-# modern 结构（三个开关全开）
-modern = make_model(use_rmsnorm=True, use_rope=True, use_swiglu=True)
-
-print(f"原始参数量: {count_params(orig):>8,}  （非嵌入参数 {orig.get_num_params():,}）")
-print(f"现代参数量: {count_params(modern):>8,}  （非嵌入参数 {modern.get_num_params():,}）")
+# 各种架构的开关组合
+CASES = [
+    ("原始", {}),
+    ("现代", dict(use_rmsnorm=True, use_rope=True, use_swiglu=True)),
+    ("MoE", dict(use_rmsnorm=True, use_rope=True, use_swiglu=True,
+                 use_moe=True, n_experts=4, n_top_k=2)),
+    ("MLA", dict(use_rmsnorm=True, use_rope=True, use_swiglu=True,
+                 use_mla=True, kv_lora_rank=32, qk_rope_head_dim=8)),
+    ("MTP", dict(use_rmsnorm=True, use_rope=True, use_swiglu=True,
+                 use_mtp=True, n_mtp=1)),
+    ("全开", dict(use_rmsnorm=True, use_rope=True, use_swiglu=True,
+                 use_moe=True, n_experts=4, n_top_k=2,
+                 use_mla=True, kv_lora_rank=32, qk_rope_head_dim=8,
+                 use_mtp=True, n_mtp=1)),
+]
 
 x = torch.randint(0, 65, (4, 64))
 y = torch.randint(0, 65, (4, 64))
 
-for name, model in [("原始", orig), ("现代", modern)]:
+for name, overrides in CASES:
+    model = make_model(**overrides)
     logits, loss = model(x, y)
     loss.backward()
     # 检查所有梯度都没有 NaN（常见 bug：位置编码维度对不上 / 广播错位）
     nan_free = all(not torch.isnan(p.grad).any() for p in model.parameters() if p.grad is not None)
-    print(f"{name:>8}: logits {tuple(logits.shape)}, 损失 {loss.item():.4f}, 梯度无 NaN = {nan_free}")
+    print(f"{name:>4}: 参数 {count_params(model):>7,} | loss {loss.item():.4f} | 梯度无 NaN = {nan_free}")
+    assert nan_free, f"{name} 出现 NaN 梯度！"
+
+# 直接验证 MoE 的负载均衡辅助损失确实非零（会被加进总损失里）
+moe = MoE(GPTConfig(n_embd=64, n_experts=4, n_top_k=2))
+moe(torch.randn(4, 16, 64))
+print(f"MoE 辅助损失 = {moe.aux_loss.item():.4f}（应非零，随机路由器不可能恰好均匀）")
+assert moe.aux_loss.item() > 0
 
 print("\n冒烟测试通过 ✅")

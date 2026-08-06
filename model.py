@@ -95,6 +95,18 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.n_embd // config.n_head
         self.dropout = config.dropout
         self.use_rope = config.use_rope
+        # MLA（DeepSeek-V2）：Q 独立投影；KV 先压缩到低秩潜在、再展开成 K 和 V。
+        # RoPE 只作用于每个 head 的前 qk_rope_head_dim 维，其余是"无位置"的内容维。
+        self.use_mla = config.use_mla
+        self.rope_head_dim = config.qk_rope_head_dim if config.use_mla else (config.n_embd // config.n_head)
+        if config.use_mla:
+            assert config.qk_rope_head_dim % 2 == 0 and config.qk_rope_head_dim <= self.head_dim, \
+                "qk_rope_head_dim 需为偶数且不超过 head_dim"
+            self.q_proj  = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+            self.kv_down = nn.Linear(config.n_embd, config.kv_lora_rank, bias=config.bias)
+            self.kv_act  = nn.SiLU()
+            self.k_up    = nn.Linear(config.kv_lora_rank, config.n_embd, bias=config.bias)
+            self.v_up    = nn.Linear(config.kv_lora_rank, config.n_embd, bias=config.bias)
         # flash attention 能让 GPU 跑得飞快，但只在 PyTorch >= 2.0 才支持
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -104,23 +116,39 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
         # 用 RoPE 的话，预计算 cos/sin 表并注册成 buffer（随模型移动设备、进 checkpoint）
         if self.use_rope:
-            cos, sin = precompute_rope_freqs(self.head_dim, config.block_size, config.rope_theta)
-            self.register_buffer("cos", cos)  # (block_size, head_dim)
-            self.register_buffer("sin", sin)  # (block_size, head_dim)
+            # MLA 只旋转每头的前 qk_rope_head_dim 维，表长和 rope_head_dim 一致
+            cos, sin = precompute_rope_freqs(self.rope_head_dim, config.block_size, config.rope_theta)
+            self.register_buffer("cos", cos)  # (block_size, rope_head_dim)
+            self.register_buffer("sin", sin)
 
     def forward(self, x):
         B, T, C = x.size() # batch 大小、序列长度、嵌入维度 (n_embd)
 
-        # 在 batch 中计算所有 head 的 query、key、value，并把 head 维前移作为 batch 维
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        # 先 reshape 成 (B, T, nh, hs)：RoPE 要在 head 维还没被换到前面时作用
-        q = q.view(B, T, self.n_head, self.head_dim)
-        k = k.view(B, T, self.n_head, self.head_dim)
-        v = v.view(B, T, self.n_head, self.head_dim)
+        if self.use_mla:
+            # MLA 路径：Q 独立投影；KV 共享一个低秩潜在表示，再分别展开成 K 和 V
+            q = self.q_proj(x).view(B, T, self.n_head, self.head_dim)
+            kv_latent = self.kv_act(self.kv_down(x))          # (B, T, kv_lora_rank)
+            k = self.k_up(kv_latent).view(B, T, self.n_head, self.head_dim)
+            v = self.v_up(kv_latent).view(B, T, self.n_head, self.head_dim)
+            if self.use_rope:
+                # 部分 RoPE：每头只有前 rope_head_dim 维参与旋转，剩余是"无位置"内容维。
+                # 让模型自己决定每个 head 需要多少位置信息（都能从同一 low-rank 潜在表达还原）
+                q_rope, q_nope = q[..., :self.rope_head_dim], q[..., self.rope_head_dim:]
+                k_rope, k_nope = k[..., :self.rope_head_dim], k[..., self.rope_head_dim:]
+                q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, self.cos[:T], self.sin[:T])
+                q = torch.cat([q_rope, q_nope], dim=-1)
+                k = torch.cat([k_rope, k_nope], dim=-1)
+        else:
+            # 标准路径：在 batch 中计算所有 head 的 query、key、value，并把 head 维前移作为 batch 维
+            q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+            # 先 reshape 成 (B, T, nh, hs)：RoPE 要在 head 维还没被换到前面时作用
+            q = q.view(B, T, self.n_head, self.head_dim)
+            k = k.view(B, T, self.n_head, self.head_dim)
+            v = v.view(B, T, self.n_head, self.head_dim)
 
-        if self.use_rope:
-            # 旋转位置编码：只对 q 和 k 做（v 不旋转），这样 q·k 携带相对位置
-            q, k = apply_rotary_pos_emb(q, k, self.cos[:T], self.sin[:T])
+            if self.use_rope:
+                # 旋转位置编码：只对 q 和 k 做（v 不旋转），这样 q·k 携带相对位置
+                q, k = apply_rotary_pos_emb(q, k, self.cos[:T], self.sin[:T])
 
         # 把 head 维移到第 2 维：(B, nh, T, hs)
         q = q.transpose(1, 2)
@@ -183,6 +211,73 @@ class SwiGLU(nn.Module):
         x = self.dropout(x)
         return x
 
+class MoE(nn.Module):
+    """MoE：混合专家（DeepSeek-V3 的核心创新）。
+
+    关键思想：每个 token 只路由到 top-k 个专家（而不是所有专家都算一遍）。
+    于是参数量随专家数线性增长，但每个 token 的计算量保持不变——
+    这就是「用更多参数、同一份算力」换更强的模型。
+
+    还需要一个「负载均衡辅助损失」：迫使 token 均匀分布到各专家。
+    否则路由器会陷入"赢家通吃"，少数专家承担绝大部分计算，
+    其它专家几乎不被激活、学不到东西（类似专家"饿死"）。
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.n_experts = config.n_experts
+        self.n_top_k = config.n_top_k
+        self.moe_aux_weight = config.moe_aux_weight
+        # 路由器：给每个 token 在每个专家上打一个分
+        self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
+        # 专家：复用 SwiGLU/MLP，每个专家是一份完整的 FFN
+        ExpertType = SwiGLU if config.use_swiglu else MLP
+        self.experts = nn.ModuleList([ExpertType(config) for _ in range(config.n_experts)])
+        # 本次前向累积的辅助损失，forward 后由 GPT 取走并清零
+        self.aux_loss = torch.tensor(0.0)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        x_flat = x.view(-1, C)          # (B*T, C)，把 batch 和序列压平逐个 token 路由
+        N = x_flat.shape[0]
+
+        # 路由打分：softmax 得到每个 token 在每个专家上的概率
+        router_logits = self.router(x_flat)               # (N, n_experts)
+        router_probs = F.softmax(router_logits, dim=-1)   # (N, n_experts)
+
+        # 选 top-k 个专家，门控权重在选中的 k 个之间重新归一化
+        top_k_probs, top_k_indices = router_probs.topk(self.n_top_k, dim=-1)  # 各 (N, k)
+        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+
+        # 负载均衡辅助损失（Switch Transformer 论文的做法）：
+        #   f_i = 第 i 个专家实际接到的 token 比例
+        #   P_i = 路由器给第 i 个专家的平均概率
+        # 两者都高意味着该专家又热门又常被选，均衡时 sum(f_i * P_i) 取最小
+        one_hot = F.one_hot(top_k_indices, self.n_experts).float()   # (N, k, n_experts)
+        f_i = one_hot.sum(dim=(0, 1)) / (N * self.n_top_k)           # (n_experts,)
+        P_i = router_probs.mean(dim=0)                               # (n_experts,)
+        self.aux_loss = self.moe_aux_weight * self.n_experts * (f_i * P_i).sum()
+
+        # 逐个专家计算：把路由到它的 token 收集起来算 FFN，再按门控权重放回原处
+        output = x_flat.new_zeros(N, C)
+        for i in range(self.n_experts):
+            expert_mask = (top_k_indices == i)             # (N, k) 该专家被选中的位置
+            token_ids, slot_ids = expert_mask.nonzero(as_tuple=True)
+            if token_ids.numel() == 0:
+                continue
+            weights = top_k_probs[token_ids, slot_ids]     # 这些 token 在该专家上的门控权重
+            expert_in = x_flat[token_ids]                  # (num, C)
+            expert_out = self.experts[i](expert_in)        # (num, C)
+            output[token_ids] += expert_out * weights.unsqueeze(-1)
+
+        return output.view(B, T, C)
+
+    def get_aux_loss(self):
+        """取出本次前向累积的辅助损失并清零。"""
+        loss = self.aux_loss
+        self.aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+        return loss
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -191,13 +286,43 @@ class Block(nn.Module):
         self.ln_1 = RMSNorm(config.n_embd) if config.use_rmsnorm else LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd) if config.use_rmsnorm else LayerNorm(config.n_embd, bias=config.bias)
-        # 前馈：SwiGLU（modern）或标准 GELU MLP（原始 GPT-2）
-        self.mlp = SwiGLU(config) if config.use_swiglu else MLP(config)
+        # 前馈：MoE > SwiGLU > 标准 GELU MLP（优先级由配置开关决定）
+        self.mlp = MoE(config) if config.use_moe else (SwiGLU(config) if config.use_swiglu else MLP(config))
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+
+    def get_moe_aux_loss(self):
+        """如果本块是 MoE，返回其辅助损失；否则返回 None（GPT 据此累加）。"""
+        if isinstance(self.mlp, MoE):
+            return self.mlp.get_aux_loss()
+        return None
+
+class MTPModule(nn.Module):
+    """MTP：多 token 预测模块（DeepSeek-V3 核心）。
+
+    普通 GPT 在位置 t 只预测 t+1；MTP 额外提供一个模块，用
+    「位置 t 的隐藏状态 + 目标 token t+1 的嵌入」去预测 t+2。
+    推理时这些模块不参与（生成没有 targets），训练信号却成倍增强——
+    相当于几乎白赚一个"下一步预演"任务。
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.emb_proj    = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.norm = RMSNorm(config.n_embd) if config.use_rmsnorm else LayerNorm(config.n_embd, bias=config.bias)
+        # 复用单层 Block 做特征融合（内部是因果 attention，正好合适）
+        self.block = Block(config)
+
+    def forward(self, hidden, next_emb):
+        # hidden:  (B, T, n_embd) 主模型在位置 t 的隐藏状态
+        # next_emb: (B, T, n_embd) 目标 token t+1 的嵌入（提前剧透下一步）
+        h = self.hidden_proj(hidden) + self.emb_proj(next_emb)
+        h = self.norm(h)
+        return self.block(h)
 
 @dataclass
 class GPTConfig:
@@ -213,6 +338,19 @@ class GPTConfig:
     use_rope: bool = False      # RoPE 替换可学习位置编码 wpe
     use_swiglu: bool = False    # SwiGLU 替换 GELU MLP
     rope_theta: float = 10000.0 # RoPE 基频（可调，DeepSeek 系列对此做了很多文章）
+    # --- MoE 混合专家（DeepSeek-V3 核心）。用 MoE 替换 FFN 层 ---
+    use_moe: bool = False       # MoE 替换 MLP/SwiGLU
+    n_experts: int = 8          # 专家总数
+    n_top_k: int = 2            # 每个 token 激活的专家数
+    moe_aux_weight: float = 0.01 # 负载均衡辅助损失的权重
+    # --- MLA 多头潜在注意力（DeepSeek-V2 核心）。低秩压缩 KV + 部分 RoPE ---
+    use_mla: bool = False       # 用 MLA 替换标准 KV 投影
+    kv_lora_rank: int = 64      # KV 压缩后的潜在维度
+    qk_rope_head_dim: int = 16  # 每头参与旋转的维数（其余维不带位置信息）
+    # --- MTP 多 token 预测（DeepSeek-V3 核心）。训练时额外预测未来的 token ---
+    use_mtp: bool = False       # 开启多 token 预测
+    n_mtp: int = 1              # 额外预测的 token 数（1 = 多预测 t+2）
+    mtp_weight: float = 1.0     # MTP 损失在总 loss 中的权重
 
 class GPT(nn.Module):
 
@@ -235,6 +373,10 @@ class GPT(nn.Module):
         if not config.use_rope:
             self.transformer['wpe'] = nn.Embedding(config.block_size, config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # MTP 模块（可选）：额外的"小 transformer 层"，训练时预测更远的 token
+        if config.use_mtp:
+            self.mtp_modules = nn.ModuleList([MTPModule(config) for _ in range(config.n_mtp)])
+            self.mtp_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # 使用 torch.compile() 做权重共享（weight tying）时会产生一些警告：
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
@@ -295,12 +437,49 @@ class GPT(nn.Module):
             # 如果给了目标 targets，就同时计算损失
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            if self.config.use_moe:
+                # 把各层 MoE 的负载均衡辅助损失加到总损失上
+                moe_loss = torch.zeros(1, device=x.device, dtype=x.dtype)
+                for block in self.transformer.h:
+                    aux = block.get_moe_aux_loss()
+                    if aux is not None:
+                        moe_loss = moe_loss + aux
+                loss = loss + moe_loss
+            if self.config.use_mtp:
+                # 多 token 预测：额外预测 t+2、t+3...，按权重加进总损失
+                loss = loss + self.config.mtp_weight * self._compute_mtp_loss(x, targets)
         else:
             # 推理时的小优化：只对最后一个位置前向传播 lm_head
             logits = self.lm_head(x[:, [-1], :]) # 注意：用列表 [-1] 来保留时间维度
             loss = None
 
         return logits, loss
+
+    def _compute_mtp_loss(self, x, targets):
+        """MTP 损失：第 k 个模块用「位置 t 的隐藏状态 + 目标 t+k+1 的嵌入」预测 t+k+2。
+        x: (B, T, n_embd) 主模型 ln_f 的输出；targets: (B, T) 训练目标（即 t+1 的正确答案）。
+        """
+        B, T, C = x.shape
+        if T < self.config.n_mtp + 2:
+            return torch.zeros(1, device=x.device, dtype=x.dtype)
+        mtp_loss = torch.zeros(1, device=x.device, dtype=x.dtype)
+        h = x  # 当前"预备预测"的隐藏状态序列
+        for k in range(self.config.n_mtp):
+            # off：h[j] 当前对应要预测 targets[j+off]（主模型 off=1，预测 t+1）
+            if k == 0:
+                hidden = h[:, :-2]      # 主模型输出预测的是 t+1，要再前进两步到 t+2
+                off = 1
+            else:
+                hidden = h[:, :-1]      # 上级模块输出预测的是 t+k+1，再前进一步即可
+                off = k + 1
+            length = hidden.shape[1]
+            next_emb = self.transformer.wte(targets[:, off : off+length])       # (B, len, C)
+            mtp_targets = targets[:, off+1 : off+1+length]                      # (B, len)
+            h = self.mtp_modules[k](hidden, next_emb)                           # (B, len, C)
+            logits = self.mtp_head(h)
+            mtp_loss = mtp_loss + F.cross_entropy(
+                logits.view(-1, logits.size(-1)), mtp_targets.reshape(-1), ignore_index=-1)
+        return mtp_loss / self.config.n_mtp
 
     def crop_block_size(self, block_size):
         # 模型“手术”：必要时减小 block size
@@ -339,10 +518,13 @@ class GPT(nn.Module):
         config_args['vocab_size'] = 50257 # GPT 模型 checkpoint 中始终是 50257
         config_args['block_size'] = 1024 # GPT 模型 checkpoint 中始终是 1024
         config_args['bias'] = True # GPT 模型 checkpoint 中始终是 True
-        # 加载 GPT-2 预训练权重时必须是原始结构（参数名/形状才能对齐），强行关掉 modern 开关
+        # 加载 GPT-2 预训练权重时必须是原始结构（参数名/形状才能对齐），强行关掉所有开关
         config_args['use_rmsnorm'] = False
         config_args['use_rope'] = False
         config_args['use_swiglu'] = False
+        config_args['use_moe'] = False
+        config_args['use_mla'] = False
+        config_args['use_mtp'] = False
         # 如果需要，可以覆盖 dropout 比率
         if 'dropout' in override_args:
             print(f"正在把 dropout 比率覆盖为 {override_args['dropout']}")
