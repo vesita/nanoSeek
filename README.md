@@ -191,8 +191,15 @@ learning_rate: 0.001
 | 训练 | `uv run python train.py config/<实验名>.yaml` |
 | 采样 | `uv run python sample.py --out_dir=out/<实验名>` |
 | 看 checkpoint 里的配置 | `torch.load('out/xxx/ckpt.pt', weights_only=False)['model_args']` |
+| TensorBoard 对比曲线 | `uv run tensorboard --logdir out/`（需在配置里开 `tensorboard_log: true`） |
 | 提交实验 | `git add -A && git commit -m "..."` |
 | 回退到上个实验 | `git checkout <上一个commit>` |
+
+**训练体验**（实验目录只留可读文件：`ckpt.pt` / `results.csv` / `loss_curve.png`）：
+- **`results.csv`**（YOLO 式）：每个评估点一行 `step, train/loss, val/loss, lr, mfu, time`，纯文本、Excel 可直接打开、训练中断也能读到已落盘部分
+- **`loss_curve.png`**：训练结束自动生成 train/val 双曲线，不用开任何工具直接看图
+- **checkpoint 异步保存**（后台线程 + 原子改名），保存时训练不再卡顿
+- **TensorBoard 可选**：默认关闭（避免二进制事件文件）；需要多实验曲线叠加时用 `--tensorboard_log=True` 开启，事件写到 `out/<实验>/tensorboard/` 子目录，然后用 `uv run tensorboard --logdir out/` 查看
 
 ---
 

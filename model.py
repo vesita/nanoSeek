@@ -395,7 +395,7 @@ class MoE(nn.Module):
         self.aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
         return loss
 
-def sinkhorn_knopp(logits, iters=5):
+def sinkhorn_knopp(logits, iters=10):
     """mHC 的流形约束：把 2×2 矩阵投影到「双随机矩阵」（每行、每列和都为 1，元素非负）。
     交替做行归一、列归一——这就是最优传输里的 Sinkhorn 迭代。
     双随机矩阵的谱范数恒为 1：信号经过每个超连接最多不被放大，

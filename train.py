@@ -17,9 +17,11 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 
 import os
+import csv
 import time
 import math
 import pickle
+import threading
 from contextlib import nullcontext
 
 import numpy as np
@@ -46,6 +48,12 @@ init_from = 'scratch' # 'scratch' 或 'resume' 或 'gpt2*'
 wandb_log = False # 默认禁用
 wandb_project = 'shakespeare-char'
 wandb_run_name = 'mini-gpt' # 'run' + str(time.time())
+# TensorBoard 日志记录（开源、本地，无需账号）。
+# 默认关闭：主输出是 YOLO 式 results.csv + loss_curve.png，不需要二进制事件文件。
+# 需要多实验曲线叠加对比时再开（事件写到 out/<实验>/tensorboard/ 子目录，不污染主目录）。
+tensorboard_log = False
+# 训练结束自动生成 results.csv 每评估点一行（step/train/val/lr/mfu/time），
+# 纯文本、Excel 可打开、训练中断也能读到已落盘的部分。
 # 数据
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1 # 用于模拟更大的 batch size
@@ -316,14 +324,97 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+writer = None
+if tensorboard_log and master_process:
+    from torch.utils.tensorboard import SummaryWriter
+    # 事件写到 out/<实验>/tensorboard/ 子目录，不污染实验主目录
+    #（主目录只留 ckpt.pt / results.csv / loss_curve.png 这些可读文件）
+    writer = SummaryWriter(log_dir=os.path.join(out_dir, 'tensorboard'))
+    writer.add_text("config", str(config), 0)
+
+# YOLO 式 results.csv：每个评估点一行，纯文本、随时可读、不依赖任何工具
+results_csv = None
+csv_writer = None
+if master_process:
+    results_csv = open(os.path.join(out_dir, 'results.csv'), 'w', newline='', encoding='utf-8')
+    csv_writer = csv.writer(results_csv)
+    csv_writer.writerow(['step', 'train/loss', 'val/loss', 'lr', 'mfu', 'time'])
+
+# -----------------------------------------------------------------------------
+# 异步 checkpoint 保存
+# torch.save 同步写盘会让训练循环卡顿。这里把「序列化 + 磁盘写入」丢给后台线程，
+# 主线程只做张量 CPU 快照（~100ms）就立刻返回继续训练。
+# 关键安全性：快照是独立张量（to(cpu, copy=True)），后台线程保存期间训练继续
+# 修改参数也不会污染它；写临时文件 + 原子改名，保证 ckpt.pt 永远完整。
+# -----------------------------------------------------------------------------
+_save_threads = []
+_save_lock = threading.Lock()
+
+def _checkpoint_to_cpu(ckpt):
+    """递归把 checkpoint 里的所有张量拷到 CPU 并脱离计算图，供后台线程安全保存。"""
+    out = {}
+    for k, v in ckpt.items():
+        if isinstance(v, dict):
+            out[k] = _checkpoint_to_cpu(v)
+        elif isinstance(v, torch.Tensor):
+            out[k] = v.detach().to('cpu', copy=True)
+        else:
+            out[k] = v
+    return out
+
+def _save_worker(ckpt, tmp_path, path):
+    with _save_lock:  # 同一时刻只写一个文件，避免并发保存互相覆盖
+        torch.save(ckpt, tmp_path)
+        os.replace(tmp_path, path)  # 原子改名：写一半的文件永远不会被读到
+
+def save_checkpoint_async(ckpt, path):
+    """把 checkpoint 丢给后台线程保存，主线程立即返回继续训练。"""
+    ckpt_cpu = _checkpoint_to_cpu(ckpt)          # 同步快照（安全），线程只负责写盘
+    t = threading.Thread(target=_save_worker, args=(ckpt_cpu, path + '.tmp', path), daemon=True)
+    _save_threads.append(t)
+    t.start()
+
+def join_save_threads():
+    """等待所有后台保存线程完成（训练结束前调用，确保最后的 checkpoint 落盘）。"""
+    for t in _save_threads:
+        t.join()
+
+def _plot_loss_curve(loss_history, out_dir, best_val_loss):
+    """训练结束后画 train/val loss 曲线到 loss_curve.png（YOLO 式 results.png），
+    不用手动开 TensorBoard 也能直接看图。"""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')  # 无显示环境，用非交互后端
+        import matplotlib.pyplot as plt
+        iters = [h[0] for h in loss_history]
+        train = [h[1] for h in loss_history]
+        val = [h[2] for h in loss_history]
+        plt.figure(figsize=(8, 5))
+        plt.plot(iters, train, label='train', color='tab:blue')
+        plt.plot(iters, val, label='val', color='tab:orange')
+        plt.xlabel('迭代步数')
+        plt.ylabel('loss')
+        plt.title(f'{os.path.basename(out_dir)} · best_val_loss {best_val_loss:.4f}')
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        path = os.path.join(out_dir, 'loss_curve.png')
+        plt.savefig(path, dpi=120)
+        plt.close()
+        print(f"已生成 loss 曲线图：{path}")
+    except Exception as e:
+        print(f"生成 loss 曲线图失败（不影响训练）：{e}")
+
 # 训练循环
 X, Y = get_batch('train') # 获取第一个 batch
-t0 = time.time()
+t0 = time.time()           # t0 在每轮迭代末尾会被重置（用于测单步速度算 MFU）
+train_start = time.time()  # 训练总起点，results.csv 里的 time 列用这个（不会随迭代重置）
 local_iter_num = 0 # 本进程生命周期内的迭代次数
 raw_model = model.module if ddp else model # 如果需要，解开 DDP 容器
 running_mfu = -1.0
 # tqdm 进度条：DDP 下只有主进程显示
 pbar = tqdm(total=max_iters, initial=iter_num, desc="训练中", dynamic_ncols=True) if master_process else None
+loss_history = []  # 每个评估点记 (iter, train_loss, val_loss)，训练结束画曲线图用
 while True:
 
     # 确定并设置本次迭代的学习率
@@ -344,6 +435,19 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # 换算成百分比
             })
+        if tensorboard_log:
+            # 与 wandb 记录同样的指标，写进 TensorBoard
+            writer.add_scalar("train/loss", losses['train'], iter_num)
+            writer.add_scalar("val/loss", losses['val'], iter_num)
+            writer.add_scalar("lr", lr, iter_num)
+            writer.add_scalar("mfu", running_mfu*100, iter_num)
+        loss_history.append((iter_num, losses['train'], losses['val']))
+        if csv_writer is not None:
+            csv_writer.writerow([
+                iter_num, f"{losses['train']:.4f}", f"{losses['val']:.4f}",
+                f"{lr:.6g}", f"{max(running_mfu, 0.0)*100:.2f}", f"{time.time()-train_start:.1f}",
+            ])
+            results_csv.flush()  # 及时落盘：训练中断也能读到已写出的部分
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -355,8 +459,8 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                pbar.write(f"✓ 已保存 checkpoint 到 {out_dir}（best_val_loss {best_val_loss:.4f}）")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                pbar.write(f"✓ 已排队保存 checkpoint 到 {out_dir}（best_val_loss {best_val_loss:.4f}）")
+                save_checkpoint_async(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
 
@@ -407,6 +511,14 @@ while True:
     if iter_num > max_iters:
         break
 
+# 训练结束：等后台保存线程写完，再画 loss 曲线图，收尾 csv
+join_save_threads()
+if results_csv is not None:
+    results_csv.close()
+if master_process and loss_history:
+    _plot_loss_curve(loss_history, out_dir, best_val_loss)
+if writer is not None:
+    writer.close()
 if pbar is not None:
     pbar.close()
 if ddp:
