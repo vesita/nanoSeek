@@ -17,6 +17,26 @@ nanoGPT 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 | `use_swiglu` | `false` | GELU MLP → SwiGLU 门控前馈（同等参数下表达力更强） |
 | `rope_theta` | `10000.0` | RoPE 基频，可调 |
 
+**DeepSeek-V2/V3 核心**：
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `use_moe` | `false` | FFN → MoE 混合专家（top-k 路由 + 负载均衡辅助损失） |
+| `n_experts` / `n_top_k` | `8` / `2` | 专家总数 / 每 token 激活的专家数 |
+| `use_mla` | `false` | 多头潜在注意力：KV 低秩压缩 + 部分 RoPE |
+| `use_mtp` | `false` | 多 token 预测：训练时额外预测未来 token |
+
+**DeepSeek-V4 新技术**（`config/train_chinese_v4_*.yaml` 逐项验证）：
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `swiglu_clamp` | `0.0` | SwiGLU 门控输出钳制半宽（0 = 关）。V4 稳定性技巧：从源头压制被 MoE 路由放大的异常值 |
+| `use_muon` | `false` | Muon 优化器替代 AdamW：矩阵参数做 Newton-Schulz 正交化 |
+| `use_mhc` | `false` | 流形约束超连接替代残差：双流混合 + 双随机矩阵（谱范数=1，信号不放大） |
+| `use_anticipatory_routing` | `false` | 预判路由：离散路由选择用 EMA 旧参数，与骨干更新解耦（防 loss spike） |
+| `use_csa` | `false` | 压缩稀疏注意力：块级 KV 压缩 + top-k 稀疏选择 + 滑窗（O(T²)→O(T·(nb+win))） |
+| `use_hca` | `false` | 重度压缩注意力：全局摘要信号（配合 use_csa 使用） |
+
 **YAML 配置系统**（替代原版 exec Python 配置）：
 - 实验配置放 `config/*.yaml`，由 `config_loader.py` 加载
 - 命令行覆盖：`uv run python train.py config/xxx.yaml --n_layer=4`
@@ -146,9 +166,18 @@ learning_rate: 0.001
 | 级别 | 技术 | 状态 |
 |------|------|------|
 | 1 | 现代化基础组件：RMSNorm + RoPE + SwiGLU | ✅ 已实现并验证（打平基线，参数量更少） |
-| 2 | MoE 混合专家（DeepSeek-V3 核心） | ⏳ 计划中 |
-| 3 | MLA 多头潜在注意力（DeepSeek-V2 核心） | ⏳ 计划中 |
-| 4 | MTP 多 token 预测（DeepSeek-V3） | ⏳ 计划中 |
+| 2 | MoE 混合专家（DeepSeek-V3 核心） | ✅ 已实现并验证 |
+| 3 | MLA 多头潜在注意力（DeepSeek-V2 核心） | ✅ 已实现并验证 |
+| 4 | MTP 多 token 预测（DeepSeek-V3） | ✅ 已实现并验证 |
+| 5 | V4：SwiGLU Clamping（数值稳定性） | ✅ 已实现，待对比训练 |
+| 6 | V4：Muon 优化器（Newton-Schulz 正交化） | ✅ 已实现，待对比训练 |
+| 7 | V4：mHC 流形约束超连接 | ✅ 已实现，待对比训练 |
+| 8 | V4：Anticipatory Routing（预判路由） | ✅ 已实现，待对比训练 |
+| 9 | V4：CSA/HCA 压缩稀疏注意力 | ✅ 已实现（简化教育版），待对比训练 |
+
+**数据集**：已从《西游记》单本扩充为四大名著合集（约 302 万字符，6403 词表，train 272 万 token），`data/chinese/prepare.py` 自动下载缺失的书籍。
+
+**V4 对比实验**：每个技术一个配置（`config/train_chinese_v4_*.yaml`），以 `train_chinese_moe.yaml` 为基线，同超参只切换目标开关，比较 val loss 与训练稳定性。
 
 **已跑过的实验**（在 10.7M 模型上）：基线的 best val loss 1.4733，modern 1.4764——几乎打平，但 modern 少了约 10 万参数（RoPE 删掉了位置编码表）、且更早收敛。这印证了这三件套是"结构效率"改进：同等表现、更省参数，规模放大后优势更明显。
 

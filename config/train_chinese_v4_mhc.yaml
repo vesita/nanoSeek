@@ -1,0 +1,43 @@
+# V4 技术验证 #3：mHC 流形约束超连接
+# 用 mHC 双流超连接（工作流 + 记忆流，混合矩阵约束为双随机）替代残差连接。
+# 对比基线：train_chinese_moe.yaml（同配置、普通残差）。
+# 技巧点：双随机约束让谱范数恒为 1，信号不会逐层放大——理解这个稳定性保证即可。
+out_dir: out/chinese-v4-mhc
+eval_interval: 250
+eval_iters: 200
+log_interval: 10
+always_save_checkpoint: false
+wandb_log: false
+wandb_project: v4-tech
+wandb_run_name: mhc
+dataset: chinese
+gradient_accumulation_steps: 1
+batch_size: 64
+block_size: 256
+
+# small 模型（默认配置）
+n_layer: 4
+n_head: 4
+n_embd: 128
+dropout: 0.2
+
+# --- modern 三件套 ---
+use_rmsnorm: true
+use_rope: true
+use_swiglu: true
+
+# --- MoE 开关 ---
+use_moe: true
+n_experts: 8
+n_top_k: 2
+moe_aux_weight: 0.01
+
+# --- V4 技术 #3：mHC 超连接 ---
+use_mhc: true   # false = 普通残差（基线）
+
+learning_rate: 0.001
+max_iters: 5000
+lr_decay_iters: 5000
+min_lr: 0.0001
+beta2: 0.99
+warmup_iters: 100

@@ -1,0 +1,43 @@
+# V4 技术验证 #1：SwiGLU Clamping
+# 在 MoE 模型基础上开启 SwiGLU 输出钳制，验证「从源头压制异常值」是否带来更稳的训练。
+# 对比基线：train_chinese_moe.yaml（同配置、不开 clamp）。
+# 技巧：clamp 半宽太小会伤表达力（信息被截断），太大则压不住异常值；10 是 V4 的取值。
+out_dir: out/chinese-v4-clamp
+eval_interval: 250
+eval_iters: 200
+log_interval: 10
+always_save_checkpoint: false
+wandb_log: false
+wandb_project: v4-tech
+wandb_run_name: swiglu-clamp
+dataset: chinese
+gradient_accumulation_steps: 1
+batch_size: 64
+block_size: 256
+
+# small 模型（默认配置）
+n_layer: 4
+n_head: 4
+n_embd: 128
+dropout: 0.2
+
+# --- modern 三件套 ---
+use_rmsnorm: true
+use_rope: true
+use_swiglu: true
+
+# --- MoE 开关：FFN → 混合专家 ---
+use_moe: true
+n_experts: 8
+n_top_k: 2
+moe_aux_weight: 0.01
+
+# --- V4 技术 #1：SwiGLU 输出钳制 ---
+swiglu_clamp: 10.0   # 0 = 关闭（基线）；10 = V4 的取值
+
+learning_rate: 0.001
+max_iters: 5000
+lr_decay_iters: 5000
+min_lr: 0.0001
+beta2: 0.99
+warmup_iters: 100

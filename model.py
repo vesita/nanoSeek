@@ -82,6 +82,7 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.config = config
         assert config.n_embd % config.n_head == 0
         # 所有 head 的 key、query、value 投影，但放在同一个 batch 里计算
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -98,7 +99,14 @@ class CausalSelfAttention(nn.Module):
         # MLA（DeepSeek-V2）：Q 独立投影；KV 先压缩到低秩潜在、再展开成 K 和 V。
         # RoPE 只作用于每个 head 的前 qk_rope_head_dim 维，其余是"无位置"的内容维。
         self.use_mla = config.use_mla
-        self.rope_head_dim = config.qk_rope_head_dim if config.use_mla else (config.n_embd // config.n_head)
+        self.use_csa = config.use_csa
+        self.rope_head_dim = config.qk_rope_head_dim if (config.use_mla or config.use_csa) else (config.n_embd // config.n_head)
+        if config.use_csa:
+            # CSA/HCA 的独立 Q/K/V 投影（与 MLA 的 KV 压缩路径分开，更直白）。
+            # 输入直接投影出 K/V，再在 forward 里做块级压缩。
+            self.q_proj_csa = nn.Linear(config.n_embd, config.n_embd, bias=False)
+            self.k_proj_csa = nn.Linear(config.n_embd, config.n_embd, bias=False)
+            self.v_proj_csa = nn.Linear(config.n_embd, config.n_embd, bias=False)
         if config.use_mla:
             assert config.qk_rope_head_dim % 2 == 0 and config.qk_rope_head_dim <= self.head_dim, \
                 "qk_rope_head_dim 需为偶数且不超过 head_dim"
@@ -123,6 +131,12 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch 大小、序列长度、嵌入维度 (n_embd)
+
+        if self.use_csa:
+            # CSA/HCA 混合注意力（V4 简化版）：走独立的压缩稀疏路径
+            y = self._csa_forward(x)
+            y = self.resid_dropout(self.c_proj(y))
+            return y
 
         if self.use_mla:
             # MLA 路径：Q 独立投影；KV 共享一个低秩潜在表示，再分别展开成 K 和 V
@@ -172,6 +186,84 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+    def _csa_forward(self, x):
+        """CSA + HCA 混合注意力（DeepSeek-V4 的简化教育版）。
+
+        CSA（压缩稀疏注意力）：把 K/V 按 m 个 token 一块，平均池化成 1 个潜在向量。
+        每个 query 只稀疏地选 top-k 个「它之前」的压缩块（长程信号用摘要传递），
+        再保留一段滑窗的原始 token（近处信息用细节传递）。注意力开销从 O(T²)
+        降到 O(T·(nb + win))——这是 V4 能跑 1M 上下文的核心原因。
+
+        HCA（重度压缩注意力）：把所有「允许的」块再压成一个全局潜在（不做稀疏
+        选择），每个 query 额外加上这份全局信号，补足长程上下文。
+
+        注：V4 原版用可学习压缩和 lightning indexer，这里用平均池化 + top-k
+        简化演示同一思想。压缩块的平均池化会丢失块内细节，靠滑窗补回近处信息。
+        """
+        B, T, C = x.shape
+        nh, d = self.n_head, self.head_dim
+        m = self.config.csa_compress
+        win = self.config.csa_window
+
+        q = self.q_proj_csa(x).view(B, T, nh, d)
+        k = self.k_proj_csa(x).view(B, T, nh, d)
+        v = self.v_proj_csa(x).view(B, T, nh, d)
+
+        if self.use_rope:
+            # 部分 RoPE：只旋转前 rope_head_dim 维（与 MLA 一致）
+            q_rope, q_nope = q[..., :self.rope_head_dim], q[..., self.rope_head_dim:]
+            k_rope, k_nope = k[..., :self.rope_head_dim], k[..., self.rope_head_dim:]
+            q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, self.cos[:T], self.sin[:T])
+            q = torch.cat([q_rope, q_nope], dim=-1)
+            k = torch.cat([k_rope, k_nope], dim=-1)
+
+        # --- 1) 块级压缩：每 m 个连续 token 的 K/V 平均池化成 1 个潜在 ---
+        T_ok = (T // m) * m
+        nb = T_ok // m
+        k_blocks = k[:, :T_ok].view(B, nb, m, nh, d).mean(dim=2)   # (B, nb, nh, d)
+        v_blocks = v[:, :T_ok].view(B, nb, m, nh, d).mean(dim=2)
+
+        # --- 2) 稀疏块选择：query 只能看「它所在块之前」的块，再取 top-k ---
+        bq = torch.arange(T, device=x.device) // m                  # 每个 query 属于哪个块
+        causal_block = bq.unsqueeze(-1) > torch.arange(nb, device=x.device)  # (T, nb)
+        has_prior = causal_block.any(dim=-1)                        # (T,) 该 query 有没有历史块
+        s_blk = torch.einsum('bthd,bnhd->bthn', q, k_blocks) / math.sqrt(d)  # (B,T,nh,nb)
+        s_blk = s_blk.masked_fill(~causal_block.unsqueeze(0).unsqueeze(2), float('-inf'))
+        # 稀疏：只保留每个 query 得分最高的 topk 个块（其余 -inf，softmax 后为 0）
+        topk_vals, _ = s_blk.topk(self.config.csa_topk, dim=-1)
+        s_blk = s_blk.masked_fill(s_blk < topk_vals[..., [-1]], float('-inf'))
+        # 没有历史块的 query：整行置 0（否则 softmax 对全 -inf 产生 NaN）
+        s_blk = s_blk.masked_fill(~has_prior.view(1, T, 1, 1), 0.0)
+        a_blk = F.softmax(s_blk, dim=-1)                            # (B,T,nh,nb)
+        y_comp = torch.einsum('bthn,bnhd->bthd', a_blk, v_blocks)   # (B,T,nh,d)
+        y_comp = y_comp * has_prior.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).float()
+
+        # --- 3) 滑窗：最近 win 个原始 token 的局部因果注意力 ---
+        # 滑窗允许看自己（j ≤ i），保证每个位置至少有一个合法键，避免全 -inf。
+        win = min(win, T)
+        i = torch.arange(T, device=x.device)
+        win_causal = (i.unsqueeze(-1) <= i.unsqueeze(0)) & (i.unsqueeze(0) - i.unsqueeze(-1) <= win)
+        s_win = torch.einsum('bthd,bjhd->bthj', q, k) / math.sqrt(d)  # (B,T,nh,T)
+        s_win = s_win.masked_fill(~win_causal.unsqueeze(0).unsqueeze(2), float('-inf'))
+        y_win = torch.einsum('bthj,bjhd->bthd', F.softmax(s_win, dim=-1), v)
+
+        y = y_comp + y_win
+
+        # --- 4) HCA：重度压缩的全局信号（可选）---
+        # 把所有允许的压缩块再平均成一个全局潜在（不做稀疏选择 = 重度压缩），
+        # 每个 query 加上它作为全局上下文。这是"全文一句话摘要"式的粗粒度信号。
+        if self.config.use_hca:
+            n_allowed = causal_block.float().sum(dim=-1).clamp(min=1)  # (T,)
+            k_glob = torch.einsum('tn,bnhd->bthd', causal_block.float(), k_blocks) / \
+                     n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            v_glob = torch.einsum('tn,bnhd->bthd', causal_block.float(), v_blocks) / \
+                     n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            # 单个全局 key 的 softmax 恒为 1，等价于直接加上这份全局摘要
+            y = y + v_glob
+
+        # 合并 head： (B, T, nh, d) → (B, T, C)
+        return y.transpose(1, 2).contiguous().view(B, T, C)
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -199,6 +291,7 @@ class SwiGLU(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.config = config  # 保存 config，forward 里可能要用到钳制等技巧
         hidden = int(8 * config.n_embd / 3)  # ≈ 2.67·n_embd
         self.c_fc   = nn.Linear(config.n_embd, hidden, bias=config.bias)  # 值分支
         self.c_fc2  = nn.Linear(config.n_embd, hidden, bias=config.bias)  # 门控分支
@@ -207,6 +300,10 @@ class SwiGLU(nn.Module):
 
     def forward(self, x):
         x = F.silu(self.c_fc(x)) * self.c_fc2(x)  # SiLU(xW1) ⊙ (xW2)
+        if self.config.swiglu_clamp > 0:
+            # V4 稳定性技巧：钳制门控输出，从源头压制异常值。
+            # 注意是在 c_proj 之前钳——异常值就是在这个门控乘积里产生的。
+            x = x.clamp(-self.config.swiglu_clamp, self.config.swiglu_clamp)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -228,6 +325,8 @@ class MoE(nn.Module):
         self.n_experts = config.n_experts
         self.n_top_k = config.n_top_k
         self.moe_aux_weight = config.moe_aux_weight
+        self.use_anticipatory_routing = config.use_anticipatory_routing
+        self.ar_momentum = config.ar_momentum
         # 路由器：给每个 token 在每个专家上打一个分
         self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
         # 专家：复用 SwiGLU/MLP，每个专家是一份完整的 FFN
@@ -235,6 +334,10 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([ExpertType(config) for _ in range(config.n_experts)])
         # 本次前向累积的辅助损失，forward 后由 GPT 取走并清零
         self.aux_loss = torch.tensor(0.0)
+        if self.use_anticipatory_routing:
+            # 慢路由：当前路由器的 EMA 平滑副本（buffer，不参与优化）。
+            # 与骨干网络的更新解耦，负责"离散地选哪些专家"。
+            self.register_buffer('router_slow', self.router.weight.detach().clone())
 
     def forward(self, x):
         B, T, C = x.shape
@@ -242,12 +345,26 @@ class MoE(nn.Module):
         N = x_flat.shape[0]
 
         # 路由打分：softmax 得到每个 token 在每个专家上的概率
-        router_logits = self.router(x_flat)               # (N, n_experts)
-        router_probs = F.softmax(router_logits, dim=-1)   # (N, n_experts)
-
-        # 选 top-k 个专家，门控权重在选中的 k 个之间重新归一化
-        top_k_probs, top_k_indices = router_probs.topk(self.n_top_k, dim=-1)  # 各 (N, k)
-        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        if self.use_anticipatory_routing:
+            # —— 预判路由（V4）：让路由决策与骨干更新解耦 ——
+            # V4 用"预判器"预测路由参数的未来状态来路由；这里用 EMA 平滑副本演示同原理：
+            #   · 离散选择（选哪些专家）：用旧参数 router_slow → 切断"路由-骨干"反馈回路，
+            #     异常值不会被当前梯度逐层放大（这正是 V4 防 loss spike 的机制之一）。
+            #   · 连续门控权重：仍用当前 router → 主损失梯度能流回路由器，专家偏好照常学习。
+            with torch.no_grad():
+                self.router_slow.mul_(1 - self.ar_momentum).add_(
+                    self.router.weight, alpha=self.ar_momentum)
+            slow_probs = F.softmax(F.linear(x_flat, self.router_slow), dim=-1)
+            _, top_k_indices = slow_probs.topk(self.n_top_k, dim=-1)      # 离散选择：旧参数
+            router_probs = F.softmax(self.router(x_flat), dim=-1)         # 门控：当前参数
+            top_k_probs = router_probs.gather(1, top_k_indices)           # (N, k)
+            top_k_probs = top_k_probs / (top_k_probs.sum(dim=-1, keepdim=True) + 1e-6)
+        else:
+            router_logits = self.router(x_flat)               # (N, n_experts)
+            router_probs = F.softmax(router_logits, dim=-1)   # (N, n_experts)
+            # 选 top-k 个专家，门控权重在选中的 k 个之间重新归一化
+            top_k_probs, top_k_indices = router_probs.topk(self.n_top_k, dim=-1)  # 各 (N, k)
+            top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
         # 负载均衡辅助损失（Switch Transformer 论文的做法）：
         #   f_i = 第 i 个专家实际接到的 token 比例
@@ -278,18 +395,46 @@ class MoE(nn.Module):
         self.aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
         return loss
 
+def sinkhorn_knopp(logits, iters=5):
+    """mHC 的流形约束：把 2×2 矩阵投影到「双随机矩阵」（每行、每列和都为 1，元素非负）。
+    交替做行归一、列归一——这就是最优传输里的 Sinkhorn 迭代。
+    双随机矩阵的谱范数恒为 1：信号经过每个超连接最多不被放大，
+    这是 V4 在 1.6T 参数量下训练稳定（不 loss spike）的关键保证。
+    """
+    m = F.softplus(logits)                       # softplus：非负且处处可导
+    for _ in range(iters):
+        m = m / m.sum(dim=1, keepdim=True)       # 行归一：每行和为 1
+        m = m / m.sum(dim=0, keepdim=True)       # 列归一：每列和为 1
+    return m
+
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.config = config
         # 归一化：RMSNorm（modern）或 LayerNorm（原始 GPT-2）
         self.ln_1 = RMSNorm(config.n_embd) if config.use_rmsnorm else LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd) if config.use_rmsnorm else LayerNorm(config.n_embd, bias=config.bias)
         # 前馈：MoE > SwiGLU > 标准 GELU MLP（优先级由配置开关决定）
         self.mlp = MoE(config) if config.use_moe else (SwiGLU(config) if config.use_swiglu else MLP(config))
+        # mHC 超连接：2×2 混合矩阵的 logits，forward 时经 Sinkhorn 投影成双随机矩阵。
+        # logits 全 0 → softplus(0)=ln2 → 投影后 ≈ [[0.5,0.5],[0.5,0.5]]，两条流均衡起步。
+        if config.use_mhc:
+            self.mix = nn.Parameter(torch.zeros(2, 2))
 
-    def forward(self, x):
+    def forward(self, x, z=None):
+        if self.config.use_mhc:
+            # 两条流：x 是「工作流」（喂给 attention/FFN），z 是「记忆流」（跨层累积）。
+            # 每层算出的块输出 z_block，同时按双随机矩阵混合进两条流。
+            # 注意这里不再有 x + f(x) 的残差——混合矩阵取代了残差连接。
+            z = x if z is None else z
+            z_block = self.mlp(self.ln_2(self.attn(self.ln_1(x))))
+            m = sinkhorn_knopp(self.mix)               # (2,2) 双随机矩阵
+            x_new = m[0, 0] * x + m[0, 1] * z_block    # 工作流：旧 x 和块输出混合
+            r_new = m[1, 0] * z + m[1, 1] * z_block    # 记忆流：旧 z 和块输出混合
+            return x_new, r_new
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
@@ -322,7 +467,99 @@ class MTPModule(nn.Module):
         # next_emb: (B, T, n_embd) 目标 token t+1 的嵌入（提前剧透下一步）
         h = self.hidden_proj(hidden) + self.emb_proj(next_emb)
         h = self.norm(h)
-        return self.block(h)
+        out = self.block(h)
+        if isinstance(out, tuple):
+            # mHC 模式：Block 返回 (工作流, 记忆流)，MTP 只取工作流做预测
+            out = out[0]
+        return out
+
+# -----------------------------------------------------------------------------
+# Muon 优化器（DeepSeek-V4 用其替代 AdamW）
+# 思路：对参数张量做「动量」后，矩阵参数会被正交化（Newton-Schulz 迭代）
+# ——把梯度的「方向」拉到单位正交矩阵附近再更新。相比 AdamW 的自适应缩放，
+# 正交化保留了梯度向量的几何结构，深层训练更稳、收敛更快。
+# -----------------------------------------------------------------------------
+
+def zeropower_via_newtonschulz(G, steps=10, eps=1e-7):
+    """用 Newton-Schulz 迭代把矩阵 G 正交化（求「最近正交矩阵」）。
+    数学上等于 SVD 里的 U V^T：对 G 做极分解的「旋转」部分，去掉缩放。
+
+    经典迭代：X ← (3X − X·Xᵀ·X)/2，等价于对 XᵀX 的特征值 s 做 p(s)=(3−s)/2。
+    p(1)=1（正交阵是不动点），s<1 被拉大、s>1 被压小 → 奇异值全部趋于 1。
+
+    先除以 Frobenius 范数：因为 ‖X‖_op ≤ ‖X‖_F，归一后算子范数 ≤ 1，
+    特征值落在 (0,1]，迭代必然稳定收敛（这是它和记忆里那组高阶常数不同、
+    但被验证可靠的写法）。经典法收敛慢，所以步数要给足。
+    """
+    assert G.ndim == 2
+    X = G.float()
+    # 对非方阵：先在「窄」的一侧做正交化，再转置回去（省算力且更稳）。
+    # 注意转置后矩阵方向变了，必须用转置前记录的 was_tall 判断要不要转回，
+    # 不能再用 size(0) > size(1) 判断（否则高矩阵会漏转回、形状对不上）。
+    was_tall = X.size(0) > X.size(1)
+    if was_tall:
+        X = X.T
+    X = X / (X.norm() + eps)  # Frobenius 范数归一，保证算子范数 ≤ 1
+    for _ in range(steps):
+        X = 1.5 * X - 0.5 * X @ X.T @ X
+    if was_tall:
+        X = X.T
+    return X.to(G.dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    """Muon 优化器（DeepSeek-V4 / Llama 4 的核心优化器）。
+
+    更新规则（对每个矩阵参数 W）：
+        1. 动量  m = 0.95·m + g
+        2. 正交化 Q = NewtonSchulz(m)   ← 与 AdamW 的本质区别
+        3. 权重衰减插值：g = (1-wd)·Q + wd·W
+        4. W -= lr·g
+
+    一维参数（bias、norm 权重）没有「方向」可言，退化为纯动量更新。
+    使用标准的 state 机制，checkpoint 里能正常 save/load。
+    """
+
+    def __init__(self, params, lr, momentum=0.95, nesterov=True, ns_steps=10,
+                 orthogonalization_fn=None):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        super().__init__(params, defaults)
+        self.orthogonalization_fn = orthogonalization_fn or zeropower_via_newtonschulz
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            nesterov = group['nesterov']
+            ns_steps = group['ns_steps']
+            wd = group.get('weight_decay', 0.0)
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(p)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+                if nesterov:
+                    # Nesterov 加速：在动量基础上再看一眼当前梯度
+                    g = g.add(buf, alpha=momentum)
+                else:
+                    g = buf
+                if g.ndim >= 2:
+                    # Muon 的核心：只对矩阵参数做正交化
+                    g = self.orthogonalization_fn(g, steps=ns_steps)
+                    # 权重衰减：正交化的方向 + 掺一点原参数做收缩
+                    g = (1 - wd) * g + wd * p.data
+                p.data.add_(g, alpha=-lr)
+        return loss
+
 
 @dataclass
 class GPTConfig:
@@ -338,11 +575,19 @@ class GPTConfig:
     use_rope: bool = False      # RoPE 替换可学习位置编码 wpe
     use_swiglu: bool = False    # SwiGLU 替换 GELU MLP
     rope_theta: float = 10000.0 # RoPE 基频（可调，DeepSeek 系列对此做了很多文章）
+    # --- V4 稳定性技巧：SwiGLU 输出钳制（DeepSeek-V4 报告）---
+    # MoE 训练中，SwiGLU 的输出可能冒出极大的数值异常值（outlier），
+    # 被路由机制逐层放大后触发 loss spike。V4 直接把门控输出钳制到 [-v, v]。
+    swiglu_clamp: float = 0.0   # 钳制区间半宽；0.0 = 关闭（原始行为）
     # --- MoE 混合专家（DeepSeek-V3 核心）。用 MoE 替换 FFN 层 ---
     use_moe: bool = False       # MoE 替换 MLP/SwiGLU
     n_experts: int = 8          # 专家总数
     n_top_k: int = 2            # 每个 token 激活的专家数
     moe_aux_weight: float = 0.01 # 负载均衡辅助损失的权重
+    # --- V4 稳定性技巧：预判路由（Anticipatory Routing）---
+    # 离散路由选择用 EMA 旧参数副本，与骨干更新解耦，防异常值被路由逐层放大。
+    use_anticipatory_routing: bool = False  # True：路由决策用旧参数；False：当前参数
+    ar_momentum: float = 0.99   # 慢路由 EMA 系数（越大，路由用的参数越"旧"）
     # --- MLA 多头潜在注意力（DeepSeek-V2 核心）。低秩压缩 KV + 部分 RoPE ---
     use_mla: bool = False       # 用 MLA 替换标准 KV 投影
     kv_lora_rank: int = 64      # KV 压缩后的潜在维度
@@ -351,6 +596,20 @@ class GPTConfig:
     use_mtp: bool = False       # 开启多 token 预测
     n_mtp: int = 1              # 额外预测的 token 数（1 = 多预测 t+2）
     mtp_weight: float = 1.0     # MTP 损失在总 loss 中的权重
+    # --- V4 优化器：Muon 替代 AdamW ---
+    # 矩阵参数经 Newton-Schulz 正交化后更新，深层训练更稳、收敛更快。
+    use_muon: bool = False      # True：configure_optimizers 返回 Muon；False：AdamW
+    # --- V4 架构：mHC 流形约束超连接（替换残差连接）---
+    # 双流混合（工作流 + 记忆流），混合矩阵约束为双随机矩阵 → 谱范数 = 1。
+    use_mhc: bool = False       # True：Block 用 mHC 双流；False：普通 x + f(x) 残差
+    # --- V4 核心：CSA/HCA 混合注意力（简化教育版）---
+    # 块级 KV 压缩 + top-k 稀疏块选择 + 滑窗局部注意力 + HCA 重度压缩全局信号。
+    # 核心收益：注意力开销从 O(T²) 降到 O(T·(nb + win))，这是 1M 上下文能跑起来的关键。
+    use_csa: bool = False       # True：用 CSA 混合注意力（建议搭配 use_rope）
+    csa_compress: int = 16      # 块大小 m：每 m 个 token 压成 1 个潜在 KV
+    csa_topk: int = 4           # 每个 query 稀疏选几个压缩块（不看全部）
+    csa_window: int = 64        # 滑窗：保留最近多少个原始 token（局部细节）
+    use_hca: bool = False       # 加 HCA：重度压缩全局信号（无稀疏选择）
 
 class GPT(nn.Module):
 
@@ -429,8 +688,15 @@ class GPT(nn.Module):
             pos = torch.arange(0, t, dtype=torch.long, device=device) # 形状 (t)
             pos_emb = self.transformer.wpe(pos) # 形状为 (t, n_embd) 的位置嵌入
             x = self.transformer.drop(tok_emb + pos_emb)
+        z = None  # mHC 的记忆流：None 时第一层 Block 内部会用 x 初始化
         for block in self.transformer.h:
-            x = block(x)
+            if self.config.use_mhc:
+                x, z = block(x, z)   # 两条流都在块间传递
+            else:
+                x = block(x)
+        if self.config.use_mhc:
+            # 最终用「记忆流」解码：它累积了所有层的块输出
+            x = z
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -575,6 +841,12 @@ class GPT(nn.Module):
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
+        if self.config.use_muon:
+            # V4：Muon 替代 AdamW。matrix 组由 Muon 做正交化+权重衰减；
+            # 一维参数组（bias/norm）纯动量更新（Muon 里 ndim<2 的分支）。
+            # 注意 Muon 不依赖 beta2（没有二阶矩），所以 betas 参数被忽略。
+            return Muon(optim_groups, lr=learning_rate)
+
         # 创建 AdamW 优化器，如果可用就使用 fused 版本
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
