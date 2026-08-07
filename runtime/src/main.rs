@@ -1,6 +1,7 @@
 //! nanoGPT 对话推理 CLI。
 //! 用法（在 runtime/ 目录下）：
 //!   cargo run --release -- --prompt "悟空"                # 一次性生成
+//!   cargo run --release -- --print-logits --prompt "悟空" # 调试：打印 top-10 logits
 //!   cargo run --release                                   # 进入对话 REPL
 use std::io::Write;
 
@@ -24,10 +25,17 @@ fn main() -> Result<()> {
     let mut temperature = 0.8f64;
     let mut top_k: Option<usize> = Some(200);
     let mut seed = 1337u64;
+    let mut print_logits = false;
+    let mut dump_logits: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--print-logits" => print_logits = true,
+            "--dump-logits" => {
+                i += 1;
+                dump_logits = Some(args[i].clone());
+            }
             "--model" => {
                 i += 1;
                 model_path = args[i].clone();
@@ -76,10 +84,59 @@ fn main() -> Result<()> {
         "模型就绪：{} 层 · {} 头 · {} 维 · {} 词表",
         config.n_layer, config.n_head, config.n_embd, config.vocab_size
     );
+    // 打印启用的架构特性（方便确认部署的是哪套架构）
+    let mut feats: Vec<String> = Vec::new();
+    if config.use_moe {
+        feats.push(format!("MoE({}专家/top{})", config.n_experts, config.n_top_k));
+        if config.use_anticipatory_routing {
+            feats.push("预判路由".to_string());
+        }
+    }
+    if config.use_csa {
+        feats.push(format!(
+            "CSA(块{}/top{}/窗{})",
+            config.csa_compress, config.csa_topk, config.csa_window
+        ));
+        if config.use_hca {
+            feats.push("HCA".to_string());
+        }
+    }
+    if config.use_mhc {
+        feats.push("mHC".to_string());
+    }
+    if config.swiglu_clamp > 0.0 {
+        feats.push(format!("Clamp({})", config.swiglu_clamp));
+    }
+    if !feats.is_empty() {
+        println!("特性: {}", feats.join(" + "));
+    }
 
     // --- 一次性生成（给了 --prompt） ---
     if let Some(p) = prompt {
         let ids = tok.encode(&p);
+        if print_logits {
+            // 调试：打印最后一个位置的 top-10 logits（用于与 Python 端对拍验证）
+            let logits = gpt.forward(&ids)?; // (vocab,)
+            let v: Vec<f32> = logits.to_vec1()?;
+            let mut pairs: Vec<(usize, f32)> = v.iter().copied().enumerate().collect();
+            pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            for (idx, val) in pairs.iter().take(10) {
+                println!("{idx}\t{val:.6}");
+            }
+            return Ok(());
+        }
+        if let Some(path) = dump_logits {
+            // 调试：把全部 logits 落盘（每行一个，用于 numpy 精确 diff）
+            let logits = gpt.forward(&ids)?; // (vocab,)
+            let v: Vec<f32> = logits.to_vec1()?;
+            let body = v
+                .iter()
+                .map(|x| format!("{x}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(&path, body)?;
+            return Ok(());
+        }
         let new_tokens = gpt.generate(&ids, max_new_tokens, temperature, top_k, &mut rng)?;
         println!("{}", tok.decode(&new_tokens));
         return Ok(());

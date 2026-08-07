@@ -68,20 +68,24 @@ uv run python scripts/smoke_test.py   # 验证环境 + 模型可用
 
 ```
 nanoGPT/
-├── model.py          # GPT 模型（魔改核心：RMSNorm/RoPE/SwiGLU 开关）
+├── model.py          # GPT 模型（魔改核心，V2/V3/V4 全部架构开关）
 ├── train.py          # 训练循环
-├── sample.py         # 文本采样
+├── sample.py         # Python 文本采样（任何架构都能跑）
 ├── bench.py          # 性能基准
 ├── config_loader.py  # YAML 配置加载器（替代原 configurator）
 ├── config/           # 实验配置（YAML）
-│   ├── train_shakespeare_char.yaml     # 基线：英文 small（原始 GPT-2 结构，65 词表）
-│   └── train_chinese.yaml              # 中文 small（西游记，4507 词表）
+│   ├── train_chinese.yaml              # 中文基线（非 MoE）
+│   ├── train_chinese_moe.yaml          # MoE 基线
+│   └── train_chinese_v4_*.yaml         # V4 五项技术对比实验
+├── runtime/          # Rust 推理框架（candle，CPU 推理 + 对话 REPL）
+│   ├── src/          # model.rs / attention.rs / main.rs / tokenizer.rs
+│   ├── scripts/convert.py   # PyTorch checkpoint → safetensors + 配置 + 词表
+│   ├── model.safetensors    # 已转换的最优模型（CSA）
+│   └── Cargo.toml
 ├── scripts/
 │   └── smoke_test.py # 冒烟测试
 ├── data/             # 数据集与预处理脚本
 └── out/              # 训练输出（git 忽略）
-    ├── shakespeare-char/
-    └── chinese/
 ```
 
 ---
@@ -183,6 +187,56 @@ learning_rate: 0.001
 
 ---
 
+## Rust 部署（CPU 对话推理）
+
+`runtime/` 是一个基于 candle 的 Rust 推理框架：把训练好的 PyTorch checkpoint 转成 safetensors，用 Rust 在 CPU 上跑对话，完全不依赖 Python。
+
+**部署流程**（训练产物 → 可对话模型）：
+
+```sh
+# 1. 转换 checkpoint（默认转换最优的 CSA 模型）
+uv run python runtime/scripts/convert.py --ckpt out/chinese-v4-csa/ckpt.pt --dataset chinese
+
+# 2. 编译 Rust 运行时
+cd runtime && cargo build --release
+
+# 3. 一次性生成
+./target/release/nanogpt-runtime --prompt "悟空" --max-new-tokens 100
+
+# 4. 进入对话 REPL（输入 `退出` / `exit` / Ctrl-D 结束）
+./target/release/nanogpt-runtime
+```
+
+**Rust 端支持的架构**（和 `model.py` 逐位对齐，对拍误差 ~1e-6）：
+
+| 特性 | 状态 | 说明 |
+|------|------|------|
+| RMSNorm / RoPE / SwiGLU | ✅ | 基础 modern 三件套 |
+| MoE（top-k 路由 + 专家 FFN） | ✅ | 含预判路由（加载 `router_slow`，推理不做 EMA 更新） |
+| SwiGLU Clamp | ✅ | V4 数值稳定性钳制 |
+| CSA + HCA（压缩稀疏注意力） | ✅ | 块压缩 + top-k 稀疏选择 + 滑窗 + 全局信号 |
+| mHC（双流超连接） | ✅ | Sinkhorn 投影到双随机矩阵 + 记忆流解码 |
+| MLA / MTP | ❌ | 零配置启用（V2/V3 遗留特性，无当前实验使用），需要时再补 |
+
+**CLI 选项**：
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `--model` / `--config` / `--vocab` | runtime/ 下三个文件 | 覆盖加载路径 |
+| `--prompt "..."` | 无 | 给则一次性生成，否则进 REPL |
+| `--max-new-tokens N` | 300 | 生成长度 |
+| `--temperature T` / `--top-k K` | 0.8 / 200 | 采样参数 |
+| `--seed N` | 1337 | 随机种子 |
+| `--print-logits` | 关 | 调试：打印最后一个位置的 top-10 logits |
+| `--dump-logits FILE` | 关 | 调试：把全部 logits 落盘（用于和 Python 端对拍） |
+
+**部署注意**：
+- 推理是纯 CPU，逐 token 重新前向（无 KV cache），块长 256 的小模型上足够快；放大模型后建议加 KV cache。
+- 权重全部 F32，无量化；需要更低显存/内存可后续加。
+- `--print-logits` / `--dump-logits` 配合 `sample.py` 的 Python 输出做逐位对拍，是验证部署正确性的标准手段。
+
+---
+
 ## 常见操作速查
 
 | 操作 | 命令 |
@@ -190,6 +244,7 @@ learning_rate: 0.001
 | 冒烟测试 | `uv run python scripts/smoke_test.py` |
 | 训练 | `uv run python train.py config/<实验名>.yaml` |
 | 采样 | `uv run python sample.py --out_dir=out/<实验名>` |
+| 部署到 Rust | `uv run python runtime/scripts/convert.py --ckpt out/<实验>/ckpt.pt --dataset chinese` → `cd runtime && cargo run --release -- --prompt "悟空"` |
 | 看 checkpoint 里的配置 | `torch.load('out/xxx/ckpt.pt', weights_only=False)['model_args']` |
 | TensorBoard 对比曲线 | `uv run tensorboard --logdir out/`（需在配置里开 `tensorboard_log: true`） |
 | 提交实验 | `git add -A && git commit -m "..."` |

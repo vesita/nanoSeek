@@ -1,71 +1,131 @@
 //! 因果自注意力（对应 model.py 的 CausalSelfAttention）。
-//! 支持 RoPE（可选）；用因果掩码实现，小模型上 CPU 推理足够快。
+//! 两种模式：
+//!   · 标准路径：合并 c_attn 投影 + 因果掩码（支持全头 RoPE）
+//!   · CSA（压缩稀疏注意力）/ HCA（重度压缩注意力）：独立 Q/K/V 投影 +
+//!     部分 RoPE + 块级 KV 压缩 + 稀疏 top-k 块选择 + 滑窗 + 全局信号
+//! 小模型上 CPU 推理足够快。
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
+use crate::model::{linear, topk_last, Config};
+
 pub struct CausalSelfAttention {
-    // 注意：PyTorch 的 Linear 是 y = x @ W^T + b，这里同样处理
-    c_attn_w: Tensor, // (3*n_embd, n_embd)
+    // 标准路径权重（use_csa 时不加载）
+    c_attn_w: Option<Tensor>, // (3*n_embd, n_embd)
     c_attn_b: Option<Tensor>,
-    c_proj_w: Tensor, // (n_embd, n_embd)
+    // CSA 路径权重（use_csa 时加载，bias=False）
+    q_proj_csa_w: Option<Tensor>, // (n_embd, n_embd)
+    k_proj_csa_w: Option<Tensor>,
+    v_proj_csa_w: Option<Tensor>,
+    // 输出投影（两条路径共享）
+    c_proj_w: Tensor,
     c_proj_b: Option<Tensor>,
     n_head: usize,
     n_embd: usize,
     head_dim: usize,
-    cos: Option<Tensor>, // (block_size, head_dim)，use_rope 时才有
+    rope_head_dim: usize, // 部分 RoPE 的旋转维数（CSA 时 = qk_rope_head_dim）
+    cos: Option<Tensor>,  // (block_size, rope_head_dim)，use_rope 时才有
     sin: Option<Tensor>,
+    // CSA 参数
+    use_csa: bool,
+    csa_compress: usize,
+    csa_topk: usize,
+    csa_window: usize,
+    use_hca: bool,
 }
 
 impl CausalSelfAttention {
-    pub fn new(
-        vb: &candle_nn::VarBuilder,
-        prefix: &str,
-        n_embd: usize,
-        n_head: usize,
-        block_size: usize,
-        use_rope: bool,
-        rope_theta: f64,
-    ) -> Result<Self> {
+    pub fn new(vb: &candle_nn::VarBuilder, prefix: &str, config: &Config) -> Result<Self> {
+        let n_embd = config.n_embd;
+        let n_head = config.n_head;
         let head_dim = n_embd / n_head;
-        let c_attn_w = vb.get_unchecked(&format!("{prefix}.c_attn.weight"))?;
-        let c_attn_b = vb.get_unchecked(&format!("{prefix}.c_attn.bias")).ok();
+        let rope_head_dim = if config.use_csa {
+            config.qk_rope_head_dim
+        } else {
+            head_dim
+        };
+
+        // 标准路径或 CSA 路径的 Q/K/V 权重（二选一）
+        let (c_attn_w, c_attn_b, q_proj_csa_w, k_proj_csa_w, v_proj_csa_w) = if config.use_csa {
+            (
+                None,
+                None,
+                Some(vb.get_unchecked(&format!("{prefix}.q_proj_csa.weight"))?),
+                Some(vb.get_unchecked(&format!("{prefix}.k_proj_csa.weight"))?),
+                Some(vb.get_unchecked(&format!("{prefix}.v_proj_csa.weight"))?),
+            )
+        } else {
+            (
+                Some(vb.get_unchecked(&format!("{prefix}.c_attn.weight"))?),
+                vb.get_unchecked(&format!("{prefix}.c_attn.bias")).ok(),
+                None,
+                None,
+                None,
+            )
+        };
         let c_proj_w = vb.get_unchecked(&format!("{prefix}.c_proj.weight"))?;
         let c_proj_b = vb.get_unchecked(&format!("{prefix}.c_proj.bias")).ok();
-        let (cos, sin) = if use_rope {
-            let (c, s) = precompute_rope_freqs(block_size, head_dim, rope_theta, vb.device())?;
+
+        let (cos, sin) = if config.use_rope {
+            let (c, s) = precompute_rope_freqs(
+                config.block_size,
+                rope_head_dim,
+                config.rope_theta,
+                vb.device(),
+            )?;
             (Some(c), Some(s))
         } else {
             (None, None)
         };
+
         Ok(Self {
             c_attn_w,
             c_attn_b,
+            q_proj_csa_w,
+            k_proj_csa_w,
+            v_proj_csa_w,
             c_proj_w,
             c_proj_b,
             n_head,
             n_embd,
             head_dim,
+            rope_head_dim,
             cos,
             sin,
+            use_csa: config.use_csa,
+            csa_compress: config.csa_compress,
+            csa_topk: config.csa_topk,
+            csa_window: config.csa_window,
+            use_hca: config.use_hca,
         })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if self.use_csa {
+            let y = self.csa_forward(x)?;
+            return linear(&y, &self.c_proj_w, self.c_proj_b.as_ref());
+        }
+
+        // —— 标准路径 ——
         let (b, t, _) = x.dims3()?;
         let device = x.device();
 
         // 一次性投影出 q/k/v：y = x @ W^T (+ b)
-        let qkv = crate::model::linear(x, &self.c_attn_w, self.c_attn_b.as_ref())?;
+        let qkv = linear(
+            x,
+            self.c_attn_w.as_ref().expect("标准路径缺 c_attn"),
+            self.c_attn_b.as_ref(),
+        )?;
         let q = qkv.narrow(2, 0, self.n_embd)?;
         let k = qkv.narrow(2, self.n_embd, self.n_embd)?;
         let v = qkv.narrow(2, 2 * self.n_embd, self.n_embd)?;
 
-        // 拆成多头：head 维保留在第 2 维，便于后面先做 RoPE 再转置
+        // 拆成多头：head 维保留在第 2 维，便于先做 RoPE 再转置
         let q = q.reshape((b, t, self.n_head, self.head_dim))?;
         let k = k.reshape((b, t, self.n_head, self.head_dim))?;
         let v = v.reshape((b, t, self.n_head, self.head_dim))?;
 
-        // RoPE：只对 q 和 k 旋转（v 不参与），这样 q·k 的点积携带相对位置
+        // RoPE（全头旋转）：只对 q 和 k 旋转（v 不参与）
         let (q, k) = if let (Some(cos), Some(sin)) = (&self.cos, &self.sin) {
             let cos = cos.narrow(0, 0, t)?.unsqueeze(0)?.unsqueeze(2)?; // (1, T, 1, hd)
             let sin = sin.narrow(0, 0, t)?.unsqueeze(0)?.unsqueeze(2)?;
@@ -94,7 +154,158 @@ impl CausalSelfAttention {
         let y = y.permute((0, 2, 1, 3))?.reshape((b, t, self.n_embd))?;
 
         // 输出投影
-        crate::model::linear(&y, &self.c_proj_w, self.c_proj_b.as_ref())
+        linear(&y, &self.c_proj_w, self.c_proj_b.as_ref())
+    }
+
+    /// CSA + HCA 混合注意力（V4 简化教育版，逐位对齐 model.py 的 _csa_forward）。
+    /// 注意开销从 O(T²) 降到 O(T·(nb + win))。
+    fn csa_forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, t, c) = x.dims3()?;
+        let nh = self.n_head;
+        let d = self.head_dim;
+        let m = self.csa_compress;
+        let win = self.csa_window.min(t);
+        let device = x.device();
+
+        // —— 1) Q/K/V 独立投影 + 部分 RoPE ——
+        let q = linear(x, self.q_proj_csa_w.as_ref().expect("use_csa 缺 q_proj_csa"), None)?
+            .reshape((b, t, nh, d))?;
+        let k = linear(x, self.k_proj_csa_w.as_ref().expect("use_csa 缺 k_proj_csa"), None)?
+            .reshape((b, t, nh, d))?;
+        let v = linear(x, self.v_proj_csa_w.as_ref().expect("use_csa 缺 v_proj_csa"), None)?
+            .reshape((b, t, nh, d))?;
+
+        // 部分 RoPE：只旋转前 rope_head_dim 维（与 MLA 一致），其余是"无位置"内容维
+        let (q, k) = if let (Some(cos), Some(sin)) = (&self.cos, &self.sin) {
+            let rope = self.rope_head_dim;
+            let cos = cos.narrow(0, 0, t)?.unsqueeze(0)?.unsqueeze(2)?; // (1,T,1,rope)
+            let sin = sin.narrow(0, 0, t)?.unsqueeze(0)?.unsqueeze(2)?;
+            let q_rope = q.narrow(3, 0, rope)?;
+            let q_nope = q.narrow(3, rope, d - rope)?;
+            let q_rope = q_rope.broadcast_mul(&cos)?.add(&rotate_half(&q_rope)?.broadcast_mul(&sin)?)?;
+            let q = Tensor::cat(&[&q_rope, &q_nope], 3)?;
+            let k_rope = k.narrow(3, 0, rope)?;
+            let k_nope = k.narrow(3, rope, d - rope)?;
+            let k_rope = k_rope.broadcast_mul(&cos)?.add(&rotate_half(&k_rope)?.broadcast_mul(&sin)?)?;
+            let k = Tensor::cat(&[&k_rope, &k_nope], 3)?;
+            (q, k)
+        } else {
+            (q, k)
+        };
+
+        // —— 2) 块级压缩 + 稀疏块选择 + HCA ——
+        // 短序列（块数 nb < topk）时 topk 会越界，用 k_eff = min(topk, nb) 兜底；
+        // nb = 0（不足一个块）时块路径整个跳过，只靠滑窗。
+        let t_ok = (t / m) * m;
+        let nb = t_ok / m;
+        let scale = 1.0 / (d as f64).sqrt();
+        let q_p = q.permute((0, 2, 1, 3))?; // (B,nh,T,d)，滑窗也要用
+
+        let mut y_comp = Tensor::zeros((b, t, nh, d), DType::F32, device)?;
+        if nb > 0 {
+            let k_blocks = k.narrow(1, 0, t_ok)?.reshape((b, nb, m, nh, d))?.mean(2)?; // (B,nb,nh,d)
+            let v_blocks = v.narrow(1, 0, t_ok)?.reshape((b, nb, m, nh, d))?.mean(2)?;
+
+            // 因果块掩码：query 只能看「它所在块之前」的块
+            let (causal_block, has_prior) = csa_masks(t, m, device)?; // (T,nb), (T,)
+
+            // 注意力分数 s_blk = einsum('bthd,bnhd->bthn', q, k_blocks) / sqrt(d)
+            let kb_p = k_blocks.permute((0, 2, 1, 3))?; // (B,nh,nb,d)
+            let s_blk = q_p.matmul(&kb_p.transpose(2, 3)?)?.affine(scale, 0.0)?; // (B,nh,T,nb)
+            let s_blk = s_blk.permute((0, 2, 1, 3))?; // (B,T,nh,nb)
+
+            // 因果 mask：不允许的块 → -inf（where_cond 的条件必须是 U8）
+            let causal_inv = causal_block
+                .affine(-1.0, 1.0)?
+                .to_dtype(DType::U8)?
+                .unsqueeze(0)?
+                .unsqueeze(2)?; // (1,T,1,nb)
+            let causal_inv = causal_inv.broadcast_as(s_blk.shape())?;
+            let (neg_inf, zeros) = inf_zeros(s_blk.shape().dims().to_vec(), device)?;
+            let s_blk = causal_inv.where_cond(&neg_inf, &s_blk)?;
+
+            // 稀疏：只保留每个 query 得分最高的 k_eff 个块（其余 -inf，softmax 后为 0）
+            let k_eff = self.csa_topk.min(nb);
+            let (topk_vals, _) = topk_last(&s_blk, k_eff)?; // (B,T,nh,k_eff)
+            let thr = topk_vals
+                .narrow(topk_vals.shape().rank() - 1, k_eff - 1, 1)?
+                .broadcast_as(s_blk.shape())?; // 第 k_eff 大值广播成阈值
+            let lt = s_blk.lt(&thr)?;
+            let s_blk = lt.where_cond(&neg_inf, &s_blk)?;
+
+            // 没有历史块的 query：整行置 0（否则 softmax 对全 -inf 产生 NaN）
+            let has_prior_inv = has_prior
+                .affine(-1.0, 1.0)?
+                .to_dtype(DType::U8)?
+                .unsqueeze(0)?
+                .unsqueeze(2)?
+                .unsqueeze(3)?
+                .broadcast_as(s_blk.shape())?; // (1,T,1,1)
+            let s_blk = has_prior_inv.where_cond(&zeros, &s_blk)?;
+
+            let a_blk = candle_nn::ops::softmax(&s_blk, 3)?; // (B,T,nh,nb)
+            // y_comp = einsum('bthn,bnhd->bthd', a_blk, v_blocks)
+            let a_p = a_blk.permute((0, 2, 1, 3))?; // (B,nh,T,nb)
+            let vb_p = v_blocks.permute((0, 2, 1, 3))?; // (B,nh,nb,d)
+            y_comp = a_p.matmul(&vb_p)?.permute((0, 2, 1, 3))?; // (B,T,nh,d)
+            let hp = has_prior.unsqueeze(0)?.unsqueeze(2)?.unsqueeze(3)?; // (1,T,1,1)
+            y_comp = y_comp.broadcast_mul(&hp)?; // 无历史块的 query 贡献清零
+
+            // —— HCA：重度压缩的全局信号（可选）——
+            // 把所有允许的压缩块再平均成一个全局潜在，每个 query 加上它
+            if self.use_hca {
+                let n_allowed = causal_block.sum_keepdim(1)?.clamp(1.0, f64::INFINITY)?.flatten_all()?; // (T,)
+                let v_flat = v_blocks.reshape((b, nb, nh * d))?; // (B,nb,nh*d)
+                // v_glob = einsum('tn,bnhd->bthd', causal_block, v_blocks) / n_allowed
+                let v_glob = causal_block
+                    .unsqueeze(0)?
+                    .matmul(&v_flat)?
+                    .reshape((b, t, nh, d))?; // (B,T,nh,d)
+                let n_b = n_allowed.unsqueeze(0)?.unsqueeze(2)?.unsqueeze(3)?; // (1,T,1,1)
+                let v_glob = v_glob.broadcast_div(&n_b)?;
+                y_comp = y_comp.add(&v_glob)?;
+            }
+        }
+
+        // —— 3) 滑窗：最近 win 个原始 token 的局部因果注意力 ——
+        // 滑窗允许看自己（j ≤ i），保证每个位置至少有一个合法键，避免全 -inf
+        let win_mask = window_mask(t, win, device)?; // (T,T)，-inf 表示不合法
+        let k_p = k.permute((0, 2, 1, 3))?; // (B,nh,T,d)
+        let s_win = q_p.matmul(&k_p.transpose(2, 3)?)?.affine(scale, 0.0)?; // (B,nh,T,T)
+        let win_b = win_mask.unsqueeze(0)?.unsqueeze(0)?.broadcast_as(s_win.shape())?; // (1,1,T,T)
+        let (win_inf, _) = inf_zeros(s_win.shape().dims().to_vec(), device)?;
+        let s_win = win_b.where_cond(&win_inf, &s_win)?;
+        let a_win = candle_nn::ops::softmax(&s_win, 3)?; // (B,nh,T,T)
+        let v_p = v.permute((0, 2, 1, 3))?; // (B,nh,T,d)
+        let y_win = a_win.matmul(&v_p)?.permute((0, 2, 1, 3))?; // (B,T,nh,d)
+
+        let y = y_comp.add(&y_win)?;
+
+        // 合并 head：(B,T,nh,d) → (B,T,C)。
+        // 逐位复刻 Python 的 y.transpose(1,2).contiguous().view(B,T,C)——
+        // 当 y 是 (B,T,nh,d) 时这个 view 不是干净 reshape，而是置换：
+        //   result[b][t][h*d+dd] = y[b][t'][h'][dd]，其中 h'*T + t' = t*nh + h。
+        // 标准注意力路径的 y 是 (B,nh,T,d)，transpose 后 view 无置换；
+        // 这是 CSA 独有的布局怪癖，模型权重按它训出来的，必须原样复刻。
+        let y_flat: Vec<f32> = y.flatten_all()?.to_vec1()?;
+        let mut out = vec![0f32; b * t * c];
+        for bb in 0..b {
+            for tt in 0..t {
+                for hh in 0..nh {
+                    // h' = V // T, t' = V % T，其中 V = tt*nh + hh
+                    let v = tt * nh + hh;
+                    let h_idx = v / t;
+                    let t_idx = v % t;
+                    for dd in 0..d {
+                        let src = ((bb * t + t_idx) * nh + h_idx) * d + dd;
+                        let dst = (bb * t + tt) * c + hh * d + dd;
+                        out[dst] = y_flat[src];
+                    }
+                }
+            }
+        }
+        let y = Tensor::new(out.as_slice(), device)?.reshape((b, t, c))?; // (B,T,C)
+        Ok(y)
     }
 }
 
@@ -106,25 +317,33 @@ fn rotate_half(x: &Tensor) -> Result<Tensor> {
     Ok(Tensor::cat(&[&x2.neg()?, &x1], 3)?)
 }
 
-/// 预计算 RoPE 的 cos/sin 表：(block_size, head_dim)。
+/// 预计算 RoPE 的 cos/sin 表：(block_size, rope_dim)。
+/// rope_dim 可以是全 head_dim（标准路径）或 qk_rope_head_dim（CSA 部分 RoPE）。
 fn precompute_rope_freqs(
     block_size: usize,
-    head_dim: usize,
+    rope_dim: usize,
     theta: f64,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
-    let mut freqs = Vec::with_capacity(block_size * head_dim);
+    // 逐位对齐 model.py 的 precompute_rope_freqs：全程 f32 运算（PyTorch 里
+    // arange.float() / head_dim 是 f32，theta ** exp 也是 f32 pow）。之前用 f64 算
+    // 完再转 f32，会和 PyTorch 的 f32 结果差 1 ulp，被 MoE 路由放大成 logits 偏差。
+    let theta32 = theta as f32;
+    let mut freqs = Vec::with_capacity(block_size * rope_dim);
     for t in 0..block_size {
-        for j in 0..head_dim / 2 {
-            let inv = 1.0 / theta.powf(j as f64 / head_dim as f64);
-            freqs.push(t as f64 * inv);
+        // 每个二维平面一个频率：指数 = 2j/head_dim（对应 torch.arange(0, head_dim, 2)）
+        for j in 0..rope_dim / 2 {
+            let exp = (2.0 * j as f32) / rope_dim as f32;
+            let inv = 1.0f32 / theta32.powf(exp);
+            freqs.push(t as f32 * inv);
         }
-        for j in 0..head_dim / 2 {
-            let inv = 1.0 / theta.powf(j as f64 / head_dim as f64);
-            freqs.push(t as f64 * inv);
+        for j in 0..rope_dim / 2 {
+            let exp = (2.0 * j as f32) / rope_dim as f32;
+            let inv = 1.0f32 / theta32.powf(exp);
+            freqs.push(t as f32 * inv);
         }
     }
-    let freqs = Tensor::new(freqs.as_slice(), device)?.reshape((block_size, head_dim))?;
+    let freqs = Tensor::new(freqs.as_slice(), device)?.reshape((block_size, rope_dim))?;
     Ok((freqs.cos()?, freqs.sin()?))
 }
 
@@ -143,4 +362,45 @@ fn causal_mask(t: usize, device: &Device) -> Result<Tensor> {
     let zeros = Tensor::zeros((t, t), DType::F32, device)?;
     let mask = invalid.where_cond(&neg_inf, &zeros)?;
     Ok(mask)
+}
+
+/// 滑窗掩码：(T, T)，U8 类型，1 = 屏蔽（where_cond 的条件必须是 U8）。
+/// 逐位对齐 model.py：win_causal[m][n] = (m <= n) & (n - m <= win)。
+/// 注意：这是「向前看」的窗口（query m 允许看 key n ∈ [m, m+win]），
+/// 与常规因果相反——但权重就是按这个语义训出来的，必须原样复刻。
+fn window_mask(t: usize, win: usize, device: &Device) -> Result<Tensor> {
+    let mut mask = vec![0u8; t * t];
+    for i in 0..t {
+        for j in 0..t {
+            mask[i * t + j] = if i <= j && j - i <= win { 0 } else { 1 };
+        }
+    }
+    Ok(Tensor::new(mask.as_slice(), device)?.reshape((t, t))?)
+}
+
+/// CSA 的块级掩码：
+///   · causal_block (T, nb)：[i][n] = 1 表示 query i 允许看块 n（块 n < 所在块）
+///   · has_prior (T,)：该 query 有没有历史块（用于 NaN 守卫）
+fn csa_masks(t: usize, m: usize, device: &Device) -> Result<(Tensor, Tensor)> {
+    let nb = t / m;
+    let mut has_prior = vec![0f32; t];
+    let mut causal = vec![0f32; t * nb];
+    for i in 0..t {
+        let bi = i / m; // 该 query 所在的块索引
+        has_prior[i] = if bi > 0 { 1.0 } else { 0.0 };
+        for n in 0..nb {
+            causal[i * nb + n] = if bi > n { 1.0 } else { 0.0 };
+        }
+    }
+    let causal_t = Tensor::new(causal.as_slice(), device)?.reshape((t, nb))?;
+    let has_prior_t = Tensor::new(has_prior.as_slice(), device)?;
+    Ok((causal_t, has_prior_t))
+}
+
+/// 生成指定形状的全 -inf 张量和全 0 张量（where_cond 的 on_true/on_false）。
+fn inf_zeros(dims: Vec<usize>, device: &Device) -> Result<(Tensor, Tensor)> {
+    let n: usize = dims.iter().product();
+    let neg_inf = Tensor::new(vec![f32::NEG_INFINITY; n], device)?.reshape(dims.clone())?;
+    let zeros = Tensor::zeros(dims, DType::F32, device)?;
+    Ok((neg_inf, zeros))
 }

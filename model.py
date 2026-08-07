@@ -218,25 +218,31 @@ class CausalSelfAttention(nn.Module):
             k = torch.cat([k_rope, k_nope], dim=-1)
 
         # --- 1) 块级压缩：每 m 个连续 token 的 K/V 平均池化成 1 个潜在 ---
+        # 短序列（块数 nb < topk）时 topk 会越界，用 k_eff = min(topk, nb) 兜底；
+        # nb = 0（不足一个块）时块路径整个跳过，只靠滑窗。
         T_ok = (T // m) * m
         nb = T_ok // m
-        k_blocks = k[:, :T_ok].view(B, nb, m, nh, d).mean(dim=2)   # (B, nb, nh, d)
-        v_blocks = v[:, :T_ok].view(B, nb, m, nh, d).mean(dim=2)
+        k_eff = min(self.config.csa_topk, nb)
+        y_comp = torch.zeros(B, T, nh, d, device=x.device, dtype=x.dtype)
+        has_prior = torch.zeros(T, device=x.device)
+        if nb > 0:
+            k_blocks = k[:, :T_ok].view(B, nb, m, nh, d).mean(dim=2)   # (B, nb, nh, d)
+            v_blocks = v[:, :T_ok].view(B, nb, m, nh, d).mean(dim=2)
 
-        # --- 2) 稀疏块选择：query 只能看「它所在块之前」的块，再取 top-k ---
-        bq = torch.arange(T, device=x.device) // m                  # 每个 query 属于哪个块
-        causal_block = bq.unsqueeze(-1) > torch.arange(nb, device=x.device)  # (T, nb)
-        has_prior = causal_block.any(dim=-1)                        # (T,) 该 query 有没有历史块
-        s_blk = torch.einsum('bthd,bnhd->bthn', q, k_blocks) / math.sqrt(d)  # (B,T,nh,nb)
-        s_blk = s_blk.masked_fill(~causal_block.unsqueeze(0).unsqueeze(2), float('-inf'))
-        # 稀疏：只保留每个 query 得分最高的 topk 个块（其余 -inf，softmax 后为 0）
-        topk_vals, _ = s_blk.topk(self.config.csa_topk, dim=-1)
-        s_blk = s_blk.masked_fill(s_blk < topk_vals[..., [-1]], float('-inf'))
-        # 没有历史块的 query：整行置 0（否则 softmax 对全 -inf 产生 NaN）
-        s_blk = s_blk.masked_fill(~has_prior.view(1, T, 1, 1), 0.0)
-        a_blk = F.softmax(s_blk, dim=-1)                            # (B,T,nh,nb)
-        y_comp = torch.einsum('bthn,bnhd->bthd', a_blk, v_blocks)   # (B,T,nh,d)
-        y_comp = y_comp * has_prior.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).float()
+            # --- 2) 稀疏块选择：query 只能看「它所在块之前」的块，再取 top-k ---
+            bq = torch.arange(T, device=x.device) // m                # 每个 query 属于哪个块
+            causal_block = bq.unsqueeze(-1) > torch.arange(nb, device=x.device)  # (T, nb)
+            has_prior = causal_block.any(dim=-1)                      # (T,) 该 query 有没有历史块
+            s_blk = torch.einsum('bthd,bnhd->bthn', q, k_blocks) / math.sqrt(d)  # (B,T,nh,nb)
+            s_blk = s_blk.masked_fill(~causal_block.unsqueeze(0).unsqueeze(2), float('-inf'))
+            # 稀疏：只保留每个 query 得分最高的 k_eff 个块（其余 -inf，softmax 后为 0）
+            topk_vals, _ = s_blk.topk(k_eff, dim=-1)
+            s_blk = s_blk.masked_fill(s_blk < topk_vals[..., [-1]], float('-inf'))
+            # 没有历史块的 query：整行置 0（否则 softmax 对全 -inf 产生 NaN）
+            s_blk = s_blk.masked_fill(~has_prior.view(1, T, 1, 1), 0.0)
+            a_blk = F.softmax(s_blk, dim=-1)                          # (B,T,nh,nb)
+            y_comp = torch.einsum('bthn,bnhd->bthd', a_blk, v_blocks)  # (B,T,nh,d)
+            y_comp = y_comp * has_prior.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).float()
 
         # --- 3) 滑窗：最近 win 个原始 token 的局部因果注意力 ---
         # 滑窗允许看自己（j ≤ i），保证每个位置至少有一个合法键，避免全 -inf。
@@ -252,7 +258,7 @@ class CausalSelfAttention(nn.Module):
         # --- 4) HCA：重度压缩的全局信号（可选）---
         # 把所有允许的压缩块再平均成一个全局潜在（不做稀疏选择 = 重度压缩），
         # 每个 query 加上它作为全局上下文。这是"全文一句话摘要"式的粗粒度信号。
-        if self.config.use_hca:
+        if self.config.use_hca and nb > 0:
             n_allowed = causal_block.float().sum(dim=-1).clamp(min=1)  # (T,)
             k_glob = torch.einsum('tn,bnhd->bthd', causal_block.float(), k_blocks) / \
                      n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
