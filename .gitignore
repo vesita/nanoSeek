@@ -22,5 +22,8 @@ runtime/Cargo.lock
 # 训练 checkpoint 输出目录
 out/
 
+# 打包产物（由 scripts/package.py 生成）
+release/
+
 # 依赖锁文件（按需重新生成）
 uv.lock
