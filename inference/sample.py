@@ -2,12 +2,17 @@
 从训练好的模型中采样生成
 """
 import os
+import sys
 import pickle
 from contextlib import nullcontext
+
+# 脚本在 inference/ 子目录，把项目根目录插到 sys.path 开头
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 import tiktoken
 from model import GPTConfig, GPT
-from config_loader import load_config
+from model.config_loader import load_config
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # 要么是 'resume'（从 out_dir），要么是某个 gpt2 变体（如 'gpt2-xl'）
@@ -35,7 +40,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # 模型
 if init_from == 'resume':
     # 从保存在特定目录中的模型初始化
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(out_dir, 'best.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
@@ -54,22 +59,20 @@ model.to(device)
 if compile:
     model = torch.compile(model) # 需要 PyTorch 2.0（可选）
 
-# 查找数据集文件夹里是否有 meta pickle
-load_meta = False
+# 查找数据集文件夹里是否有 BPE 分词器
+load_tok = False
 if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # 旧版 checkpoint 可能没有这些字段……
-    meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
-    load_meta = os.path.exists(meta_path)
-if load_meta:
-    print(f"正在从 {meta_path} 加载 meta……")
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    # TODO 希望让这里对任意的编码/解码方案更通用
-    stoi, itos = meta['stoi'], meta['itos']
-    encode = lambda s: [stoi[c] for c in s]
-    decode = lambda l: ''.join([itos[i] for i in l])
+    tok_path = os.path.join('data', checkpoint['config']['dataset'], 'tokenizer.json')
+    load_tok = os.path.exists(tok_path)
+if load_tok:
+    print(f"正在从 {tok_path} 加载 BPE 分词器……")
+    from tokenizers import Tokenizer
+    tokenizer = Tokenizer.from_file(tok_path)
+    encode = lambda s: tokenizer.encode(s).ids
+    decode = lambda l: tokenizer.decode(l)
 else:
     # 好，那就默认使用 gpt-2 编码
-    print("未找到 meta.pkl，假定使用 GPT-2 编码……")
+    print("未找到 tokenizer.json，假定使用 GPT-2 编码……")
     enc = tiktoken.get_encoding("gpt2")
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)

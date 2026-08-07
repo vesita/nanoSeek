@@ -26,7 +26,7 @@ nanoGPT 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 | `use_mla` | `false` | 多头潜在注意力：KV 低秩压缩 + 部分 RoPE |
 | `use_mtp` | `false` | 多 token 预测：训练时额外预测未来 token |
 
-**DeepSeek-V4 新技术**（`config/train_chinese_v4_*.yaml` 逐项验证）：
+**DeepSeek-V4 新技术**（`training/config/train_chinese_v4_*.yaml` 逐项验证）：
 
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
@@ -45,7 +45,7 @@ nanoGPT 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 **默认 small 模型**：4 层 / 128 维 / 256 上下文 ≈ **0.83M 参数**，RTX 5060 上约 1 分钟一轮训练，适合快速迭代实验。
 
 **实验基础设施**：
-- 冒烟测试 `scripts/smoke_test.py`：秒级验证模型前向/反向 + 参数量对比
+- 冒烟测试 `inference/scripts/smoke_test.py`：秒级验证模型前向/反向 + 参数量对比
 - checkpoint 统一输出到 `out/`（git 忽略）
 - 干净的 git 仓库，每个实验一个 commit，可随时回退对比
 
@@ -57,7 +57,7 @@ nanoGPT 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 
 ```sh
 uv sync          # 按 pyproject.toml 安装依赖到 .venv
-uv run python scripts/smoke_test.py   # 验证环境 + 模型可用
+uv run python inference/scripts/smoke_test.py   # 验证环境 + 模型可用
 ```
 
 环境要求：Python ≥ 3.12，PyTorch ≥ 2.0（用于 flash attention 和 torch.compile），有 NVIDIA GPU 最佳。
@@ -68,24 +68,29 @@ uv run python scripts/smoke_test.py   # 验证环境 + 模型可用
 
 ```
 nanoGPT/
-├── model.py          # GPT 模型（魔改核心，V2/V3/V4 全部架构开关）
-├── train.py          # 训练循环
-├── sample.py         # Python 文本采样（任何架构都能跑）
-├── bench.py          # 性能基准
-├── config_loader.py  # YAML 配置加载器（替代原 configurator）
-├── config/           # 实验配置（YAML）
-│   ├── train_chinese.yaml              # 中文基线（非 MoE）
-│   ├── train_chinese_moe.yaml          # MoE 基线
-│   └── train_chinese_v4_*.yaml         # V4 五项技术对比实验
-├── runtime/          # Rust 推理框架（candle，CPU 推理 + 对话 REPL）
-│   ├── src/          # model.rs / attention.rs / main.rs / tokenizer.rs
-│   ├── scripts/convert.py   # PyTorch checkpoint → safetensors + 配置 + 词表
-│   ├── model.safetensors    # 已转换的最优模型（CSA）
-│   └── Cargo.toml
-├── scripts/
-│   └── smoke_test.py # 冒烟测试
-├── data/             # 数据集与预处理脚本
-└── out/              # 训练输出（git 忽略）
+├── model/                     # 模型核心
+│   ├── __init__.py            # 重导出 GPT / GPTConfig 等
+│   ├── model.py               # GPT 模型（V2/V3/V4 全部架构开关）
+│   └── config_loader.py       # YAML 配置加载器
+├── training/                  # 训练相关
+│   ├── train.py               # 训练循环
+│   └── config/                # 实验配置（YAML）
+│       ├── train_chinese.yaml             # 快速调试用（base，非 MoE）
+│       └── train_chinese_v4_csa.yaml      # 默认对话模型（CSA/HCA + MoE）
+├── inference/                 # 推理与部署
+│   ├── sample.py              # Python 文本采样（任何架构都能跑）
+│   ├── bench.py               # 性能基准
+│   ├── runtime/               # Rust 推理框架（candle，CPU 推理 + 对话 REPL）
+│   │   ├── src/               # model.rs / attention.rs / main.rs / tokenizer.rs
+│   │   └── scripts/convert.py # checkpoint → safetensors + tokenizer.json
+│   └── scripts/               # smoke_test.py（冒烟）/ package.py（打包）
+├── data/                      # 数据集脚本（数据文件按需下载，git 忽略）
+│   └── chinese/
+│       ├── prepare.py         # 语料 → train.bin / val.bin
+│       ├── train_tokenizer.py # BPE 分词器训练
+│       └── download_dialogue.py  # 魔搭对话语料下载
+├── out/                       # 训练输出（git 忽略）
+└── release/                   # 打包产物（git 忽略）
 ```
 
 ---
@@ -97,43 +102,26 @@ nanoGPT/
 **① 准备数据**（一次性）
 
 ```sh
-uv run python data/shakespeare_char/prepare.py   # 英文：65 词表，约 100 万 token
-uv run python data/chinese/prepare.py            # 中文《西游记》：4507 词表，约 68 万 token
+uv run python data/chinese/download_dialogue.py     # 1. 从魔搭下载中文对话语料
+uv run python data/chinese/train_tokenizer.py       # 2. 训 BPE 分词器 → tokenizer.json
+uv run python data/chinese/prepare.py               # 3. 编码 → train.bin / val.bin
 ```
 
 **② 训练中文模型**
 
 ```sh
-uv run python train.py config/train_chinese.yaml
+uv run python training/train.py training/config/train_chinese.yaml
 ```
 
-约 5-10 分钟跑完（5000 步）。**注意**：中文初始 loss ≈ 8.4，不是英文的 ~4.2——那是 `ln(4507)` 词表难度的正常值，跨数据集比 loss 没有意义。
+约 5-10 分钟跑完（5000 步）。**注意**：BPE 词表 8000，随机初始化 loss ≈ `ln(8000)` ≈ 9.0；这个值只和词表大小挂钩，跨数据集/词表比 loss 没有意义。
 
 **③ 采样看效果**
 
 ```sh
-uv run python sample.py --out_dir=out/chinese --start="悟空" --num_samples=3 --max_new_tokens=300
+uv run python inference/sample.py --out_dir=out/chinese --start="悟空" --num_samples=3 --max_new_tokens=300
 ```
 
-**④ 架构 A/B（在英文基线上做）**
-
-对比「原始 GPT-2」和「modern 三件套」，用英文基线跑：速度快、loss 低、好比较。modern 用命令行覆盖开关即可，无需新建配置：
-
-```sh
-uv run python train.py config/train_shakespeare_char.yaml
-uv run python train.py config/train_shakespeare_char.yaml --out_dir=out/shakespeare-char-modern --use_rmsnorm=true --use_rope=true --use_swiglu=true
-```
-
-各约 1 分钟。关键看训练途中出现的 **best val loss**（小数据集上模型会过拟合，最终 loss 会反弹，别比最后一轮）：
-
-```sh
-uv run python -c "
-import torch
-for d in ['out/shakespeare-char', 'out/shakespeare-char-modern']:
-    ck = torch.load(f'{d}/ckpt.pt', map_location='cpu', weights_only=False)
-    print(f'{d}: best_val_loss = {ck[\"best_val_loss\"]:.4f}')
-"
-```
+**④ 版本化续训**（详见下方「版本化连续训练」）：`--init_from=resume` 续训、`--init_from=<路径>.pt` 基于已有模型做后训练。
 
 **⑤ 提交实验**（每个实验一个 commit，方便回退）
 
@@ -148,7 +136,7 @@ git add -A && git commit -m "实验：..."
 配置文件是 YAML，键对应 `train.py` 里的全局变量：
 
 ```yaml
-# config/train_chinese.yaml
+# training/config/train_chinese.yaml
 out_dir: out/chinese
 dataset: chinese
 n_layer: 4
@@ -179,11 +167,29 @@ learning_rate: 0.001
 | 8 | V4：Anticipatory Routing（预判路由） | ✅ 已实现，待对比训练 |
 | 9 | V4：CSA/HCA 压缩稀疏注意力 | ✅ 已实现（简化教育版），待对比训练 |
 
-**数据集**：已从《西游记》单本扩充为四大名著合集（约 302 万字符，6403 词表，train 272 万 token），`data/chinese/prepare.py` 自动下载缺失的书籍。
+**数据集**：已从字符级换为 **BPE 子词分词**（魔搭中文对话语料 ~153MB，8000 词表，ByteLevel 预分词）。8000 词表专为日常中文设计：压缩率 ~1.3x（比 30000 只降 13%），但嵌入表从 2.88M 砍到 0.77M，transformer 参数占比大幅提升。数据流程：`download_dialogue.py`（魔搭下载对话）→ `train_tokenizer.py`（训 BPE，`--vocab-size` 可调）→ `prepare.py`（编码成 train.bin/val.bin）。数据文件全部 git 忽略、按需下载。
 
-**V4 对比实验**：每个技术一个配置（`config/train_chinese_v4_*.yaml`），以 `train_chinese_moe.yaml` 为基线，同超参只切换目标开关，比较 val loss 与训练稳定性。
+**默认模型**：`train_chinese_v4_csa.yaml`（CSA/HCA + MoE，~4.3M 参数）——项目已从"逐项对比 V4 技术"转向"持续训练一个对话模型"，其余对比配置已删除。
 
-**已跑过的实验**（在 10.7M 模型上）：基线的 best val loss 1.4733，modern 1.4764——几乎打平，但 modern 少了约 10 万参数（RoPE 删掉了位置编码表）、且更早收敛。这印证了这三件套是"结构效率"改进：同等表现、更省参数，规模放大后优势更明显。
+## 版本化连续训练
+
+训练按"版本"推进，每版一个 `out/` 目录，靠 YOLO 式的 `best.pt`/`last.pt` 双 checkpoint 衔接：
+
+```sh
+# v0：从零初训（会存 last.pt 每次评估 + best.pt 仅在 val 变优时存）
+uv run python training/train.py training/config/train_chinese_v4_csa.yaml --max_iters=10000
+
+# 续训（同一版本继续训，恢复优化器和学习率计划）
+uv run python training/train.py training/config/train_chinese_v4_csa.yaml --init_from=resume --max_iters=15000
+
+# 后训练（基于旧版本 best.pt 开新版本，优化器/学习率重置）
+uv run python training/train.py training/config/train_chinese_v4_csa.yaml \
+  --init_from=out/chinese-v4-csa/best.pt --out_dir=out/chinese-v4-csa-v2 --max_iters=5000
+```
+
+- `best.pt`：val loss 最优的 checkpoint，续训/部署默认用它
+- `last.pt`：每次评估时的最新状态，防止训练中断丢进度
+- 进度条显示当前轮次（epoch）
 
 ---
 
@@ -195,10 +201,10 @@ learning_rate: 0.001
 
 ```sh
 # 1. 转换 checkpoint（默认转换最优的 CSA 模型）
-uv run python runtime/scripts/convert.py --ckpt out/chinese-v4-csa/ckpt.pt --dataset chinese
+uv run python inference/runtime/scripts/convert.py --ckpt out/chinese-v4-csa/best.pt --dataset chinese
 
 # 2. 编译 Rust 运行时
-cd runtime && cargo build --release
+cd inference/runtime && cargo build --release
 
 # 3. 一次性生成
 ./target/release/nanogpt-runtime --prompt "悟空" --max-new-tokens 100
@@ -222,7 +228,7 @@ cd runtime && cargo build --release
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
-| `--model` / `--config` / `--vocab` | runtime/ 下三个文件 | 覆盖加载路径 |
+| `--model` / `--config` / `--tokenizer` | runtime/ 下三个文件 | 覆盖加载路径 |
 | `--prompt "..."` | 无 | 给则一次性生成，否则进 REPL |
 | `--max-new-tokens N` | 300 | 生成长度 |
 | `--temperature T` / `--top-k K` | 0.8 / 200 | 采样参数 |
@@ -233,7 +239,7 @@ cd runtime && cargo build --release
 **部署注意**：
 - 推理是纯 CPU，逐 token 重新前向（无 KV cache），块长 256 的小模型上足够快；放大模型后建议加 KV cache。
 - 权重全部 F32，无量化；需要更低显存/内存可后续加。
-- `--print-logits` / `--dump-logits` 配合 `sample.py` 的 Python 输出做逐位对拍，是验证部署正确性的标准手段。
+- `--print-logits` / `--dump-logits` 配合 `inference/sample.py` 的 Python 输出做逐位对拍，是验证部署正确性的标准手段。
 
 ---
 
@@ -241,16 +247,16 @@ cd runtime && cargo build --release
 
 | 操作 | 命令 |
 |------|------|
-| 冒烟测试 | `uv run python scripts/smoke_test.py` |
+| 冒烟测试 | `uv run python inference/scripts/smoke_test.py` |
 | 训练 | `uv run python train.py config/<实验名>.yaml` |
-| 采样 | `uv run python sample.py --out_dir=out/<实验名>` |
-| 部署到 Rust | `uv run python runtime/scripts/convert.py --ckpt out/<实验>/ckpt.pt --dataset chinese` → `cd runtime && cargo run --release -- --prompt "悟空"` |
-| 看 checkpoint 里的配置 | `torch.load('out/xxx/ckpt.pt', weights_only=False)['model_args']` |
+| 采样 | `uv run python inference/sample.py --out_dir=out/<实验名>` |
+| 部署到 Rust | `uv run python inference/runtime/scripts/convert.py --ckpt out/<实验>/best.pt --dataset chinese` → `cd inference/runtime && cargo run --release -- --prompt "悟空"` |
+| 看 checkpoint 里的配置 | `torch.load('out/xxx/best.pt', weights_only=False)['model_args']` |
 | TensorBoard 对比曲线 | `uv run tensorboard --logdir out/`（需在配置里开 `tensorboard_log: true`） |
 | 提交实验 | `git add -A && git commit -m "..."` |
 | 回退到上个实验 | `git checkout <上一个commit>` |
 
-**训练体验**（实验目录只留可读文件：`ckpt.pt` / `results.csv` / `loss_curve.png`）：
+**训练体验**（实验目录只留可读文件：`best.pt` / `results.csv` / `loss_curve.png`）：
 - **`results.csv`**（YOLO 式）：每个评估点一行 `step, train/loss, val/loss, lr, mfu, time`，纯文本、Excel 可直接打开、训练中断也能读到已落盘部分
 - **`loss_curve.png`**：训练结束自动生成 train/val 双曲线，不用开任何工具直接看图
 - **checkpoint 异步保存**（后台线程 + 原子改名），保存时训练不再卡顿

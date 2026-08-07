@@ -3,15 +3,15 @@
 把训练好的 PyTorch checkpoint 转成 Rust 推理框架需要的格式：
     model.safetensors    权重（去掉 _orig_mod. 前缀、跳过 RoPE 的 cos/sin）
     model_config.json    模型配置（GPTConfig 字段）
-    vocab.json           字符级词表（stoi / itos）
+    tokenizer.json       BPE 分词器（从 data/<dataset>/ 复制，Python/Rust 共用）
 
 用法（从项目根目录）：
-    uv run python runtime/scripts/convert.py --ckpt out/chinese/ckpt.pt --dataset chinese
+    uv run python inference/runtime/scripts/convert.py --ckpt out/chinese-v4-csa/best.pt --dataset chinese
 """
 import argparse
 import json
 import os
-import pickle
+import shutil
 
 import torch
 from safetensors.torch import save_file
@@ -19,9 +19,9 @@ from safetensors.torch import save_file
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--ckpt', default='out/chinese/ckpt.pt', help='训练好的 checkpoint 路径')
-    ap.add_argument('--dataset', default='chinese', help='数据集名，用来找 data/<dataset>/meta.pkl')
-    ap.add_argument('--out', default='runtime', help='输出目录（Rust 项目根）')
+    ap.add_argument('--ckpt', default='out/chinese-v4-csa/best.pt', help='训练好的 checkpoint 路径（默认最优 CSA 模型）')
+    ap.add_argument('--dataset', default='chinese', help='数据集名，用来找 data/<dataset>/tokenizer.json')
+    ap.add_argument('--out', default='inference/runtime', help='输出目录（Rust 项目根）')
     args = ap.parse_args()
 
     ck = torch.load(args.ckpt, map_location='cpu', weights_only=False)
@@ -43,21 +43,17 @@ def main():
     with open(os.path.join(args.out, 'model_config.json'), 'w', encoding='utf-8') as f:
         json.dump(model_args, f, indent=2, ensure_ascii=False)
 
-    meta_path = os.path.join('data', args.dataset, 'meta.pkl')
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    vocab = {
-        'stoi': meta['stoi'],
-        # JSON 的键必须是字符串，把 itos 的 int 键转成 str
-        'itos': {str(i): ch for i, ch in meta['itos'].items()},
-    }
-    with open(os.path.join(args.out, 'vocab.json'), 'w', encoding='utf-8') as f:
-        json.dump(vocab, f, indent=2, ensure_ascii=False)
+    # BPE 分词器：直接从数据集目录复制，Python 端（tokenizers 库）和 Rust 端
+    # （tokenizers crate）共用同一个 tokenizer.json，保证编解码完全一致。
+    tokenizer_path = os.path.join('data', args.dataset, 'tokenizer.json')
+    if not os.path.exists(tokenizer_path):
+        raise SystemExit(f'错误：找不到 {tokenizer_path}，先跑 train_tokenizer.py')
+    shutil.copy(tokenizer_path, os.path.join(args.out, 'tokenizer.json'))
 
     n_params = sum(v.numel() for v in sd.values())
     print(f"转换完成 ✅ 权重 {n_params:,} 参数 → {os.path.join(args.out, 'model.safetensors')}")
     print(f"配置: {model_args}")
-    print(f"词表: {len(meta['stoi'])} 字符")
+    print(f"分词器: {tokenizer_path} → {os.path.join(args.out, 'tokenizer.json')}")
 
 
 if __name__ == '__main__':

@@ -8,9 +8,9 @@ MoE / MLA / MTP / 全开组合）都能正常前向传播 + 反向传播，并�
 import sys
 from pathlib import Path
 
-# 脚本在 scripts/ 子目录里，Python 默认不会把项目根目录加进模块搜索路径。
+# 脚本在 inference/scripts/ 子目录里，Python 默认不会把项目根目录加进模块搜索路径。
 # 这里把根目录插到 sys.path 开头，才能 `from model import ...`。
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import math
 

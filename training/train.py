@@ -18,11 +18,16 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 
 import os
 import csv
+import sys
 import time
 import math
 import pickle
 import threading
 from contextlib import nullcontext
+
+# 脚本在 training/ 子目录，Python 默认不会把项目根目录加进模块搜索路径。
+# 这里把根目录插到 sys.path 开头，才能 `from model import ...`。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import torch
@@ -31,7 +36,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
-from config_loader import load_config
+from model.config_loader import load_config
 
 # -----------------------------------------------------------------------------
 # 默认配置：small 模型在字符级莎士比亚上训练（与 config/train_shakespeare_char.yaml 一致）。
@@ -149,6 +154,14 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # 简易数据加载器
 data_dir = os.path.join('data', dataset)
+
+# 每个 epoch 的步数（YOLO 式进度条显示轮次用）
+try:
+    _train_tokens = os.path.getsize(os.path.join(data_dir, 'train.bin')) // 2  # uint16
+    steps_per_epoch = max(1, _train_tokens // tokens_per_iter)
+except OSError:
+    steps_per_epoch = None
+
 def get_batch(split):
     # 我们每个 batch 都重新创建 np.memmap，以避免内存泄漏，参见
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -190,22 +203,11 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_muon=use_muon, use_mhc=use_mhc,
                   use_csa=use_csa, csa_compress=csa_compress, csa_topk=csa_topk,
                   csa_window=csa_window, use_hca=use_hca)
-if init_from == 'scratch':
-    # 从零初始化一个新模型
-    # 确定从零训练时使用的 vocab size
-    if meta_vocab_size is None:
-        print("默认把 GPT-2 的 vocab_size 设为 50304（50257 向上取整以提高效率）")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-elif init_from == 'resume':
-    print(f"正在从 {out_dir} 恢复训练")
-    # 从 checkpoint 恢复训练。
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
+
+def _build_model_from_checkpoint(checkpoint):
+    """按 checkpoint 里的 model_args 构建模型并加载权重（供 resume / 后训练复用）。"""
     checkpoint_model_args = checkpoint['model_args']
-    # 强制这些配置属性相等，否则我们根本无法恢复训练
-    # 其余属性（如 dropout）可以按命令行里的期望值保持不变
+    # 强制这些配置属性等于 checkpoint 里的值（架构必须一致才能加载权重）
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
     # modern/DeepSeek 开关：老 checkpoint 里可能没这些键，用命令行/默认值兜底
@@ -216,19 +218,39 @@ elif init_from == 'resume':
               'use_mtp', 'n_mtp', 'mtp_weight', 'use_muon', 'use_mhc',
               'use_csa', 'csa_compress', 'csa_topk', 'csa_window', 'use_hca']:
         model_args[k] = checkpoint_model_args.get(k, model_args[k])
-    # 创建模型
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
-    # 修复 state dictionary 的键 :(
-    # 老实说不知道 checkpoint 有时怎么会带上这个前缀，需要再调试一下
+    # 修复 state dictionary 的键：torch.compile 偶尔会带上 _orig_mod. 前缀
     unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
+    for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
+    return model
+
+if init_from == 'scratch':
+    # 从零初始化一个新模型
+    # 确定从零训练时使用的 vocab size
+    if meta_vocab_size is None:
+        print("默认把 GPT-2 的 vocab_size 设为 50304（50257 向上取整以提高效率）")
+    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+elif init_from == 'resume':
+    print(f"正在从 {out_dir} 恢复训练（YOLO 式：自动加载 best.pt）")
+    # 从 checkpoint 恢复训练。续训会连同优化器、学习率计划、迭代计数一起恢复。
+    ckpt_path = os.path.join(out_dir, 'best.pt')
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    model = _build_model_from_checkpoint(checkpoint)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+elif init_from.endswith('.pt'):
+    # 在已有模型上做后训练：加载权重，但从头开始新的优化器/学习率计划
+    print(f"正在从 {init_from} 加载已有模型权重（后训练，优化器/学习率重置）")
+    checkpoint = torch.load(init_from, map_location=device)
+    model = _build_model_from_checkpoint(checkpoint)
+    # iter_num / best_val_loss 保持初始值（0 / 1e9），全新训练
 elif init_from.startswith('gpt2'):
     print(f"正在从 OpenAI GPT-2 权重初始化: {init_from}")
     # 从 OpenAI GPT-2 权重初始化
@@ -271,8 +293,10 @@ def print_summary():
     print(f"  模型      {n_layer} 层 · {n_head} 头 · {n_embd} 维" + (f" · {modern}" if modern else ""))
     opt_name = 'Muon' if use_muon else 'AdamW'
     print(f"  优化器    {opt_name} · lr {learning_rate:g} · wd {weight_decay:g} · betas ({beta1:g}, {beta2:g})")
-    print(f"  训练      {max_iters} 步 · batch {batch_size} · {tokens_per_iter:,} tokens/步")
+    epoch_note = f" · ≈{max_iters/steps_per_epoch:.1f} epoch" if steps_per_epoch else ""
+    print(f"  训练      {max_iters} 步 · {tokens_per_iter:,} tokens/步{epoch_note}")
     print(f"  设备      {device} · {dtype} · compile {'开' if compile else '关'}")
+    print(f"  检查点    best.pt（val 最优）+ last.pt（最新）· 续训自动从 best.pt 恢复")
     print(border)
     print()
 
@@ -281,6 +305,16 @@ if master_process:
 
 # 编译模型
 if compile:
+    # 抑制 inductor 在低 SM 数 GPU 上的提示性警告：
+    # RTX 5060 只有 30 个 SM（< 68），max_autotune_gemm 用不了，compile 时会反复打
+    # "Not enough SMs to use max_autotune_gemm mode"。这是良性提示——只是退回
+    # 默认 matmul，不影响正确性。用定向 Filter 只静音这条，不动其他警告。
+    import logging
+    class _MaxAutotuneGemmFilter(logging.Filter):
+        def filter(self, record):
+            return "max_autotune_gemm" not in record.getMessage()
+    logging.getLogger('torch._inductor').addFilter(_MaxAutotuneGemmFilter())
+
     print("正在编译模型……这一步比较耗时，请耐心等待")
     unoptimized_model = model
     model = torch.compile(model) # 需要 PyTorch 2.0
@@ -386,6 +420,18 @@ def _plot_loss_curve(loss_history, out_dir, best_val_loss):
         import matplotlib
         matplotlib.use('Agg')  # 无显示环境，用非交互后端
         import matplotlib.pyplot as plt
+        from matplotlib import font_manager
+        # 中文字体：图里有中文标签，DejaVu Sans 没有中文字形会打出方块。
+        # 按优先级尝试常见 CJK 字体，全找不到就回退默认（图仍能生成，只是中文变方块）。
+        for _font in ('Noto Sans CJK SC', 'Source Han Sans CN', 'WenQuanYi Zen Hei',
+                      'Microsoft YaHei', 'SimHei'):
+            try:
+                font_manager.findfont(_font, fallback_to_default=False)
+                plt.rcParams['font.family'] = _font
+                break
+            except Exception:
+                continue
+        plt.rcParams['axes.unicode_minus'] = False  # 负号用 ASCII 减号，避免显示成方块
         iters = [h[0] for h in loss_history]
         train = [h[1] for h in loss_history]
         val = [h[2] for h in loss_history]
@@ -448,19 +494,24 @@ while True:
                 f"{lr:.6g}", f"{max(running_mfu, 0.0)*100:.2f}", f"{time.time()-train_start:.1f}",
             ])
             results_csv.flush()  # 及时落盘：训练中断也能读到已写出的部分
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                pbar.write(f"✓ 已排队保存 checkpoint 到 {out_dir}（best_val_loss {best_val_loss:.4f}）")
-                save_checkpoint_async(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+        if iter_num > 0:
+            # YOLO 式：last.pt 每次评估都存（最新状态），best.pt 只在 val 变优时存
+            is_best = losses['val'] < best_val_loss
+            if is_best:
+                best_val_loss = losses['val']
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'model_args': model_args,
+                'iter_num': iter_num,
+                'best_val_loss': best_val_loss,
+                'config': config,
+                'epoch': iter_num / steps_per_epoch if steps_per_epoch else None,
+            }
+            save_checkpoint_async(checkpoint, os.path.join(out_dir, 'last.pt'))
+            if is_best:
+                save_checkpoint_async(checkpoint, os.path.join(out_dir, 'best.pt'))
+                pbar.write(f"✓ 新最佳 val {best_val_loss:.4f} → best.pt（并已更新 last.pt）")
     if iter_num == 0 and eval_only:
         break
 
@@ -501,7 +552,8 @@ while True:
         if local_iter_num >= 5: # 让训练循环先稳定一下
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        pbar.set_postfix(损失=f"{lossf:.4f}", MFU=f"{running_mfu*100:.1f}%")
+        epoch_str = f"{iter_num/steps_per_epoch:.2f}" if steps_per_epoch else "-"
+        pbar.set_postfix(轮次=f"{epoch_str}", 损失=f"{lossf:.4f}", MFU=f"{running_mfu*100:.1f}%")
     iter_num += 1
     local_iter_num += 1
     if pbar is not None:

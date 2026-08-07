@@ -1,8 +1,9 @@
-# V4 技术验证 #5：CSA/HCA 压缩稀疏注意力
+# V4 技术验证 #5：CSA/HCA 压缩稀疏注意力 —— 也是默认对话模型
 # 块级 KV 压缩 + top-k 稀疏块选择 + 滑窗局部注意力 + HCA 重度压缩全局信号。
 # 对比基线：train_chinese_moe.yaml（同配置、标准全量因果注意力）。
 # 注意：CSA 需要 use_rope 提供位置信息；csa_compress 越小越接近全量注意力，
 #       topk 越大全局信息越全但越贵——这两个超参正是"压缩 vs 精度"的权衡点。
+# 规模：n_embd 96 + n_experts 4（~2.2M 参数），适配 8000 BPE 词表（日常中文，嵌入表小、transformer 占比高）。
 out_dir: out/chinese-v4-csa
 eval_interval: 250
 eval_iters: 200
@@ -16,10 +17,10 @@ gradient_accumulation_steps: 1
 batch_size: 64
 block_size: 256
 
-# small 模型（默认配置）
+# small 模型（~2.2M 参数，8000 词表下嵌入占 35%）
 n_layer: 4
 n_head: 4
-n_embd: 128
+n_embd: 96
 dropout: 0.2
 
 # --- modern 三件套（CSA 必须开 use_rope）---
@@ -29,7 +30,7 @@ use_swiglu: true
 
 # --- MoE 开关 ---
 use_moe: true
-n_experts: 8
+n_experts: 4
 n_top_k: 2
 moe_aux_weight: 0.01
 

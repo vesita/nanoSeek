@@ -3,26 +3,28 @@
 .ipynb_checkpoints/
 .vscode
 __pycache__/
-*.bin
-*.pkl
-*.pt
 *.pyc
-input.txt
-env/
-venv/
+*.pt
 
-target/
+# 数据文件不提交（按需通过 data/*/download_*.py 下载、prepare.py 生成）
+data/*/*.txt
+data/*/tokenizer.json
+data/*/train.bin
+data/*/val.bin
+data/*/meta.pkl
 
-# Rust 推理框架转换产物（由 runtime/scripts/convert.py 从 checkpoint 重新生成）
-runtime/model.safetensors
-runtime/model_config.json
-runtime/vocab.json
-runtime/Cargo.lock
+# Rust 推理框架转换产物（由 inference/runtime/scripts/convert.py 重新生成）
+inference/runtime/target/
+inference/runtime/model.safetensors
+inference/runtime/model_config.json
+inference/runtime/vocab.json
+inference/runtime/tokenizer.json
+inference/runtime/Cargo.lock
 
 # 训练 checkpoint 输出目录
 out/
 
-# 打包产物（由 scripts/package.py 生成）
+# 打包产物（由 inference/scripts/package.py 生成）
 release/
 
 # 依赖锁文件（按需重新生成）

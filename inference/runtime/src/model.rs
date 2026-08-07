@@ -178,14 +178,17 @@ impl GPT {
         Ok(last)
     }
 
-    /// 续写：从 prompt 生成 n 个新 token，返回新生成的 token（不含 prompt）。
-    pub fn generate<R: Rng>(
+    /// 续写（流式）：从 prompt 生成 n 个新 token，每生成一个调用 on_token，
+    /// 返回新生成的 token（不含 prompt）。
+    pub fn generate_stream<R: Rng, F: FnMut(u32)>(
         &self,
         prompt: &[u32],
         n: usize,
         temperature: f64,
         top_k: Option<usize>,
+        eos_id: Option<u32>,
         rng: &mut R,
+        mut on_token: F,
     ) -> Result<Vec<u32>> {
         let mut new_tokens = Vec::with_capacity(n);
         let mut tokens = prompt.to_vec();
@@ -198,10 +201,30 @@ impl GPT {
             };
             let logits = self.forward(ctx)?; // (vocab,)
             let next = sample(&logits, temperature, top_k, rng)?;
+            // 遇到 <eos> 立即停止：不输出、也不拼进上下文，否则会继续生成垃圾
+            if Some(next) == eos_id {
+                break;
+            }
+            on_token(next);
             tokens.push(next);
             new_tokens.push(next);
         }
         Ok(new_tokens)
+    }
+
+    /// 续写（一次性）：生成 n 个新 token 后一起返回（流式的薄包装）。
+    /// main.rs 现在走 generate_stream，这里作为非流式 API 保留。
+    #[allow(dead_code)]
+    pub fn generate<R: Rng>(
+        &self,
+        prompt: &[u32],
+        n: usize,
+        temperature: f64,
+        top_k: Option<usize>,
+        eos_id: Option<u32>,
+        rng: &mut R,
+    ) -> Result<Vec<u32>> {
+        self.generate_stream(prompt, n, temperature, top_k, eos_id, rng, |_| {})
     }
 }
 

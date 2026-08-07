@@ -1,5 +1,5 @@
 //! nanoGPT 对话推理 CLI。
-//! 用法（在 runtime/ 目录下）：
+//! 用法（在 inference/runtime/ 目录下）：
 //!   cargo run --release -- --prompt "悟空"                # 一次性生成
 //!   cargo run --release -- --print-logits --prompt "悟空" # 调试：打印 top-10 logits
 //!   cargo run --release                                   # 进入对话 REPL
@@ -8,7 +8,7 @@ use std::io::Write;
 use anyhow::Result;
 use model::Config;
 use rand::SeedableRng;
-use tokenizer::CharTokenizer;
+use tokenizer::BpeTokenizer;
 
 mod attention;
 mod model;
@@ -19,7 +19,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut model_path = "model.safetensors".to_string();
     let mut config_path = "model_config.json".to_string();
-    let mut vocab_path = "vocab.json".to_string();
+    let mut tokenizer_path = "tokenizer.json".to_string();
     let mut prompt: Option<String> = None;
     let mut max_new_tokens = 300usize;
     let mut temperature = 0.8f64;
@@ -44,9 +44,9 @@ fn main() -> Result<()> {
                 i += 1;
                 config_path = args[i].clone();
             }
-            "--vocab" => {
+            "--tokenizer" => {
                 i += 1;
-                vocab_path = args[i].clone();
+                tokenizer_path = args[i].clone();
             }
             "--prompt" => {
                 i += 1;
@@ -78,7 +78,7 @@ fn main() -> Result<()> {
     println!("正在加载模型……");
     let config = Config::load(&config_path)?;
     let gpt = model::GPT::load(&model_path, &config, &device)?;
-    let tok = CharTokenizer::load(&vocab_path)?;
+    let tok = BpeTokenizer::load(&tokenizer_path)?;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     println!(
         "模型就绪：{} 层 · {} 头 · {} 维 · {} 词表",
@@ -113,7 +113,7 @@ fn main() -> Result<()> {
 
     // --- 一次性生成（给了 --prompt） ---
     if let Some(p) = prompt {
-        let ids = tok.encode(&p);
+        let ids = tok.encode(&p)?;
         if print_logits {
             // 调试：打印最后一个位置的 top-10 logits（用于与 Python 端对拍验证）
             let logits = gpt.forward(&ids)?; // (vocab,)
@@ -137,8 +137,9 @@ fn main() -> Result<()> {
             std::fs::write(&path, body)?;
             return Ok(());
         }
-        let new_tokens = gpt.generate(&ids, max_new_tokens, temperature, top_k, &mut rng)?;
-        println!("{}", tok.decode(&new_tokens));
+        // 流式生成：逐 token 打印
+        stream_print(&gpt, &tok, &ids, max_new_tokens, temperature, top_k, &mut rng)?;
+        println!();
         return Ok(());
     }
 
@@ -160,12 +161,47 @@ fn main() -> Result<()> {
         if line == "退出" || line == "exit" || line == "quit" {
             break;
         }
-        // 把这一轮用户输入拼进上下文，让模型接着往下写
-        context.extend(tok.encode(&format!("用户: {line}\n模型: ")));
-        let new_tokens = gpt.generate(&context, max_new_tokens, temperature, top_k, &mut rng)?;
-        let text = tok.decode(&new_tokens);
-        println!("模型: {text}");
+        // 把这一轮用户输入拼进上下文，让模型接着往下写。
+        // 注意：训练数据用的是全角冒号（用户：/模型：），这里必须保持一致，
+        // 否则模型认不出对话结构。数据里 "用户：...\n模型：" 之后就是模型回答，无空格。
+        context.extend(tok.encode(&format!("用户：{line}\n模型："))?);
+        print!("模型: ");
+        let new_tokens = stream_print(&gpt, &tok, &context, max_new_tokens, temperature, top_k, &mut rng)?;
+        println!();
         context.extend(new_tokens);
     }
     Ok(())
+}
+
+/// 流式生成：逐 token 生成 + 逐 token 解码打印（处理跨 token 的多字节字符）。
+/// 返回新生成的 token（不含 prompt），供调用方继续拼上下文。
+fn stream_print(
+    gpt: &model::GPT,
+    tok: &BpeTokenizer,
+    ids: &[u32],
+    max_new_tokens: usize,
+    temperature: f64,
+    top_k: Option<usize>,
+    rng: &mut rand::rngs::StdRng,
+) -> Result<Vec<u32>> {
+    let eos_id = tok.eos_id(); // 遇到 <eos> 就停止，避免生成垃圾
+    let mut decoder = tok.stream();
+    let new_tokens = gpt.generate_stream(
+        ids,
+        max_new_tokens,
+        temperature,
+        top_k,
+        eos_id,
+        rng,
+        |t| {
+            if let Ok(Some(chunk)) = decoder.push(t) {
+                print!("{chunk}");
+                let _ = std::io::stdout().flush();
+            }
+        },
+    )?;
+    let tail = decoder.finish()?;
+    print!("{tail}");
+    let _ = std::io::stdout().flush();
+    Ok(new_tokens)
 }

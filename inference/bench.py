@@ -2,12 +2,17 @@
 用于基准测试的 train.py 精简版
 """
 import os
+import sys
 from contextlib import nullcontext
+
+# 脚本在 inference/ 子目录，把项目根目录插到 sys.path 开头
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import time
 import torch
 from model import GPTConfig, GPT
-from config_loader import load_config
+from model.config_loader import load_config
 
 # -----------------------------------------------------------------------------
 batch_size = 12
