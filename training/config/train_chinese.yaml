@@ -42,6 +42,13 @@ csa_window: 64      # 滑窗保留最近 64 个原始 token
 use_hca: true       # 加 HCA 重度压缩全局信号
 use_csa_learnable: true   # 可学习门控池化替代平均池化
 
+# --- V4 结构设计升级（实验性，默认全关）---
+# use_attn_sink: true          # Attention Sinks：每头可学习标量偏置吸收无关注意力
+# use_mhc: true                # mHC：4 流并行残差（X_{l+1}=B·X_l+C·F(A·X_l)）
+# hc_mult: 4
+# use_lightning_indexer: true  # 学习型块选择替代 CSA raw top-k
+# num_hash_layers: 2           # 前 2 层用 hash 路由
+
 learning_rate: 0.001
 max_iters: 5000
 lr_decay_iters: 5000

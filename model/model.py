@@ -9,6 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
+import dataclasses
 from dataclasses import dataclass
 
 import torch
@@ -105,6 +106,13 @@ class CausalSelfAttention(nn.Module):
                 self.csa_gate_linear = nn.Linear(
                     config.csa_compress * self.head_dim, self.head_dim, bias=False)
                 nn.init.zeros_(self.csa_gate_linear.weight)
+            if config.use_lightning_indexer:
+                # V4 Lightning Indexer（简版）：学习型块选择替代 raw top-k。
+                # idx_q 把 query 投影到「选择空间」，idx_k 给每个压缩块打一个标量分。
+                # 分数只决定「选哪几个块」，不参与注意力值；梯度经 KL 桥接到块选择。
+                self.idx_q = nn.Linear(config.n_embd, config.n_head, bias=False)  # (n_embd→nh)
+                self.idx_k = nn.Linear(self.head_dim, 1, bias=False)              # 块→标量分
+                nn.init.zeros_(self.idx_k.weight)  # 起步打分≈0，中性选块
         if config.use_mla:
             assert config.qk_rope_head_dim % 2 == 0 and config.qk_rope_head_dim <= self.head_dim, \
                 "qk_rope_head_dim 需为偶数且不超过 head_dim"
@@ -113,6 +121,12 @@ class CausalSelfAttention(nn.Module):
             self.kv_act  = nn.SiLU()
             self.k_up    = nn.Linear(config.kv_lora_rank, config.n_embd, bias=config.bias)
             self.v_up    = nn.Linear(config.kv_lora_rank, config.n_embd, bias=config.bias)
+        # V4 Attention Sinks：每头一个可学习标量偏置，作为 softmax 的"垃圾桶"。
+        # 追加一列 sink[h] 到分数末尾（对应零 value 向量），模型借此丢掉无关注意力预算。
+        # flash attention 不支持追加 softmax 列，启用 sink 时回退到手动注意力。
+        self.use_attn_sink = config.use_attn_sink
+        if self.use_attn_sink:
+            self.attn_sink = nn.Parameter(torch.zeros(config.n_head))
         # flash attention 能让 GPU 跑得飞快，但只在 PyTorch >= 2.0 才支持
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -175,9 +189,16 @@ class CausalSelfAttention(nn.Module):
             # 手动实现 attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            if self.use_attn_sink:
+                # Attention Sink：追加一列 sink[h]（value 用零向量占位）。
+                # 这列 softmax 后有 exp(sink) 的概率质量，但乘零向量 → 贡献为 0，
+                # 等价于"把多余的注意力预算倒进垃圾桶"。
+                sink = self.attn_sink.view(1, self.n_head, 1, 1).expand(B, self.n_head, T, 1)
+                att = torch.cat([att, sink], dim=-1)                          # (B,nh,T,T+1)
+                v = torch.cat([v, v.new_zeros(B, self.n_head, T, 1, v.size(-1))], dim=-2)  # (B,nh,T+1,hs)
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = att @ v # (B, nh, T, T+1) x (B, nh, T+1, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # 把所有 head 的输出并排重新组装
 
         # 输出投影
@@ -202,6 +223,8 @@ class CausalSelfAttention(nn.Module):
         nh, d = self.n_head, self.head_dim
         m = self.config.csa_compress
         win = self.config.csa_window
+        # Lightning Indexer 的 KL 辅助损失（块路径跳过时兜底为 0）
+        self.indexer_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         q = self.q_proj_csa(x).view(B, T, nh, d)
         k = self.k_proj_csa(x).view(B, T, nh, d)
@@ -239,12 +262,53 @@ class CausalSelfAttention(nn.Module):
             has_prior = causal_block.any(dim=-1)                      # (T,) 该 query 有没有历史块
             s_blk = torch.einsum('bthd,bnhd->bthn', q, k_blocks) / math.sqrt(d)  # (B,T,nh,nb)
             s_blk = s_blk.masked_fill(~causal_block.unsqueeze(0).unsqueeze(2), float('-inf'))
-            # 稀疏：只保留每个 query 得分最高的 k_eff 个块（其余 -inf，softmax 后为 0）
-            topk_vals, _ = s_blk.topk(k_eff, dim=-1)
-            s_blk = s_blk.masked_fill(s_blk < topk_vals[..., [-1]], float('-inf'))
+
+            if self.config.use_lightning_indexer:
+                # --- V4 Lightning Indexer（简版）：学习型块选择 ---
+                # idx_q 把 query 投影到「选择空间」(B,T,nh)，idx_k 给每块打标量分 (B,nb,nh)。
+                # 分数 = Σ_h q_idx[t,h]·k_idx[s,h]，是 (T,nb) 外积：query 和块的位置解耦。
+                # 分数只决定「选哪几块」；s_blk 仍算真实注意力，选中的块才参与 softmax。
+                q_idx = self.idx_q(x)                                        # (B,T,nh)
+                k_idx = self.idx_k(k_blocks.reshape(-1, d)).view(B, nb, nh)  # (B,nb,nh)
+                idx_scores = torch.einsum('bth,bnh->btn', q_idx, k_idx)     # (B,T,nb) 外积
+                idx_scores = idx_scores.masked_fill(
+                    ~causal_block.unsqueeze(0), float('-inf'))
+                # 没有历史块的 query：整行置 0（否则 softmax 对全 -inf 产生 NaN）
+                idx_scores = idx_scores.masked_fill(
+                    ~has_prior.view(1, T, 1), 0.0)
+                # 用 indexer 分数选 top-k 块（只决定 mask，不直接进注意力）
+                idx_topk, _ = idx_scores.topk(k_eff, dim=-1)
+                sel_mask = idx_scores >= idx_topk[..., [-1]]                # (B,T,nb)
+                sel_mask = sel_mask.unsqueeze(2).expand(B, T, nh, nb)       # → (B,T,nh,nb)
+                # 记录 KL 信号：让 indexer 的 softmax 逼近「真实注意力」的块分布。
+                # p=0 的位置该项贡献 0（causal 不允许的块 p 和 q 都为 0）；
+                # clamp 到 1e-12 避免 0×log(0)=NaN。
+                # 没有历史块的 query：q 行整行置 0（softmax 后均匀分布，不与 p 比较）
+                valid = has_prior.float()                                   # (T,)
+                p = F.softmax(idx_scores.float(), dim=-1)                  # (B,T,nb)
+                s_blk_mean = s_blk.detach().float().mean(dim=2)            # (B,T,nb)
+                s_blk_mean = s_blk_mean.masked_fill(
+                    ~has_prior.view(1, T, 1), 0.0)                          # 无历史块行置 0
+                target_p = F.softmax(s_blk_mean, dim=-1)                   # (B,T,nb) KL 目标
+                kl = (p * (p.clamp_min(1e-12).log() -
+                           target_p.clamp_min(1e-12).log())).sum(dim=-1)  # (B,T)
+                kl = (kl * valid.unsqueeze(0)).sum() / valid.sum().clamp(min=1)
+                self.indexer_loss = kl
+                # 用选中的块替换 s_blk 的稀疏 mask（注意：仍保留真实注意力分数）
+                s_blk = s_blk.masked_fill(~sel_mask, float('-inf'))
+            else:
+                # 基线：直接对真实注意力分数取 top-k（raw 稀疏）
+                self.indexer_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+                topk_vals, _ = s_blk.topk(k_eff, dim=-1)
+                s_blk = s_blk.masked_fill(s_blk < topk_vals[..., [-1]], float('-inf'))
             # 没有历史块的 query：整行置 0（否则 softmax 对全 -inf 产生 NaN）
             s_blk = s_blk.masked_fill(~has_prior.view(1, T, 1, 1), 0.0)
-            a_blk = F.softmax(s_blk, dim=-1)                          # (B,T,nh,nb)
+            if self.use_attn_sink:
+                # Attention Sink：块注意力也追加一列 sink[h]（v_blocks 补零块占位）
+                sink = self.attn_sink.view(1, 1, self.n_head, 1).expand(B, T, self.n_head, 1)
+                s_blk = torch.cat([s_blk, sink], dim=-1)                       # (B,T,nh,nb+1)
+                v_blocks = torch.cat([v_blocks, v_blocks.new_zeros(B, 1, self.n_head, d)], dim=1)  # (B,nb+1,nh,d)
+            a_blk = F.softmax(s_blk, dim=-1)                          # (B,T,nh,nb+1)
             y_comp = torch.einsum('bthn,bnhd->bthd', a_blk, v_blocks)  # (B,T,nh,d)
             y_comp = y_comp * has_prior.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).float()
 
@@ -255,7 +319,13 @@ class CausalSelfAttention(nn.Module):
         win_causal = (i.unsqueeze(-1) <= i.unsqueeze(0)) & (i.unsqueeze(0) - i.unsqueeze(-1) <= win)
         s_win = torch.einsum('bthd,bjhd->bthj', q, k) / math.sqrt(d)  # (B,T,nh,T)
         s_win = s_win.masked_fill(~win_causal.unsqueeze(0).unsqueeze(2), float('-inf'))
-        y_win = torch.einsum('bthj,bjhd->bthd', F.softmax(s_win, dim=-1), v)
+        v_win = v
+        if self.use_attn_sink:
+            # Attention Sink：滑窗注意力同样追加一列（v 补零行占位）
+            sink = self.attn_sink.view(1, 1, self.n_head, 1).expand(B, T, self.n_head, 1)
+            s_win = torch.cat([s_win, sink], dim=-1)                        # (B,T,nh,T+1)
+            v_win = torch.cat([v, v.new_zeros(B, 1, self.n_head, d)], dim=1)  # (B,T+1,nh,d)
+        y_win = torch.einsum('bthj,bjhd->bthd', F.softmax(s_win, dim=-1), v_win)
 
         y = y_comp + y_win
 
@@ -263,16 +333,22 @@ class CausalSelfAttention(nn.Module):
         # 把所有允许的压缩块再平均成一个全局潜在（不做稀疏选择 = 重度压缩），
         # 每个 query 加上它作为全局上下文。这是"全文一句话摘要"式的粗粒度信号。
         if self.config.use_hca and nb > 0:
+            # 只用真实块：sink 模式下 v_blocks 末尾多了一个占位零块，切掉它
+            v_blocks_real = v_blocks[:, :nb] if self.use_attn_sink else v_blocks
             n_allowed = causal_block.float().sum(dim=-1).clamp(min=1)  # (T,)
             k_glob = torch.einsum('tn,bnhd->bthd', causal_block.float(), k_blocks) / \
                      n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            v_glob = torch.einsum('tn,bnhd->bthd', causal_block.float(), v_blocks) / \
+            v_glob = torch.einsum('tn,bnhd->bthd', causal_block.float(), v_blocks_real) / \
                      n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
             # 单个全局 key 的 softmax 恒为 1，等价于直接加上这份全局摘要
             y = y + v_glob
 
         # 合并 head： (B, T, nh, d) → (B, T, C)
         return y.transpose(1, 2).contiguous().view(B, T, C)
+
+    def get_indexer_loss(self):
+        """取出本层 Lightning Indexer 的 KL 辅助损失（非 CSA 路径时无意义，返回 0）。"""
+        return self.indexer_loss if hasattr(self, 'indexer_loss') else None
 
     def _compress_block(self, x_block, B, nb, nh, d, m):
         """V4 可学习门控池化：把块内 m 个 token 压成 1 个潜在（替代平均池化）。
@@ -325,7 +401,7 @@ class MoE(nn.Module):
     其它专家几乎不被激活、学不到东西（类似专家"饿死"）。
     """
 
-    def __init__(self, config):
+    def __init__(self, config, use_hash=False):
         super().__init__()
         self.n_experts = config.n_experts
         self.n_top_k = config.n_top_k
@@ -334,7 +410,11 @@ class MoE(nn.Module):
         self.use_aux_free_balance = config.use_aux_free_balance
         self.use_sqrtsoftplus = config.use_sqrtsoftplus
         self.route_scale = config.route_scale
-        # 路由器：给每个 token 在每个专家上打一个分
+        # V4 Hash 路由：浅层用 hash(token_id)%n_experts 确定性分配，不学习。
+        # 设计动机：浅层特征是简单语法/常见搭配，确定性路由稳定且零算力；
+        # 深层语义复杂才需要学习型路由。use_hash 由 Block 按 layer_idx 传入。
+        self.use_hash = use_hash
+        # 路由器：给每个 token 在每个专家上打一个分（hash 模式下仍保留，作为后续层复用）
         self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
         # 专家：每个专家是一份完整的 SwiGLU FFN
         self.experts = nn.ModuleList([SwiGLU(config) for _ in range(config.n_experts)])
@@ -355,37 +435,51 @@ class MoE(nn.Module):
         x_flat = x.view(-1, C)          # (B*T, C)，把 batch 和序列压平逐个 token 路由
         N = x_flat.shape[0]
 
-        # 路由打分：给每个 token 在每个专家上打一个分
-        router_logits = self.router(x_flat)               # (N, n_experts)
-        # aux-free 偏置修正：bias 加到 logits 上影响 top-k 选择（bias 不参与梯度）
-        if self.use_aux_free_balance:
-            router_logits = router_logits + self.router_bias
-        # 软概率：Switch aux loss 用（aux-free 模式下不参与损失）
-        router_probs = F.softmax(router_logits, dim=-1)   # (N, n_experts)
-        if self.use_sqrtsoftplus:
-            # V4 打分：√softplus(logits) * route_scale，直接用于选择 + 归一化
-            scores = torch.sqrt(F.softplus(router_logits)) * self.route_scale
-            top_k_scores, top_k_indices = scores.topk(self.n_top_k, dim=-1)
-            top_k_probs = top_k_scores / (top_k_scores.sum(dim=-1, keepdim=True) + 1e-6)
+        if self.use_hash:
+            # --- V4 Hash 路由：确定性分配，不学习 ---
+            # Knuth 乘法哈希：用 token 嵌入的第一个标量作签名，均匀映射到各专家。
+            # 用 k 个不同的乘子生成 k 个不重复的专家槽位。
+            hash_input = x_flat[:, 0].long()  # 用输入第一维当 token 签名（token 无关）
+            # 生成 n_top_k 个不同的哈希：hash + i*prime 再 % n_experts
+            top_k_indices = torch.stack([
+                ((hash_input * (2654435761 + 97 * i)) >> 16) % self.n_experts
+                for i in range(self.n_top_k)
+            ], dim=-1)  # (N, k)
+            top_k_probs = x_flat.new_full((N, self.n_top_k), 1.0 / self.n_top_k)  # 均匀权重
+            self.aux_loss = torch.tensor(0.0, device=x_flat.device, dtype=x_flat.dtype)
+            # 跳过负载均衡：哈希本身均匀分配，天然均衡
         else:
-            # 基线：softmax 全专家 → top-k → 重归一化
-            top_k_probs, top_k_indices = router_probs.topk(self.n_top_k, dim=-1)  # 各 (N, k)
-            top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+            # 路由打分：给每个 token 在每个专家上打一个分
+            router_logits = self.router(x_flat)               # (N, n_experts)
+            # aux-free 偏置修正：bias 加到 logits 上影响 top-k 选择（bias 不参与梯度）
+            if self.use_aux_free_balance:
+                router_logits = router_logits + self.router_bias
+            # 软概率：Switch aux loss 用（aux-free 模式下不参与损失）
+            router_probs = F.softmax(router_logits, dim=-1)   # (N, n_experts)
+            if self.use_sqrtsoftplus:
+                # V4 打分：√softplus(logits) * route_scale，直接用于选择 + 归一化
+                scores = torch.sqrt(F.softplus(router_logits)) * self.route_scale
+                top_k_scores, top_k_indices = scores.topk(self.n_top_k, dim=-1)
+                top_k_probs = top_k_scores / (top_k_scores.sum(dim=-1, keepdim=True) + 1e-6)
+            else:
+                # 基线：softmax 全专家 → top-k → 重归一化
+                top_k_probs, top_k_indices = router_probs.topk(self.n_top_k, dim=-1)  # 各 (N, k)
+                top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
-        # 负载均衡：f_i = 第 i 个专家实际接到的 token 比例
-        one_hot = F.one_hot(top_k_indices, self.n_experts).float()   # (N, k, n_experts)
-        f_i = one_hot.sum(dim=(0, 1)) / (N * self.n_top_k)           # (n_experts,)
-        if self.use_aux_free_balance:
-            # V4 aux-free：无辅助损失，改为按负载偏差更新 bias（无梯度，决定性推动均衡）。
-            # 过载专家（f_i > 均值）bias 下降 → 更难被选中；欠载专家 bias 上升 → 更容易被选中。
-            self.aux_loss = torch.tensor(0.0)
-            with torch.no_grad():
-                self.router_bias.add_((f_i - 1.0 / self.n_experts).sign() * self.balance_factor)
-        else:
-            # Switch Transformer 辅助损失：P_i = 路由器给第 i 个专家的平均概率。
-            # 两者都高意味着该专家又热门又常被选，均衡时 sum(f_i * P_i) 取最小。
-            P_i = router_probs.mean(dim=0)                           # (n_experts,)
-            self.aux_loss = self.moe_aux_weight * self.n_experts * (f_i * P_i).sum()
+            # 负载均衡：f_i = 第 i 个专家实际接到的 token 比例
+            one_hot = F.one_hot(top_k_indices, self.n_experts).float()   # (N, k, n_experts)
+            f_i = one_hot.sum(dim=(0, 1)) / (N * self.n_top_k)           # (n_experts,)
+            if self.use_aux_free_balance:
+                # V4 aux-free：无辅助损失，改为按负载偏差更新 bias（无梯度，决定性推动均衡）。
+                # 过载专家（f_i > 均值）bias 下降 → 更难被选中；欠载专家 bias 上升 → 更容易被选中。
+                self.aux_loss = torch.tensor(0.0)
+                with torch.no_grad():
+                    self.router_bias.add_((f_i - 1.0 / self.n_experts).sign() * self.balance_factor)
+            else:
+                # Switch Transformer 辅助损失：P_i = 路由器给第 i 个专家的平均概率。
+                # 两者都高意味着该专家又热门又常被选，均衡时 sum(f_i * P_i) 取最小。
+                P_i = router_probs.mean(dim=0)                           # (n_experts,)
+                self.aux_loss = self.moe_aux_weight * self.n_experts * (f_i * P_i).sum()
 
         # V4 共享专家：所有 token 都过一遍共享专家（捕获共性），再叠加路由专家的差异化输出
         output = self.shared_expert(x_flat) if self.use_shared_expert else x_flat.new_zeros(N, C)
@@ -410,18 +504,66 @@ class MoE(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx=0):
         super().__init__()
         self.config = config
+        self.use_mhc = config.use_mhc
         # 固定架构：RMSNorm + 残差；FFN 用 MoE（可选）或 SwiGLU
         self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd)
-        self.mlp = MoE(config) if config.use_moe else SwiGLU(config)
+        self.mlp = MoE(config, use_hash=layer_idx < config.num_hash_layers) \
+            if config.use_moe else SwiGLU(config)
+
+        if self.use_mhc:
+            # mHC 超连接：4 流并行残差。每流宽度仍为 n_embd，子层 F 只跑 1 次。
+            # 两组 A/B/C（attn 子层 + FFN 子层），见 _mhc_forward。
+            hc = config.hc_mult
+            self.hc_mult = hc
+            self.raw_A_attn = nn.Parameter(torch.zeros(1, hc))       # → sigmoid（有界非负）
+            self.raw_B_attn = nn.Parameter(torch.zeros(hc, hc))      # → softplus → sinkhorn（双重随机）
+            self.raw_C_attn = nn.Parameter(torch.zeros(hc, 1))       # → sigmoid
+            self.raw_A_ffn = nn.Parameter(torch.zeros(1, hc))
+            self.raw_B_ffn = nn.Parameter(torch.zeros(hc, hc))
+            self.raw_C_ffn = nn.Parameter(torch.zeros(hc, 1))
+            # 初始化：A/C 全 0 → sigmoid=0.5（各流等权）；B 全 0 → exp(0)=1 → sinkhorn
+            # 后均匀混合（对称起点，不扭曲初始行为）。
 
     def forward(self, x):
+        if self.use_mhc:
+            return self._mhc_forward(x)
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
+        return x
+
+    def _mhc_forward(self, x):
+        """mHC 4-copy：X' = B·X + C·F(A·X)。
+
+        x: (B, T, hc, d)  4 个并行残差流。
+        每步：A（1×hc，sigmoid）把 4 流压成 1 流给子层 F；子层只算 1 次；
+        C（hc×1，sigmoid）把子层输出展开回 4 流；B（hc×hc，双重随机）混合残差流。
+        """
+        B, T = x.shape[0], x.shape[1]
+        hc, d = self.hc_mult, x.shape[-1]
+
+        # --- 子层 1：注意力 ---
+        A = torch.sigmoid(self.raw_A_attn)                     # (1, hc)
+        h_in = (x * A.view(1, 1, hc, 1)).sum(dim=2)            # (B, T, d)
+        h_out = self.attn(self.ln_1(h_in))                     # (B, T, d) 子层只跑 1 次
+        C = torch.sigmoid(self.raw_C_attn)                     # (hc, 1)
+        delta = h_out.unsqueeze(2) * C.view(1, 1, hc, 1)       # (B, T, hc, d)
+        B_ds = sinkhorn_knopp(F.softplus(self.raw_B_attn))     # (hc, hc) 双重随机
+        x = torch.einsum('bthd,hc->btcd', x, B_ds) + delta     # 残差混合 + 子层增量
+
+        # --- 子层 2：FFN（MoE 或 SwiGLU）---
+        A = torch.sigmoid(self.raw_A_ffn)
+        h_in = (x * A.view(1, 1, hc, 1)).sum(dim=2)
+        h_out = self.mlp(self.ln_2(h_in))
+        C = torch.sigmoid(self.raw_C_ffn)
+        delta = h_out.unsqueeze(2) * C.view(1, 1, hc, 1)
+        B_ds = sinkhorn_knopp(F.softplus(self.raw_B_ffn))
+        x = torch.einsum('bthd,hc->btcd', x, B_ds) + delta
+
         return x
 
     def get_moe_aux_loss(self):
@@ -429,6 +571,10 @@ class Block(nn.Module):
         if isinstance(self.mlp, MoE):
             return self.mlp.get_aux_loss()
         return None
+
+    def get_indexer_loss(self):
+        """本块注意力的 Lightning Indexer 辅助损失（未启用返回 None）。"""
+        return self.attn.get_indexer_loss()
 
 class MTPModule(nn.Module):
     """MTP：多 token 预测模块（DeepSeek-V3 核心）。
@@ -444,8 +590,9 @@ class MTPModule(nn.Module):
         self.hidden_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.emb_proj    = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.norm = RMSNorm(config.n_embd)
-        # 复用单层 Block 做特征融合（内部是因果 attention，正好合适）
-        self.block = Block(config)
+        # 复用单层 Block 做特征融合（内部是因果 attention，正好合适）。
+        # 强制关闭 mHC：MTP 的输入是单流 hidden + next_emb，不是 4 流残差。
+        self.block = Block(dataclasses.replace(config, use_mhc=False))
 
     def forward(self, hidden, next_emb):
         # hidden:  (B, T, n_embd) 主模型在位置 t 的隐藏状态
@@ -453,6 +600,25 @@ class MTPModule(nn.Module):
         h = self.hidden_proj(hidden) + self.emb_proj(next_emb)
         h = self.norm(h)
         return self.block(h)
+
+# -----------------------------------------------------------------------------
+# Sinkhorn-Knopp 投影：把方阵投影到 Birkhoff 多胞体（双重随机矩阵）
+# mHC 用它对 B 做流混合投影，保证 ‖B‖≤1 → 残差变换非扩张，深堆稳定。
+# -----------------------------------------------------------------------------
+
+def sinkhorn_knopp(log_alpha, n_iter=20):
+    """把 log_alpha 投影成行列和均为 1 的双重随机矩阵（Birkhoff 多胞体）。
+
+    Sinkhorn-Knopp 交替做行/列归一化。exp 保证元素正定（双重随机矩阵要求 ≥0）。
+    双重随机矩阵的谱范数 ≤1 → 残差变换非扩张，梯度不会随层数指数爆炸。
+    这是 V4 的 mHC 相比普通 Hyper-Connections 的核心稳定性保障。
+    """
+    M = torch.exp(log_alpha)  # 元素正定
+    for _ in range(n_iter):
+        M = M / M.sum(dim=-1, keepdim=True)   # 行归一化：每行和为 1
+        M = M / M.sum(dim=-2, keepdim=True)   # 列归一化：每列和为 1
+    return M
+
 
 # -----------------------------------------------------------------------------
 # Muon 优化器（DeepSeek-V4 用其替代 AdamW）
@@ -628,6 +794,16 @@ class GPTConfig:
     csa_window: int = 64        # 滑窗：保留最近多少个原始 token（局部细节）
     use_hca: bool = False       # 加 HCA：重度压缩全局信号（无稀疏选择）
     use_csa_learnable: bool = True  # V4：可学习门控池化替代平均池化（压缩块内 m 个 token）
+    # --- V4 结构设计升级（实验性，默认全关）---
+    # Attention Sinks：每头一个可学习标量偏置，作为 softmax 的"垃圾桶"吸收无关注意力。
+    use_attn_sink: bool = False
+    # mHC 超连接：4 流并行残差（X_{l+1} = B·X_l + C·F(A·X_l)，A/C sigmoid 有界、B 双重随机）。
+    use_mhc: bool = False
+    hc_mult: int = 4            # 残差流数（V4 原版 = 4）
+    # Lightning Indexer：学习型块选择替代 CSA 的 raw top-k（256 上下文收益有限，先搭框架）。
+    use_lightning_indexer: bool = False
+    # Hash 路由：前 num_hash_layers 层用 hash(token_id)%n_experts 确定性分配（0 = 禁用）。
+    num_hash_layers: int = 0
 
 class GPT(nn.Module):
 
@@ -640,7 +816,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, layer_idx=i) for i in range(config.n_layer)]),
             ln_f = RMSNorm(config.n_embd),
         ))
         # 用 RoPE 时，位置信息由 attention 内部注入，不需要可学习的位置编码表
@@ -706,8 +882,14 @@ class GPT(nn.Module):
             pos = torch.arange(0, t, dtype=torch.long, device=device) # 形状 (t)
             pos_emb = self.transformer.wpe(pos) # 形状为 (t, n_embd) 的位置嵌入
             x = self.transformer.drop(tok_emb + pos_emb)
+        if self.config.use_mhc:
+            # mHC：4 个残差流从同一个嵌入出发（在流维扩展）
+            x = x.unsqueeze(2).expand(b, t, self.config.hc_mult, self.config.n_embd)
         for block in self.transformer.h:
             x = block(x)
+        if self.config.use_mhc:
+            # 4 流均值回到 1 流，再给 ln_f / lm_head（V4 用可学习合并，这里用均值简化）
+            x = x.mean(dim=2)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -725,6 +907,15 @@ class GPT(nn.Module):
             if self.config.use_mtp:
                 # 多 token 预测：额外预测 t+2、t+3...，按权重加进总损失
                 loss = loss + self.config.mtp_weight * self._compute_mtp_loss(x, targets)
+            if self.config.use_lightning_indexer:
+                # Lightning Indexer 辅助损失：让 indexer 的选块分布逼近真实注意力分布
+                # （权重 0.01，作为辅助信号，不喧宾夺主）
+                idx_loss = torch.zeros(1, device=x.device, dtype=x.dtype)
+                for block in self.transformer.h:
+                    aux = block.get_indexer_loss()
+                    if aux is not None:
+                        idx_loss = idx_loss + aux
+                loss = loss + 0.01 * idx_loss
         else:
             # 推理时的小优化：只对最后一个位置前向传播 lm_head
             logits = self.lm_head(x[:, [-1], :]) # 注意：用列表 [-1] 来保留时间维度

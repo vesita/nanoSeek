@@ -103,6 +103,12 @@ csa_topk = 4           # 每个 query 稀疏选几个压缩块
 csa_window = 64        # 滑窗：保留最近多少个原始 token
 use_hca = False        # HCA 重度压缩全局信号
 use_csa_learnable = True   # V4：可学习门控池化替代平均池化
+# --- V4 结构设计升级（实验性，默认全关）---
+use_attn_sink = False        # Attention Sinks：每头可学习标量偏置吸收无关注意力
+use_mhc = False              # mHC 超连接：4 流并行残差
+hc_mult = 4                  # mHC 残差流数（V4 原版 = 4）
+use_lightning_indexer = False   # 学习型块选择替代 CSA raw top-k
+num_hash_layers = 0          # 前 N 层用 hash 路由（0 = 禁用）
 # adamw 优化器
 learning_rate = 1e-3 # 最大学习率
 max_iters = 5000 # 训练总迭代次数
@@ -209,7 +215,9 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_mtp=use_mtp, n_mtp=n_mtp, mtp_weight=mtp_weight,
                   use_muon=use_muon, muon_momentum=muon_momentum, muon_ns_steps=muon_ns_steps,
                   use_csa=use_csa, csa_compress=csa_compress, csa_topk=csa_topk,
-                  csa_window=csa_window, use_hca=use_hca, use_csa_learnable=use_csa_learnable)
+                  csa_window=csa_window, use_hca=use_hca, use_csa_learnable=use_csa_learnable,
+                  use_attn_sink=use_attn_sink, use_mhc=use_mhc, hc_mult=hc_mult,
+                  use_lightning_indexer=use_lightning_indexer, num_hash_layers=num_hash_layers)
 
 def _build_model_from_checkpoint(checkpoint):
     """按 checkpoint 里的 model_args 构建模型并加载权重（供 resume / 后训练复用）。"""
@@ -226,7 +234,9 @@ def _build_model_from_checkpoint(checkpoint):
               'use_mtp', 'n_mtp', 'mtp_weight',
               'use_muon', 'muon_momentum', 'muon_ns_steps',
               'use_csa', 'csa_compress', 'csa_topk', 'csa_window',
-              'use_hca', 'use_csa_learnable']:
+              'use_hca', 'use_csa_learnable',
+              'use_attn_sink', 'use_mhc', 'hc_mult',
+              'use_lightning_indexer', 'num_hash_layers']:
         model_args[k] = checkpoint_model_args.get(k, model_args[k])
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)

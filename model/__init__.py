@@ -9,6 +9,7 @@ from .model import (
     SwiGLU,
     Muon,
     zeropower_via_newtonschulz,
+    sinkhorn_knopp,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "SwiGLU",
     "Muon",
     "zeropower_via_newtonschulz",
+    "sinkhorn_knopp",
 ]

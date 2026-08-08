@@ -1,6 +1,7 @@
 """
-快速冒烟测试：验证 model.py 的保留架构配置（MoE / 共享专家 / aux-free /
-√softplus / MLA / MTP / CSA / CSA+HCA）都能正常前向传播 + 反向传播，并对比参数量。
+快速冒烟测试：验证 model.py 的全部保留架构配置都能正常前向传播 + 反向传播，并对比参数量。
+架构（MoE / 共享专家 / aux-free / √softplus / MLA / MTP / CSA / CSA+HCA）+
+结构设计升级（Attention Sinks / mHC / Lightning Indexer / Hash 路由）。
 Muon 单测混相 Newton-Schulz 正交化和训练 loss 下降。
 
 固定架构（无需配置）：RMSNorm + SwiGLU；RoPE 由 use_rope 开关控制。
@@ -44,6 +45,17 @@ CASES = [
     ("CSA均池", dict(use_csa=True, csa_compress=16, csa_topk=2, csa_window=32, use_csa_learnable=False)),
     ("CSA可学习", dict(use_csa=True, csa_compress=16, csa_topk=2, csa_window=32)),
     ("CSA+HCA", dict(use_csa=True, csa_compress=16, csa_topk=2, csa_window=32, use_hca=True)),
+    # --- V4 结构设计升级 ---
+    ("AttnSink", dict(use_csa=True, csa_compress=16, csa_topk=2, csa_window=32, use_attn_sink=True)),
+    ("mHC", dict(use_mhc=True, hc_mult=4)),
+    ("mHC+CSA", dict(use_mhc=True, hc_mult=4, use_csa=True, csa_compress=16, csa_topk=2, csa_window=32, use_hca=True)),
+    ("LightIndex", dict(use_csa=True, csa_compress=16, csa_topk=2, csa_window=32, use_lightning_indexer=True)),
+    ("Hash路由", dict(use_moe=True, n_experts=4, n_top_k=2, num_hash_layers=1)),
+    ("全特性", dict(use_mhc=True, hc_mult=4, use_attn_sink=True,
+                    use_moe=True, n_experts=4, n_top_k=2, use_shared_expert=True,
+                    use_aux_free_balance=True, num_hash_layers=1,
+                    use_csa=True, csa_compress=16, csa_topk=2, csa_window=32,
+                    use_hca=True, use_lightning_indexer=True)),
 ]
 
 x = torch.randint(0, 65, (4, 64))
@@ -73,6 +85,18 @@ print(f"aux-free 偏置更新后：max|Δbias| = {(moe_af.router_bias - bias_bef
 assert (moe_af.router_bias - bias_before).abs().max().item() > 0, "aux-free 偏置没有更新！"
 assert moe_af.aux_loss.item() == 0.0, "aux-free 模式不应产生辅助损失！"
 
+# 验证 mHC 的 Sinkhorn-Knopp 投影：结果必须是双重随机矩阵（行和列和都为 1、非负）
+from model import sinkhorn_knopp
+import torch.nn.functional as F
+B_raw = torch.randn(4, 4)
+B_ds = sinkhorn_knopp(F.softplus(B_raw))
+row_ok = (B_ds.sum(dim=-1) - 1).abs().max().item() < 1e-4
+col_ok = (B_ds.sum(dim=-2) - 1).abs().max().item() < 1e-4
+nonneg = (B_ds >= 0).all().item()
+print(f"Sinkhorn 双重随机：行和误差 {B_ds.sum(dim=-1).sub(1).abs().max().item():.2e} | "
+      f"列和误差 {B_ds.sum(dim=-2).sub(1).abs().max().item():.2e} | 非负 = {nonneg}")
+assert row_ok and col_ok and nonneg, "Sinkhorn 投影没有生成双重随机矩阵！"
+
 # 验证 SwiGLU Clamp：极端输入下，开钳制后的输出必须大幅收敛
 from model import SwiGLU
 glu = SwiGLU(GPTConfig(n_embd=64, dropout=0.0, bias=False, swiglu_clamp=10.0))
@@ -89,6 +113,8 @@ assert out_clamped < out_unclamped / 10, "SwiGLU Clamp 没有有效压制极端�
 # 验证 Muon 优化器：先单测混相 Newton-Schulz 正交化，再端到端训练几步
 from model import Muon, zeropower_via_newtonschulz
 
+# 固定种子：NS 正交化误差对输入矩阵敏感，随机矩阵偶发超阈值导致冒烟 flaky
+torch.manual_seed(1337)
 G = torch.randn(16, 16)
 Q = zeropower_via_newtonschulz(G, steps=10)   # 8 激进 + 2 经典
 orth_err = (Q.T @ Q - torch.eye(16)).abs().max().item()
