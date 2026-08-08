@@ -6,9 +6,9 @@ release 目录包含：推理程序 + 模型权重 + 架构配置 + 词表 + 运
 拷走就能跑，不依赖 Python / GPU / 源码。
 
 用法（在项目根目录）：
-    uv run python inference/scripts/package.py                        # 默认打最优 CSA 模型
-    uv run python inference/scripts/package.py --ckpt out/chinese-v4-mhc/best.pt
-    uv run python inference/scripts/package.py --ckpt out/chinese-v4-csa/best.pt --name csa-v1
+    uv run python inference/scripts/package.py                        # 默认打全特性模型
+    uv run python inference/scripts/package.py --ckpt out/chinese-all/best.pt
+    uv run python inference/scripts/package.py --ckpt out/chinese/best.pt --name csa-v1
 """
 import argparse
 import os
@@ -47,8 +47,8 @@ def fmt(nbytes):
 
 def main():
     ap = argparse.ArgumentParser(description='打包成独立部署目录')
-    ap.add_argument('--ckpt', default='out/chinese-v4-csa/best.pt',
-                    help='训练产物路径（默认最优 CSA 模型）')
+    ap.add_argument('--ckpt', default='out/chinese-all/best.pt',
+                    help='训练产物路径（默认全特性模型）')
     ap.add_argument('--dataset', default='chinese', help='数据集名（找 data/<名>/meta.pkl 取词表）')
     ap.add_argument('--name', default=None, help='release 目录名（默认从 ckpt 路径自动提取）')
     ap.add_argument('--no-build', action='store_true',

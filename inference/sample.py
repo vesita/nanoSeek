@@ -26,6 +26,7 @@ seed = 1337
 device = 'cuda' # 示例：'cpu'、'cuda'、'cuda:0'、'cuda:1' 等
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' 或 'bfloat16' 或 'float16'
 compile = False # 使用 PyTorch 2.0 编译模型以加速
+dump_logits = '' # 非空时把 prompt 最后位置的 logits 落盘（每行一个），用于和 Rust --dump-logits 逐位对拍
 load_config(globals()) # 从命令行或配置文件覆盖
 # -----------------------------------------------------------------------------
 
@@ -80,6 +81,17 @@ if start.startswith('FILE:'):
         start = f.read()
 start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+
+# 对拍模式：dump 最后位置的 logits（与 Rust --dump-logits 输出格式一致：每行一个）
+if dump_logits:
+    with torch.no_grad():
+        with ctx:
+            logits, _ = model(x)  # (1, T, vocab)
+    v = logits[0, -1, :].float().cpu().tolist()
+    with open(dump_logits, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(f'{x}' for x in v) + '\n')
+    print(f"已 dump {len(v)} 个 logits → {dump_logits}")
+    sys.exit(0)
 
 # 运行生成
 with torch.no_grad():

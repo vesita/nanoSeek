@@ -32,6 +32,17 @@ pub struct CausalSelfAttention {
     csa_topk: usize,
     csa_window: usize,
     use_hca: bool,
+    // V4 Attention Sinks：每头一个可学习标量偏置，softmax 末尾追加一列（value 为零）
+    use_attn_sink: bool,
+    attn_sink: Option<Tensor>, // (n_head,)
+    // V4 可学习门控池化：压缩 Linear + sigmoid gate 替代平均池化（K/V 共享权重）
+    use_csa_learnable: bool,
+    compress_w: Option<Tensor>, // (d, m*d)
+    gate_w: Option<Tensor>,     // (d, m*d)
+    // V4 Lightning Indexer（简版）：学习型块选择。分数只决定选哪些块，不进注意力。
+    use_lightning_indexer: bool,
+    idx_q_w: Option<Tensor>, // (n_head, n_embd)
+    idx_k_w: Option<Tensor>, // (1, head_dim)
 }
 
 impl CausalSelfAttention {
@@ -78,6 +89,31 @@ impl CausalSelfAttention {
             (None, None)
         };
 
+        // V4 Attention Sinks：每头一个可学习标量偏置（垃圾回收多余的注意力预算）
+        let attn_sink = if config.use_attn_sink {
+            Some(vb.get_unchecked(&format!("{prefix}.attn_sink"))?)
+        } else {
+            None
+        };
+        // V4 可学习门控池化：压缩块内 m 个 token 的 K/V（K/V 共享权重）
+        let (compress_w, gate_w) = if config.use_csa && config.use_csa_learnable {
+            (
+                Some(vb.get_unchecked(&format!("{prefix}.csa_compress_linear.weight"))?),
+                Some(vb.get_unchecked(&format!("{prefix}.csa_gate_linear.weight"))?),
+            )
+        } else {
+            (None, None)
+        };
+        // V4 Lightning Indexer：学习型块选择（替代 raw top-k）
+        let (idx_q_w, idx_k_w) = if config.use_csa && config.use_lightning_indexer {
+            (
+                Some(vb.get_unchecked(&format!("{prefix}.idx_q.weight"))?),
+                Some(vb.get_unchecked(&format!("{prefix}.idx_k.weight"))?),
+            )
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             c_attn_w,
             c_attn_b,
@@ -97,6 +133,14 @@ impl CausalSelfAttention {
             csa_topk: config.csa_topk,
             csa_window: config.csa_window,
             use_hca: config.use_hca,
+            use_attn_sink: config.use_attn_sink,
+            attn_sink,
+            use_csa_learnable: config.use_csa_learnable,
+            compress_w,
+            gate_w,
+            use_lightning_indexer: config.use_lightning_indexer,
+            idx_q_w,
+            idx_k_w,
         })
     }
 
@@ -143,11 +187,25 @@ impl CausalSelfAttention {
 
         // 注意力分数 = q @ k^T / sqrt(head_dim)
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let att = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?; // (B, nh, T, T)
+        let mut att = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?; // (B, nh, T, T)
 
         // 因果掩码：上三角（j > i）置 -inf
         let mask = causal_mask(t, device)?; // (T, T)
-        let att = att.broadcast_add(&mask.unsqueeze(0)?.unsqueeze(0)?)?;
+        att = att.broadcast_add(&mask.unsqueeze(0)?.unsqueeze(0)?)?;
+
+        // V4 Attention Sink：softmax 前追加一列 sink[h]（对应零 value 行），
+        // 模型借此把多余的注意力预算倒进"垃圾桶"。flash 不支持加列 → 手动注意力。
+        let (att, v) = if self.use_attn_sink {
+            let sink = self.attn_sink.as_ref().expect("use_attn_sink 缺 attn_sink");
+            let sink_col = sink.reshape((1, self.n_head, 1, 1))?.broadcast_as((b, self.n_head, t, 1))?;
+            let att = Tensor::cat(&[&att, &sink_col], 3)?; // (B, nh, T, T+1)
+            let zero_row = Tensor::zeros((b, self.n_head, 1, self.head_dim), DType::F32, device)?;
+            let v = Tensor::cat(&[&v, &zero_row], 2)?; // (B, nh, T+1, head_dim)
+            (att, v)
+        } else {
+            (att, v)
+        };
+
         let att = candle_nn::ops::softmax(&att, 3)?;
 
         let y = att.matmul(&v)?; // (B, nh, T, head_dim)
@@ -203,8 +261,17 @@ impl CausalSelfAttention {
 
         let mut y_comp = Tensor::zeros((b, t, nh, d), DType::F32, device)?;
         if nb > 0 {
-            let k_blocks = k.narrow(1, 0, t_ok)?.reshape((b, nb, m, nh, d))?.mean(2)?; // (B,nb,nh,d)
-            let v_blocks = v.narrow(1, 0, t_ok)?.reshape((b, nb, m, nh, d))?.mean(2)?;
+            // 块级压缩：平均池化（基线）或 V4 可学习门控池化（K/V 共享权重）
+            let k_blocks = if self.use_csa_learnable {
+                self.compress_block(&k.narrow(1, 0, t_ok)?, b, nb, nh, d, m)?
+            } else {
+                k.narrow(1, 0, t_ok)?.reshape((b, nb, m, nh, d))?.mean(2)?
+            }; // (B,nb,nh,d)
+            let v_blocks = if self.use_csa_learnable {
+                self.compress_block(&v.narrow(1, 0, t_ok)?, b, nb, nh, d, m)?
+            } else {
+                v.narrow(1, 0, t_ok)?.reshape((b, nb, m, nh, d))?.mean(2)?
+            };
 
             // 因果块掩码：query 只能看「它所在块之前」的块
             let (causal_block, has_prior) = csa_masks(t, m, device)?; // (T,nb), (T,)
@@ -224,14 +291,60 @@ impl CausalSelfAttention {
             let (neg_inf, zeros) = inf_zeros(s_blk.shape().dims().to_vec(), device)?;
             let s_blk = causal_inv.where_cond(&neg_inf, &s_blk)?;
 
-            // 稀疏：只保留每个 query 得分最高的 k_eff 个块（其余 -inf，softmax 后为 0）
+            // 稀疏：只保留每个 query 得分最高的 k_eff 个块（其余 -inf，softmax 后为 0）。
+            // use_lightning_indexer 时用学习型选择，否则 raw top-k。
             let k_eff = self.csa_topk.min(nb);
-            let (topk_vals, _) = topk_last(&s_blk, k_eff)?; // (B,T,nh,k_eff)
-            let thr = topk_vals
-                .narrow(topk_vals.shape().rank() - 1, k_eff - 1, 1)?
-                .broadcast_as(s_blk.shape())?; // 第 k_eff 大值广播成阈值
-            let lt = s_blk.lt(&thr)?;
-            let s_blk = lt.where_cond(&neg_inf, &s_blk)?;
+            let s_blk = if self.use_lightning_indexer {
+                // --- V4 Lightning Indexer：学习型块选择（对应 model.py:266-298）---
+                // idx_q 把 query 投影到「选择空间」(B,T,nh)，idx_k 给每块每头打标量分。
+                // idx_scores = q_idx @ k_idx^T 收缩头维 → (B,T,nb)。分数只决定选哪几块，
+                // 真实注意力分数 s_blk 仍用于注意力值（推理时不做 KL 桥接损失）。
+                let q_idx = linear(x, self.idx_q_w.as_ref().expect("indexer 缺 idx_q"), None)?; // (B,T,nh)
+                let k_idx = linear(
+                    &k_blocks.reshape((b * nb * nh, d))?,
+                    self.idx_k_w.as_ref().expect("indexer 缺 idx_k"),
+                    None,
+                )?
+                .reshape((b, nb, nh))?; // (B,nb,nh)
+                let mut idx_scores = q_idx.matmul(&k_idx.transpose(1, 2)?)?; // (B,T,nb)
+
+                // 因果 mask：不允许的块 → -inf
+                let causal_inv_idx = causal_block
+                    .affine(-1.0, 1.0)?
+                    .to_dtype(DType::U8)?
+                    .unsqueeze(0)?
+                    .broadcast_as(idx_scores.shape())?; // (1,T,nb)
+                let (idx_inf, idx_zeros) = inf_zeros(idx_scores.shape().dims().to_vec(), device)?;
+                idx_scores = causal_inv_idx.where_cond(&idx_inf, &idx_scores)?;
+                // 无历史块的 query：整行置 0（不是 -inf，避免 topk 对全 -inf 产生 NaN）
+                let has_prior_inv_idx = has_prior
+                    .affine(-1.0, 1.0)?
+                    .to_dtype(DType::U8)?
+                    .unsqueeze(0)?
+                    .unsqueeze(2)?
+                    .broadcast_as(idx_scores.shape())?; // (1,T,1)
+                idx_scores = has_prior_inv_idx.where_cond(&idx_zeros, &idx_scores)?;
+
+                // topk → 阈值 → sel_mask = idx_scores >= 阈值（保留并列）
+                let (idx_topk, _) = topk_last(&idx_scores, k_eff)?; // (B,T,k_eff)
+                let thr = idx_topk
+                    .narrow(idx_topk.shape().rank() - 1, k_eff - 1, 1)?
+                    .broadcast_as(idx_scores.shape())?; // (B,T,nb)
+                let sel = idx_scores.ge(&thr)?; // U8 (B,T,nb)
+                let sel = sel.unsqueeze(2)?.broadcast_as(s_blk.shape())?; // (B,T,nh,nb)
+
+                // 选中块保留真实注意力分数，未选中置 -inf（替代 raw top-k）
+                let (sel_inf, _) = inf_zeros(s_blk.shape().dims().to_vec(), device)?;
+                sel.where_cond(&s_blk, &sel_inf)?
+            } else {
+                // --- 基线：直接对真实注意力分数取 top-k（raw 稀疏）---
+                let (topk_vals, _) = topk_last(&s_blk, k_eff)?; // (B,T,nh,k_eff)
+                let thr = topk_vals
+                    .narrow(topk_vals.shape().rank() - 1, k_eff - 1, 1)?
+                    .broadcast_as(s_blk.shape())?; // 第 k_eff 大值广播成阈值
+                let lt = s_blk.lt(&thr)?;
+                lt.where_cond(&neg_inf, &s_blk)?
+            };
 
             // 没有历史块的 query：整行置 0（否则 softmax 对全 -inf 产生 NaN）
             let has_prior_inv = has_prior
@@ -241,12 +354,22 @@ impl CausalSelfAttention {
                 .unsqueeze(2)?
                 .unsqueeze(3)?
                 .broadcast_as(s_blk.shape())?; // (1,T,1,1)
-            let s_blk = has_prior_inv.where_cond(&zeros, &s_blk)?;
+            let mut s_blk = has_prior_inv.where_cond(&zeros, &s_blk)?;
 
-            let a_blk = candle_nn::ops::softmax(&s_blk, 3)?; // (B,T,nh,nb)
+            // V4 Attention Sink：块注意力也追加一列 sink[h]（v_blocks 补零块占位）
+            let mut v_blocks = v_blocks;
+            if self.use_attn_sink {
+                let sink = self.attn_sink.as_ref().expect("use_attn_sink 缺 attn_sink");
+                let sink_col = sink.reshape((1, 1, self.n_head, 1))?.broadcast_as((b, t, self.n_head, 1))?;
+                s_blk = Tensor::cat(&[&s_blk, &sink_col], 3)?; // (B,T,nh,nb+1)
+                let zero_blk = Tensor::zeros((b, 1, self.n_head, d), DType::F32, device)?;
+                v_blocks = Tensor::cat(&[&v_blocks, &zero_blk], 1)?; // (B,nb+1,nh,d)
+            }
+
+            let a_blk = candle_nn::ops::softmax(&s_blk, 3)?; // (B,T,nh,nb) 或 (B,T,nh,nb+1)
             // y_comp = einsum('bthn,bnhd->bthd', a_blk, v_blocks)
-            let a_p = a_blk.permute((0, 2, 1, 3))?; // (B,nh,T,nb)
-            let vb_p = v_blocks.permute((0, 2, 1, 3))?; // (B,nh,nb,d)
+            let a_p = a_blk.permute((0, 2, 1, 3))?; // (B,nh,T,nb) 或 (B,nh,T,nb+1)
+            let vb_p = v_blocks.permute((0, 2, 1, 3))?; // (B,nh,nb,d) 或 (B,nh,nb+1,d)
             y_comp = a_p.matmul(&vb_p)?.permute((0, 2, 1, 3))?; // (B,T,nh,d)
             let hp = has_prior.unsqueeze(0)?.unsqueeze(2)?.unsqueeze(3)?; // (1,T,1,1)
             y_comp = y_comp.broadcast_mul(&hp)?; // 无历史块的 query 贡献清零
@@ -254,8 +377,14 @@ impl CausalSelfAttention {
             // —— HCA：重度压缩的全局信号（可选）——
             // 把所有允许的压缩块再平均成一个全局潜在，每个 query 加上它
             if self.use_hca {
+                // sink 模式下 v_blocks 末尾多了一个占位零块，只用真实块
+                let v_blocks_real = if self.use_attn_sink {
+                    v_blocks.narrow(1, 0, nb)?
+                } else {
+                    v_blocks
+                };
                 let n_allowed = causal_block.sum_keepdim(1)?.clamp(1.0, f64::INFINITY)?.flatten_all()?; // (T,)
-                let v_flat = v_blocks.reshape((b, nb, nh * d))?; // (B,nb,nh*d)
+                let v_flat = v_blocks_real.reshape((b, nb, nh * d))?; // (B,nb,nh*d)
                 // v_glob = einsum('tn,bnhd->bthd', causal_block, v_blocks) / n_allowed
                 let v_glob = causal_block
                     .unsqueeze(0)?
@@ -271,12 +400,22 @@ impl CausalSelfAttention {
         // 滑窗允许看自己（j ≤ i），保证每个位置至少有一个合法键，避免全 -inf
         let win_mask = window_mask(t, win, device)?; // (T,T)，-inf 表示不合法
         let k_p = k.permute((0, 2, 1, 3))?; // (B,nh,T,d)
-        let s_win = q_p.matmul(&k_p.transpose(2, 3)?)?.affine(scale, 0.0)?; // (B,nh,T,T)
+        let mut s_win = q_p.matmul(&k_p.transpose(2, 3)?)?.affine(scale, 0.0)?; // (B,nh,T,T)
         let win_b = win_mask.unsqueeze(0)?.unsqueeze(0)?.broadcast_as(s_win.shape())?; // (1,1,T,T)
         let (win_inf, _) = inf_zeros(s_win.shape().dims().to_vec(), device)?;
-        let s_win = win_b.where_cond(&win_inf, &s_win)?;
-        let a_win = candle_nn::ops::softmax(&s_win, 3)?; // (B,nh,T,T)
-        let v_p = v.permute((0, 2, 1, 3))?; // (B,nh,T,d)
+        s_win = win_b.where_cond(&win_inf, &s_win)?;
+
+        // V4 Attention Sink：滑窗也追加一列（v 补零行占位）
+        let mut v_p = v.permute((0, 2, 1, 3))?; // (B,nh,T,d)
+        if self.use_attn_sink {
+            let sink = self.attn_sink.as_ref().expect("use_attn_sink 缺 attn_sink");
+            let sink_col = sink.reshape((1, self.n_head, 1, 1))?.broadcast_as((b, self.n_head, t, 1))?;
+            s_win = Tensor::cat(&[&s_win, &sink_col], 3)?; // (B,nh,T,T+1)
+            let zero_row = Tensor::zeros((b, self.n_head, 1, d), DType::F32, device)?;
+            v_p = Tensor::cat(&[&v_p, &zero_row], 2)?; // (B,nh,T+1,d)
+        }
+
+        let a_win = candle_nn::ops::softmax(&s_win, 3)?; // (B,nh,T,T) 或 (B,nh,T,T+1)
         let y_win = a_win.matmul(&v_p)?.permute((0, 2, 1, 3))?; // (B,T,nh,d)
 
         let y = y_comp.add(&y_win)?;
@@ -306,6 +445,24 @@ impl CausalSelfAttention {
         }
         let y = Tensor::new(out.as_slice(), device)?.reshape((b, t, c))?; // (B,T,C)
         Ok(y)
+    }
+
+    /// V4 可学习门控池化（对应 model.py 的 _compress_block）：把块内 m 个 token 的
+    /// K/V 压成 1 个潜在。compress 线性压缩 × sigmoid 门控，K/V 共享同一组权重。
+    /// x_block: (B, T_ok, nh, d)，T_ok = nb*m；返回 (B, nb, nh, d)。
+    fn compress_block(&self, x_block: &Tensor, b: usize, nb: usize, nh: usize, d: usize, m: usize) -> Result<Tensor> {
+        // (B, nb*m, nh, d) → (B, nb, m, nh, d) → (B, nb, nh, m, d) → 展平每块 (B*nb*nh, m*d)
+        let flat = x_block
+            .reshape((b, nb, m, nh, d))?
+            .permute((0, 1, 3, 2, 4))?
+            .reshape((b * nb * nh, m * d))?;
+        let h = linear(&flat, self.compress_w.as_ref().expect("use_csa_learnable 缺 compress"), None)?; // (B*nb*nh, d)
+        let gate = candle_nn::ops::sigmoid(&linear(
+            &flat,
+            self.gate_w.as_ref().expect("use_csa_learnable 缺 gate"),
+            None,
+        )?)?; // (B*nb*nh, d)
+        Ok(h.mul(&gate)?.reshape((b, nb, nh, d))?)
     }
 }
 

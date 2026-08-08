@@ -6,7 +6,7 @@
     tokenizer.json       BPE 分词器（从 data/<dataset>/ 复制，Python/Rust 共用）
 
 用法（从项目根目录）：
-    uv run python inference/runtime/scripts/convert.py --ckpt out/chinese-v4-csa/best.pt --dataset chinese
+    uv run python inference/runtime/scripts/convert.py --ckpt out/chinese-all/best.pt --dataset chinese
 """
 import argparse
 import json
@@ -19,7 +19,7 @@ from safetensors.torch import save_file
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--ckpt', default='out/chinese-v4-csa/best.pt', help='训练好的 checkpoint 路径（默认最优 CSA 模型）')
+    ap.add_argument('--ckpt', default='out/chinese-all/best.pt', help='训练好的 checkpoint 路径（默认全特性模型）')
     ap.add_argument('--dataset', default='chinese', help='数据集名，用来找 data/<dataset>/tokenizer.json')
     ap.add_argument('--out', default='inference/runtime', help='输出目录（Rust 项目根）')
     args = ap.parse_args()

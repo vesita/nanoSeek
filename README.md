@@ -47,6 +47,15 @@ nanoGPT 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 | `use_muon` | `false` | **V4** Muon 优化器（矩阵参数正交化，embedding/lm_head/norm 用 AdamW 保护） |
 | `muon_ns_steps` | `10` | Newton-Schulz 迭代次数（系数 (2,-1.5,0.5)） |
 
+**V4 结构设计升级**（连接方式，不增加规模；实验性，默认全关）：
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `use_attn_sink` | `false` | **V4** Attention Sinks：每头一个可学习标量偏置，作为 softmax 的"垃圾桶"吸收无关注意力 |
+| `use_mhc` / `hc_mult` | `false` / `4` | **V4** mHC 超连接：4 流并行残差 `X'=B·X+C·F(A·X)`，A/C sigmoid 有界、B 双重随机（Sinkhorn），子层只跑 1 次不翻倍计算 |
+| `use_lightning_indexer` | `false` | **V4** 学习型块选择（简版）：idx_q/idx_k 打分选块替代 CSA raw top-k，KL 梯度桥接 |
+| `num_hash_layers` | `0` | **V4** 前 N 层用 `hash(token_id)%n_experts` 确定性路由，深层才用学习路由 |
+
 **YAML 配置系统**（替代原版 exec Python 配置）：
 - 实验配置放 `config/*.yaml`，由 `config_loader.py` 加载
 - 命令行覆盖：`uv run python train.py config/xxx.yaml --n_layer=4`
@@ -93,7 +102,7 @@ nanoGPT/
 │   ├── runtime/               # Rust 推理框架（candle，CPU 推理 + 对话 REPL）
 │   │   ├── src/               # model.rs / attention.rs / main.rs / tokenizer.rs
 │   │   └── scripts/convert.py # checkpoint → safetensors + tokenizer.json
-│   └── scripts/               # smoke_test.py（冒烟）/ package.py（打包）
+│   └── scripts/               # smoke_test.py（冒烟）/ package.py（打包）/ compare_logits.py（对拍）
 ├── data/                      # 数据集脚本（数据文件按需下载，git 忽略）
 │   └── chinese/
 │       ├── prepare.py         # 语料 → train.bin / val.bin
@@ -186,12 +195,15 @@ learning_rate: 0.001
 | V4：MTP 多 token 预测 | ⚠️ 待长训验证 | 800 步主 loss 差 0.17，数据效率收益需更久显现 |
 | V2：MLA 多头潜在注意力 | ✅ 已实现 | 与 CSA 互斥，可切换 |
 | V4：SwiGLU Clamp | ✅ 已实现 | 稳定性技巧，配置启用 |
-| ~~mHC~~ | ❌ 移除 | 2 流版是概念错误（V4 是 4-copy），4 层模型不需要 |
+| V4：Attention Sinks | 🔬 待验证 | 开关可用，每头可学习标量偏置吸收无关注意力 |
+| V4：mHC 4-copy | 🔬 待验证 | **机制正确**（4 流 + Sinkhorn 双重随机 B，非之前删掉的 2 流错误版） |
+| V4：Lightning Indexer（简版） | 🔬 待验证 | 学习型块选择替代 raw top-k，KL 梯度桥接 |
+| V4：Hash 路由 | 🔬 待验证 | 前 N 层确定性路由，开关可用 |
 | ~~预判路由~~ | ❌ 移除 | 非 V4 概念（混淆了 aux-free 偏置修正） |
 
 **数据集**：**BPE 子词分词**（魔搭中文对话语料 ~153MB，8000 词表，ByteLevel 预分词）。数据流程：`download_dialogue.py`（魔搭下载对话）→ `train_tokenizer.py`（训 BPE）→ `prepare.py`（编码成 train.bin/val.bin）。
 
-**默认模型**：`training/config/train_chinese.yaml`（CSA/HCA + MoE，~2.6M 参数）。有收益的开关（共享专家、可学习门控池化）已写进默认配置。
+**默认模型**：`training/config/train_chinese.yaml`（CSA/HCA + MoE，~2.6M 参数）。有收益的开关（共享专家、可学习门控池化）已写进默认配置。四个结构设计升级（Sinks/mHC/Indexer/Hash）实验性默认关闭，冒烟测试已验证可独立开启。
 
 ## 版本化连续训练
 
@@ -206,7 +218,7 @@ uv run python training/train.py training/config/train_chinese.yaml --init_from=r
 
 # 后训练（基于旧版本 best.pt 开新版本，优化器/学习率重置）
 uv run python training/train.py training/config/train_chinese.yaml \
-  --init_from=out/chinese-v4-csa/best.pt --out_dir=out/chinese-v4-csa-v2 --max_iters=5000
+  --init_from=out/chinese-all/best.pt --out_dir=out/chinese-all-v2 --max_iters=5000
 ```
 
 - `best.pt`：val loss 最优的 checkpoint，续训/部署默认用它
@@ -222,8 +234,8 @@ uv run python training/train.py training/config/train_chinese.yaml \
 **部署流程**（训练产物 → 可对话模型）：
 
 ```sh
-# 1. 转换 checkpoint（默认转换最优的 CSA 模型）
-uv run python inference/runtime/scripts/convert.py --ckpt out/chinese-v4-csa/best.pt --dataset chinese
+# 1. 转换 checkpoint（默认转换全特性模型）
+uv run python inference/runtime/scripts/convert.py --ckpt out/chinese-all/best.pt --dataset chinese
 
 # 2. 编译 Rust 运行时
 cd inference/runtime && cargo build --release
@@ -240,14 +252,16 @@ cd inference/runtime && cargo build --release
 | 特性 | 状态 | 说明 |
 |------|------|------|
 | RMSNorm / RoPE / SwiGLU | ✅ | 固定架构三件套 |
-| MoE（top-k 路由 + 专家 FFN） | ✅ | 不含共享专家（Python 新增，Rust 待补） |
+| MoE（top-k 路由 + 专家 FFN + 共享专家） | ✅ | 含 V4 共享专家 |
 | SwiGLU Clamp | ✅ | V4 数值稳定性钳制 |
-| CSA + HCA（压缩稀疏注意力） | ✅ | 块压缩 + top-k 稀疏选择 + 滑窗 + 全局信号（**仅平均池化**，可学习门控池化 Rust 待补） |
+| CSA + HCA（压缩稀疏注意力） | ✅ | 块压缩 + top-k 稀疏选择 + 滑窗 + 全局信号，含 V4 可学习门控池化 |
+| V4 Attention Sinks / mHC / Lightning Indexer / Hash 路由 | ✅ | 结构设计升级，与 Python 逐位对齐 |
 | MLA / MTP | ❌ | Python 端有，Rust 未实现 |
 
-⚠️ **部署注意**：Python 端新增的 `use_csa_learnable`（可学习门控池化）和 `use_shared_expert`
-（共享专家）Rust 端**尚未实现**。训练时开启这两个开关的模型，部署前需要先给 Rust 端补上对应
-实现（或训练时不开启），否则 Rust 推理与 Python 权重不一致。
+⚠️ **部署注意**：MLA / MTP 仍只在 Python 端，Rust 未实现。训练时开启这两个开关的
+模型无法部署；其余 V4 特性（含四个结构设计升级）Rust 已全部支持。Rust 端验证方法：
+用 `--print-logits` / `--dump-logits` 配合 `inference/sample.py` 的 `--dump_logits`
+逐位对拍（见下方「对拍验证」）。
 
 **CLI 选项**：
 
@@ -264,7 +278,10 @@ cd inference/runtime && cargo build --release
 **部署注意**：
 - 推理是纯 CPU，逐 token 重新前向（无 KV cache），块长 256 的小模型上足够快；放大模型后建议加 KV cache。
 - 权重全部 F32，无量化；需要更低显存/内存可后续加。
-- `--print-logits` / `--dump-logits` 配合 `inference/sample.py` 的 Python 输出做逐位对拍，是验证部署正确性的标准手段。
+- 对拍验证：同一 prompt 下 Rust 与 Python 的 logits 应逐位对齐（最大误差 < 1e-5）。
+  有 `inference/scripts/compare_logits.py` 一条命令完成（convert → build → 双端 dump → diff），
+  也可手动跑：Python 端 `uv run python inference/sample.py --out_dir=out/<实验> --start="悟空" --dump_logits=/tmp/py.txt`，
+  Rust 端 `./target/release/nanogpt-runtime --dump-logits /tmp/rust.txt --prompt "悟空"`，然后 diff 两个文件。
 
 ---
 
@@ -276,6 +293,7 @@ cd inference/runtime && cargo build --release
 | 训练 | `uv run python train.py config/<实验名>.yaml` |
 | 采样 | `uv run python inference/sample.py --out_dir=out/<实验名>` |
 | 部署到 Rust | `uv run python inference/runtime/scripts/convert.py --ckpt out/<实验>/best.pt --dataset chinese` → `cd inference/runtime && cargo run --release -- --prompt "悟空"` |
+| Rust/Python 对拍 | `uv run python inference/scripts/compare_logits.py --ckpt out/<实验>/best.pt`（一条命令：convert→build→双端 dump→diff） |
 | 看 checkpoint 里的配置 | `torch.load('out/xxx/best.pt', weights_only=False)['model_args']` |
 | TensorBoard 对比曲线 | `uv run tensorboard --logdir out/`（需在配置里开 `tensorboard_log: true`） |
 | 提交实验 | `git add -A && git commit -m "..."` |

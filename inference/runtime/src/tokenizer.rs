@@ -102,9 +102,9 @@ mod tests {
             return;
         }
         let tok = BpeTokenizer::load(path).expect("tokenizer 加载失败");
-        assert_eq!(tok.encode("你好世界").unwrap(), vec![4285, 8957, 27833]);
-        assert_eq!(tok.encode("悟空").unwrap(), vec![24060, 210, 20474]);
-        assert_eq!(tok.decode(&[4285, 8957, 27833]).unwrap(), "你好世界");
+        assert_eq!(tok.encode("你好世界").unwrap(), vec![5298, 1152]);
+        assert_eq!(tok.encode("悟空").unwrap(), vec![3443, 769]);
+        assert_eq!(tok.decode(&[5298, 1152]).unwrap(), "你好世界");
     }
 
     /// 流式解码：逐 token 喂入，最终还原必须和一次性解码一致。

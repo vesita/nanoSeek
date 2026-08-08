@@ -91,6 +91,12 @@ fn main() -> Result<()> {
         if config.use_anticipatory_routing {
             feats.push("预判路由".to_string());
         }
+        if config.use_shared_expert {
+            feats.push("共享专家".to_string());
+        }
+        if config.num_hash_layers > 0 {
+            feats.push(format!("Hash路由(前{}层)", config.num_hash_layers));
+        }
     }
     if config.use_csa {
         feats.push(format!(
@@ -100,9 +106,18 @@ fn main() -> Result<()> {
         if config.use_hca {
             feats.push("HCA".to_string());
         }
+        if config.use_csa_learnable {
+            feats.push("门控池化".to_string());
+        }
+        if config.use_lightning_indexer {
+            feats.push("Indexer".to_string());
+        }
     }
     if config.use_mhc {
-        feats.push("mHC".to_string());
+        feats.push(format!("mHC({}流)", config.hc_mult));
+    }
+    if config.use_attn_sink {
+        feats.push("Sinks".to_string());
     }
     if config.swiglu_clamp > 0.0 {
         feats.push(format!("Clamp({})", config.swiglu_clamp));

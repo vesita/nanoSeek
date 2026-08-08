@@ -56,6 +56,19 @@ pub struct Config {
     // --- mHC（V4）---
     #[serde(default)]
     pub use_mhc: bool,
+    // --- V4 结构设计升级（默认全关，缺字段的旧配置自动回退）---
+    #[serde(default = "default_hc_mult")]
+    pub hc_mult: usize,              // mHC 残差流数（Python GPTConfig 默认 4）
+    #[serde(default)]
+    pub use_attn_sink: bool,         // Attention Sinks：每头可学习标量偏置
+    #[serde(default)]
+    pub use_lightning_indexer: bool, // 学习型块选择替代 CSA raw top-k
+    #[serde(default)]
+    pub num_hash_layers: usize,      // 前 N 层用 hash 路由（0=禁用）
+    #[serde(default)]
+    pub use_shared_expert: bool,     // MoE 始终激活的共享专家
+    #[serde(default)]
+    pub use_csa_learnable: bool,     // 门控池化替代平均池化（旧配置缺字段按 false=平均池化最安全）
 }
 
 fn default_rope_theta() -> f64 {
@@ -78,6 +91,9 @@ fn default_csa_window() -> usize {
 }
 fn default_qk_rope_head_dim() -> usize {
     16
+}
+fn default_hc_mult() -> usize {
+    4
 }
 
 impl Config {
@@ -116,18 +132,45 @@ impl GPT {
             let attn = CausalSelfAttention::new(&vb, &format!("{prefix}.attn"), config)?;
             let ln2 = Norm::new(&vb, &format!("{prefix}.ln_2"), config.use_rmsnorm)?;
             // 前馈：MoE > SwiGLU > 标准 GELU MLP（优先级和 model.py 一致）
+            // Hash 路由：前 num_hash_layers 层的 MoE 用确定性 hash 分配（对应 model.py 的 layer_idx < num_hash_layers）
             let mlp = if config.use_moe {
-                Ffn::MoE(MoE::new(&vb, &format!("{prefix}.mlp"), config)?)
+                Ffn::MoE(MoE::new(&vb, &format!("{prefix}.mlp"), config, i < config.num_hash_layers)?)
             } else {
                 Ffn::Mlp(Mlp::new(&vb, &format!("{prefix}.mlp"), config)?)
             };
-            // mHC 的 2×2 混合矩阵 logits（经 Sinkhorn 投影成双随机矩阵）
-            let mix = if config.use_mhc {
-                Some(vb.get_unchecked(&format!("{prefix}.mix"))?)
+            // mHC 4-copy：6 个 raw 参数（attn 子层 + FFN 子层的 A/B/C），use_mhc 时加载
+            let (raw_a_attn, raw_b_attn, raw_c_attn) = if config.use_mhc {
+                (
+                    Some(vb.get_unchecked(&format!("{prefix}.raw_A_attn"))?),
+                    Some(vb.get_unchecked(&format!("{prefix}.raw_B_attn"))?),
+                    Some(vb.get_unchecked(&format!("{prefix}.raw_C_attn"))?),
+                )
             } else {
-                None
+                (None, None, None)
             };
-            blocks.push(Block { ln1, attn, ln2, mlp, mix });
+            let (raw_a_ffn, raw_b_ffn, raw_c_ffn) = if config.use_mhc {
+                (
+                    Some(vb.get_unchecked(&format!("{prefix}.raw_A_ffn"))?),
+                    Some(vb.get_unchecked(&format!("{prefix}.raw_B_ffn"))?),
+                    Some(vb.get_unchecked(&format!("{prefix}.raw_C_ffn"))?),
+                )
+            } else {
+                (None, None, None)
+            };
+            blocks.push(Block {
+                ln1,
+                attn,
+                ln2,
+                mlp,
+                use_mhc: config.use_mhc,
+                hc_mult: config.hc_mult,
+                raw_A_attn: raw_a_attn,
+                raw_B_attn: raw_b_attn,
+                raw_C_attn: raw_c_attn,
+                raw_A_ffn: raw_a_ffn,
+                raw_B_ffn: raw_b_ffn,
+                raw_C_ffn: raw_c_ffn,
+            });
         }
         let ln_f = Norm::new(&vb, "transformer.ln_f", config.use_rmsnorm)?;
 
@@ -155,20 +198,15 @@ impl GPT {
             h = h.add(&pos_emb)?;
         }
 
-        // mHC 的记忆流 z：None 时第一层 Block 内部会用 x 初始化
-        let mut z: Option<Tensor> = None;
+        // mHC：4 个残差流从同一嵌入出发（在流维广播扩展），层后取均值回到 1 流
+        if self.config.use_mhc {
+            h = h.unsqueeze(2)?.broadcast_as((1, t, self.config.hc_mult, self.config.n_embd))?;
+        }
         for block in &self.blocks {
-            if self.config.use_mhc {
-                let (xn, zn) = block.forward_mhc(&h, z.as_ref())?;
-                h = xn;
-                z = Some(zn);
-            } else {
-                h = block.forward(&h)?;
-            }
+            h = block.forward(&h)?; // Block::forward 内部按 use_mhc 分派
         }
         if self.config.use_mhc {
-            // 最终用「记忆流」解码：它累积了所有层的块输出（和 model.py 一致）
-            h = z.expect("use_mhc 但记忆流 z 为空");
+            h = h.mean(2)?; // (1, T, hc, d) → (1, T, d)
         }
         let h = self.ln_f.forward(&h)?;
 
@@ -228,13 +266,22 @@ impl GPT {
     }
 }
 
-/// 单个 transformer 块：attn + ff，残差连接（或 mHC 双流混合）。
+/// 单个 transformer 块：attn + ff，残差连接（或 mHC 4 流混合）。
+#[allow(non_snake_case)] // raw_A_attn 等字段名与 Python 权重名一致，方便 vb 加载
 struct Block {
     ln1: Norm,
     attn: CausalSelfAttention,
     ln2: Norm,
     mlp: Ffn,
-    mix: Option<Tensor>, // mHC 的 2×2 混合矩阵 logits（经 Sinkhorn 投影）
+    // mHC 4-copy（V4）：X' = B·X + C·F(A·X)。attn 和 FFN 子层各一组 A/B/C。
+    use_mhc: bool,
+    hc_mult: usize,
+    raw_A_attn: Option<Tensor>, // (1, hc) → sigmoid，把 4 流压成 1 流给子层
+    raw_B_attn: Option<Tensor>, // (hc, hc) → softplus → Sinkhorn（双随机混合）
+    raw_C_attn: Option<Tensor>, // (hc, 1) → sigmoid，把子层输出展开回 4 流
+    raw_A_ffn: Option<Tensor>,
+    raw_B_ffn: Option<Tensor>,
+    raw_C_ffn: Option<Tensor>,
 }
 
 /// 前馈网络：MoE（V3）或单一 MLP/SwiGLU。
@@ -254,26 +301,65 @@ impl Ffn {
 
 impl Block {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if self.use_mhc {
+            return self.forward_mhc(x);
+        }
         let h = self.attn.forward(&self.ln1.forward(x)?)?;
         let x = x.add(&h)?;
         let h = self.mlp.forward(&self.ln2.forward(&x)?)?;
         Ok(x.add(&h)?)
     }
 
-    /// mHC 双流前向：返回 (新工作流 x, 新记忆流 z)。
-    /// z 为 None 时（第一块）用 x 初始化记忆流。
-    fn forward_mhc(&self, x: &Tensor, z: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
-        let z = z.unwrap_or(x); // 第一块：记忆流从工作流初始化
-        // 块输出 z_block = FFN(LN2(ATTN(LN1(x))))，两条流都从它混合
-        let z_block = self.mlp.forward(&self.ln2.forward(&self.attn.forward(&self.ln1.forward(x)?)?)?)?;
-        // 2×2 双随机矩阵：谱范数恒为 1，信号经过每个超连接最多不被放大
-        let m: Vec<f32> = sinkhorn_knopp(self.mix.as_ref().expect("use_mhc 缺 mix 参数"), 10)?
-            .flatten_all()?
-            .to_vec1()?;
-        let (m00, m01, m10, m11) = (m[0], m[1], m[2], m[3]);
-        let x_new = x.affine(m00 as f64, 0.0)?.add(&z_block.affine(m01 as f64, 0.0)?)?;
-        let r_new = z.affine(m10 as f64, 0.0)?.add(&z_block.affine(m11 as f64, 0.0)?)?;
-        Ok((x_new, r_new))
+    /// mHC 4-copy 前向：X' = B·X + C·F(A·X)，逐位对齐 model.py 的 Block._mhc_forward。
+    /// x: (B, T, hc, d) 4 个并行残差流；返回同样形状的新 4 流。
+    /// A（1×hc，sigmoid）把 4 流压成 1 流给子层 F；子层只算 1 次；
+    /// C（hc×1，sigmoid）把子层输出展开回 4 流；B（hc×hc，双随机）混合残差流。
+    fn forward_mhc(&self, x: &Tensor) -> Result<Tensor> {
+        let (_, _, hc, _) = x.dims4()?;
+        debug_assert_eq!(hc, self.hc_mult);
+
+        // --- 子层 1：注意力 ---
+        let x = self.mhc_sublayer(x, hc, true)?;
+
+        // --- 子层 2：FFN（MoE 或 SwiGLU）---
+        self.mhc_sublayer(&x, hc, false)
+    }
+
+    /// 单个 mHC 子层：A 压缩 → F 计算 → C 展开 → B 混合残差。
+    fn mhc_sublayer(&self, x: &Tensor, hc: usize, is_attn: bool) -> Result<Tensor> {
+        // A = sigmoid(raw_A)：(1, hc)
+        let raw_a = if is_attn { &self.raw_A_attn } else { &self.raw_A_ffn };
+        let a = candle_nn::ops::sigmoid(raw_a.as_ref().expect("use_mHC 缺 raw_A"))?;
+        // h_in = Σ_h x[...,h,:] * A[h]：(B, T, d)
+        let h_in = x.broadcast_mul(&a.reshape((1, 1, hc, 1))?)?.sum(2)?;
+
+        // 子层 F 只跑 1 次
+        let h_out = if is_attn {
+            self.attn.forward(&self.ln1.forward(&h_in)?)?
+        } else {
+            self.mlp.forward(&self.ln2.forward(&h_in)?)?
+        };
+
+        // C = sigmoid(raw_C)：(hc, 1)；delta = h_out.unsqueeze(2) * C：(B, T, hc, d)
+        let raw_c = if is_attn { &self.raw_C_attn } else { &self.raw_C_ffn };
+        let c = candle_nn::ops::sigmoid(raw_c.as_ref().expect("use_mhc 缺 raw_C"))?;
+        let delta = h_out.unsqueeze(2)?.broadcast_mul(&c.reshape((1, 1, hc, 1))?)?;
+
+        // B = sinkhorn(softplus(raw_B))：(hc, hc)，双随机
+        let raw_b = if is_attn { &self.raw_B_attn } else { &self.raw_B_ffn };
+        let b_ds = sinkhorn_knopp(raw_b.as_ref().expect("use_mhc 缺 raw_B"), 20)?;
+
+        // x' = einsum('bthd,hc->btcd', x, B) + delta
+        //     = (x 的 h/d 轴对调) @ B 再对调回来，等价于对 h 维做矩阵乘。
+        // candle 的 matmul 不支持 4D @ 2D，把 (B,T,d,hc) 拍平成 2D 乘完再还原。
+        let (b, t, hc, d) = x.dims4()?;
+        let x_pt = x.permute((0, 1, 3, 2))?; // (B,T,d,hc)
+        let mixed = x_pt
+            .reshape((b * t * d, hc))?
+            .matmul(&b_ds)?
+            .reshape((b, t, d, hc))?
+            .permute((0, 1, 3, 2))?; // (B,T,hc,d)
+        Ok(mixed.add(&delta)?)
     }
 }
 
@@ -373,16 +459,19 @@ impl Mlp {
 
 /// MoE（V3）：混合专家。每个 token 只路由到 top-k 个专家——参数量随专家数
 /// 线性增长，但每个 token 的计算量不变。推理时不计算负载均衡辅助损失。
+/// V4：浅层可用 hash 确定性路由（use_hash），深层用学习路由；可叠加共享专家。
 struct MoE {
     gate: Tensor,              // (n_experts, n_embd) 路由打分权重
     gate_slow: Option<Tensor>, // (n_experts, n_embd) 预判路由的 EMA 副本（buffer）
     experts: Vec<Mlp>,         // n_experts 个完整 FFN（SwiGLU 或 GELU）
+    shared_expert: Option<Mlp>, // V4：始终激活的共享专家（捕获共性特征）
     n_top_k: usize,
     use_anticipatory_routing: bool,
+    use_hash: bool, // V4：浅层用 hash(token 第一维) 确定性分配，不学习
 }
 
 impl MoE {
-    fn new(vb: &candle_nn::VarBuilder, prefix: &str, config: &Config) -> Result<Self> {
+    fn new(vb: &candle_nn::VarBuilder, prefix: &str, config: &Config, use_hash: bool) -> Result<Self> {
         let gate = vb.get_unchecked(&format!("{prefix}.router.weight"))?;
         // 预判路由的慢路由 buffer：推理时直接用（不再做 EMA 漂移——那是训练行为）
         let gate_slow = if config.use_anticipatory_routing {
@@ -394,12 +483,20 @@ impl MoE {
         for j in 0..config.n_experts {
             experts.push(Mlp::new(vb, &format!("{prefix}.experts.{j}"), config)?);
         }
+        // V4 共享专家：始终激活，捕获所有 token 的共性特征（语法、常见搭配）
+        let shared_expert = if config.use_shared_expert {
+            Some(Mlp::new(vb, &format!("{prefix}.shared_expert"), config)?)
+        } else {
+            None
+        };
         Ok(Self {
             gate,
             gate_slow,
             experts,
+            shared_expert,
             n_top_k: config.n_top_k,
             use_anticipatory_routing: config.use_anticipatory_routing,
+            use_hash,
         })
     }
 
@@ -409,58 +506,98 @@ impl MoE {
         let n = b * t;
         let n_experts = self.gate.dim(0)?;
 
-        // 路由打分：softmax 得到每个 token 在每个专家上的概率
-        let gate_logits = linear(&x_flat, &self.gate, None)?; // (N, n_experts)
-        let (top_k_probs, top_k_indices) = if self.use_anticipatory_routing {
-            // 预判路由（V4）：离散选择用慢路由（旧参数），门控用当前路由
-            let slow_logits =
-                linear(&x_flat, self.gate_slow.as_ref().expect("预判路由缺 router_slow"), None)?;
-            let (_, indices) = topk_last(&softmax_last(&slow_logits)?, self.n_top_k)?;
-            let router_probs = softmax_last(&gate_logits)?;
-            let probs = gather_last(&router_probs, &indices)?; // (N, k)
-            let denom = probs.sum_keepdim(1)?.affine(1.0, 1e-6)?; // +1e-6 防除零
-            (probs.broadcast_div(&denom)?, indices)
+        // 路由：hash 确定性分配（浅层）或学习打分（深层）
+        let (top_k_probs, top_k_indices) = if self.use_hash {
+            // --- V4 Hash 路由：确定性分配，不学习（对应 model.py:438-450）---
+            // Knuth 乘法哈希：用 token 嵌入的第一维作签名，均匀映射到各专家。
+            // 用 k 个不同的乘子生成 k 个专家槽位。
+            let col0: Vec<f32> = x_flat.narrow(1, 0, 1)?.flatten_all()?.to_vec1()?;
+            let mut indices = vec![0u32; n * self.n_top_k];
+            for i in 0..self.n_top_k {
+                let prime: i64 = 2654435761 + 97 * i as i64;
+                for row in 0..n {
+                    // .long() 截断向零 → Rust `as i64`；rem_euclid 保证和 Python % 一样恒非负
+                    let v = col0[row] as i64;
+                    let h = v.wrapping_mul(prime) >> 16;
+                    indices[row * self.n_top_k + i] = h.rem_euclid(n_experts as i64) as u32;
+                }
+            }
+            let indices_t = Tensor::new(indices.as_slice(), x.device())?
+                .reshape((n, self.n_top_k))?;
+            let probs_t = Tensor::new(vec![1.0 / self.n_top_k as f32; n * self.n_top_k], x.device())?
+                .reshape((n, self.n_top_k))?;
+            (probs_t, indices_t)
         } else {
-            let router_probs = softmax_last(&gate_logits)?;
-            let (vals, indices) = topk_last(&router_probs, self.n_top_k)?;
-            let denom = vals.sum_keepdim(1)?;
-            (vals.broadcast_div(&denom)?, indices)
+            // 路由打分：softmax 得到每个 token 在每个专家上的概率
+            let gate_logits = linear(&x_flat, &self.gate, None)?; // (N, n_experts)
+            if self.use_anticipatory_routing {
+                // 预判路由（V4）：离散选择用慢路由（旧参数），门控用当前路由
+                let slow_logits =
+                    linear(&x_flat, self.gate_slow.as_ref().expect("预判路由缺 router_slow"), None)?;
+                let (_, indices) = topk_last(&softmax_last(&slow_logits)?, self.n_top_k)?;
+                let router_probs = softmax_last(&gate_logits)?;
+                let probs = gather_last(&router_probs, &indices)?; // (N, k)
+                let denom = probs.sum_keepdim(1)?.affine(1.0, 1e-6)?; // +1e-6 防除零
+                (probs.broadcast_div(&denom)?, indices)
+            } else {
+                let router_probs = softmax_last(&gate_logits)?;
+                let (vals, indices) = topk_last(&router_probs, self.n_top_k)?;
+                let denom = vals.sum_keepdim(1)?;
+                (vals.broadcast_div(&denom)?, indices)
+            }
         };
 
         // 逐个专家计算：收集路由到它的 token 过 FFN，按门控权重加回原处
         let idx: Vec<u32> = top_k_indices.flatten_all()?.to_vec1()?;
         let w: Vec<f32> = top_k_probs.flatten_all()?.to_vec1()?;
-        let mut output = x_flat.zeros_like()?;
+        // V4 共享专家：所有 token 都先过一遍（捕获共性），再叠加路由专家的差异化输出
+        let mut output = if let Some(shared) = &self.shared_expert {
+            shared.forward(&x_flat)?
+        } else {
+            x_flat.zeros_like()?
+        };
         for i in 0..n_experts {
-            let mut token_ids: Vec<u32> = Vec::new();
-            let mut weights: Vec<f32> = Vec::new();
+            // 收集路由到该专家的 (row, weight)。PyTorch 的 `output[token_ids] += contrib`
+            // 是 fancy-index +=，对重复 row（同一 token 被 hash 选进同一专家两次）会「后写覆盖
+            // 先写」——只保留每个 row 最后一个 slot 的贡献，而不是累加两次。这里显式模拟：
+            // 用 row → weight 的覆盖映射，重复 row 时后者覆盖前者。
+            let mut per_row: Vec<(u32, f32)> = Vec::new();
             for row in 0..n {
                 for slot in 0..self.n_top_k {
                     if idx[row * self.n_top_k + slot] == i as u32 {
-                        token_ids.push(row as u32);
-                        weights.push(w[row * self.n_top_k + slot]);
+                        // 直接更新（覆盖）：重复 row 只保留最后一次的权重
+                        if let Some(e) = per_row.iter_mut().find(|(r, _)| *r == row as u32) {
+                            e.1 = w[row * self.n_top_k + slot];
+                        } else {
+                            per_row.push((row as u32, w[row * self.n_top_k + slot]));
+                        }
                     }
                 }
             }
-            if token_ids.is_empty() {
+            if per_row.is_empty() {
                 continue;
             }
+            let token_ids: Vec<u32> = per_row.iter().map(|(r, _)| *r).collect();
+            let weights: Vec<f32> = per_row.iter().map(|(_, wgt)| *wgt).collect();
             let ids = Tensor::new(token_ids.as_slice(), x.device())?; // (num,)
             let expert_in = x_flat.index_select(&ids, 0)?; // (num, C)
             let expert_out = self.experts[i].forward(&expert_in)?; // (num, C)
             let w_t = Tensor::new(weights.as_slice(), x.device())?.unsqueeze(1)?; // (num, 1)
             let contrib = expert_out.broadcast_mul(&w_t)?;
+            // 每个 row 只出现一次，用 index_add（等价于加一次）
             output = output.index_add(&ids, &contrib, 0)?;
         }
         Ok(output.reshape((b, t, c))?)
     }
 }
 
-/// Sinkhorn-Knopp：把 2×2 logits 投影成双随机矩阵（每行每列和都为 1、元素非负）。
-/// 双随机矩阵的谱范数恒为 1——信号经过每个 mHC 超连接最多不被放大。
-fn sinkhorn_knopp(logits: &Tensor, iters: usize) -> Result<Tensor> {
-    // softplus(x) = log(1 + exp(x))：非负且处处可导
-    let mut m = logits.exp()?.affine(1.0, 1.0)?.log()?;
+/// Sinkhorn-Knopp：把 hc×hc 矩阵投影成双随机矩阵（每行每列和都为 1、元素非负）。
+/// 双随机矩阵的谱范数 ≤ 1——信号经过每个 mHC 超连接最多不被放大。
+/// 逐位对齐 model.py：sinkhorn_knopp(F.softplus(raw_B))，内部先 exp(softplus(·)) 再 20 次行列归一。
+fn sinkhorn_knopp(raw: &Tensor, iters: usize) -> Result<Tensor> {
+    // softplus(x) = log(1 + exp(x))；exp(softplus(raw)) = 1 + exp(raw)
+    let softplus = raw.exp()?.affine(1.0, 1.0)?.log()?; // log(1+exp(raw))
+    let mut m = softplus.exp()?;                        // exp(softplus(raw))
     for _ in 0..iters {
         m = m.broadcast_div(&m.sum_keepdim(1)?)?; // 行归一：每行和为 1
         m = m.broadcast_div(&m.sum_keepdim(0)?)?; // 列归一：每列和为 1
