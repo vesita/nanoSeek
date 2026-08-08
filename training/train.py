@@ -48,6 +48,11 @@ log_interval = 10
 eval_iters = 200
 eval_only = False # 如果为 True，脚本在第一次评估后立即退出
 always_save_checkpoint = False # 如果为 True，每次评估后总是保存 checkpoint；否则只在 val 变优时保存
+# 早停：val loss 连续 patience 次评估无实质改善就提前终止（不用手动估算步数）
+enable_early_stop = True   # 默认开；设为 False 则训满 max_iters
+patience = 3               # val 连续 3 次评估不改善就停（激进；保守可调 5-8）
+min_val_improve = 0.01     # val 至少下降 0.01 才算"改善"（避免微小抖动干扰）
+min_iters = 1000           # 前 1000 步强制不早停（训练早期 loss 波动大，避免误停）
 init_from = 'scratch' # 'scratch' 或 'resume' 或 '<路径>.pt'（后训练）
 # wandb 日志记录
 wandb_log = False # 默认禁用
@@ -411,6 +416,8 @@ def save_checkpoint_async(ckpt, path):
     t = threading.Thread(target=_save_worker, args=(ckpt_cpu, path + '.tmp', path), daemon=True)
     _save_threads.append(t)
     t.start()
+    # 清理已完成的线程，防止列表无限累积占内存（eval 多次后列表会很长）
+    _save_threads[:] = [x for x in _save_threads if x.is_alive()]
 
 def join_save_threads():
     """等待所有后台保存线程完成（训练结束前调用，确保最后的 checkpoint 落盘）。"""
@@ -465,6 +472,8 @@ running_mfu = -1.0
 # tqdm 进度条：DDP 下只有主进程显示
 pbar = tqdm(total=max_iters, initial=iter_num, desc="训练中", dynamic_ncols=True) if master_process else None
 loss_history = []  # 每个评估点记 (iter, train_loss, val_loss)，训练结束画曲线图用
+early_stopped = False  # 早停是否触发（收尾打印用）
+no_improve_count = 0   # val 连续无实质改善的评估次数（早停计数）
 while True:
 
     # 确定并设置本次迭代的学习率
@@ -516,6 +525,18 @@ while True:
             if is_best:
                 save_checkpoint_async(checkpoint, os.path.join(out_dir, 'best.pt'))
                 pbar.write(f"✓ 新最佳 val {best_val_loss:.4f} → best.pt（并已更新 last.pt）")
+            # 早停：val 连续 patience 次评估无实质改善 → 提前终止。
+            # 改善判定用 min_val_improve 阈值（严格低于才重置计数），避免微小抖动干扰。
+            # 注意 is_best 是"比历史 best 低"即算，这里要"比 best 低出 min_val_improve"才算实质改善。
+            if enable_early_stop and iter_num >= min_iters:
+                if losses['val'] < best_val_loss - min_val_improve:
+                    no_improve_count = 0  # 有实质改善，重置计数
+                else:
+                    no_improve_count += 1
+                    if no_improve_count >= patience:
+                        early_stopped = True
+                        pbar.write(f"⏹ 早停：val 连续 {patience} 次评估无实质改善（best {best_val_loss:.4f}），提前终止 @ {iter_num}")
+                        break
     if iter_num == 0 and eval_only:
         break
 
@@ -568,6 +589,11 @@ while True:
         break
 
 # 训练结束：等后台保存线程写完，再画 loss 曲线图，收尾 csv
+if master_process:
+    if early_stopped:
+        print(f"训练提前终止：{iter_num} 步（早停，best_val_loss {best_val_loss:.4f}）")
+    else:
+        print(f"训练完成：{iter_num} 步（达 max_iters {max_iters}）")
 join_save_threads()
 if results_csv is not None:
     results_csv.close()
