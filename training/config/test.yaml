@@ -1,0 +1,45 @@
+# 快速冒烟配置：验证代码不崩、能训起来就跑，别用来出正式模型。
+# 和 train_chinese.yaml 同样的架构开关，但步数少、模型更小，秒级完成。
+# 正式训练用 train_chinese.yaml。
+out_dir: out/test
+eval_interval: 20
+eval_iters: 10
+log_interval: 5
+always_save_checkpoint: false
+wandb_log: false
+dataset: chinese
+gradient_accumulation_steps: 1
+batch_size: 16
+block_size: 256
+
+# 最小模型（~0.34M 参数）
+vocab_size: 8000   # 显式指定，防止 GPTConfig 默认 50304（GPT-2 词表）
+n_layer: 2
+n_head: 2
+n_embd: 32
+dropout: 0.0
+
+# --- 位置编码：RoPE ---
+use_rope: true
+
+# --- MoE 混合专家 ---
+use_moe: true
+n_experts: 2
+n_top_k: 1
+moe_aux_weight: 0.01
+use_shared_expert: true
+
+# --- CSA/HCA 混合注意力（默认；也可换 MLA）---
+use_csa: true
+csa_compress: 16
+csa_topk: 2
+csa_window: 64
+use_hca: true
+use_csa_learnable: true
+
+learning_rate: 0.001
+max_iters: 50
+lr_decay_iters: 50
+min_lr: 0.0001
+beta2: 0.99
+warmup_iters: 10

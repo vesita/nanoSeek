@@ -8,7 +8,6 @@ from .model import (
     MoE,
     SwiGLU,
     Muon,
-    sinkhorn_knopp,
     zeropower_via_newtonschulz,
 )
 
@@ -18,6 +17,5 @@ __all__ = [
     "MoE",
     "SwiGLU",
     "Muon",
-    "sinkhorn_knopp",
     "zeropower_via_newtonschulz",
 ]

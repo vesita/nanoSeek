@@ -8,41 +8,51 @@ nanoGPT 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 
 ## 当前功能
 
-**现代化模型组件**（`model.py`，全部可开关，默认关 = 原始 GPT-2 结构）：
+**固定架构**（`model.py` 硬编码，不可配置）：RMSNorm + SwiGLU。
+
+**配置项**（`model.py` / YAML 可开关）：
 
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
-| `use_rmsnorm` | `false` | LayerNorm → RMSNorm（DeepSeek/LLaMA 标准归一化，省掉均值运算） |
-| `use_rope` | `false` | 可学习位置编码 → RoPE 旋转位置编码（点积自动携带相对位置信息） |
-| `use_swiglu` | `false` | GELU MLP → SwiGLU 门控前馈（同等参数下表达力更强） |
+| `use_rope` | `false` | 可学习位置编码 → RoPE 旋转位置编码 |
 | `rope_theta` | `10000.0` | RoPE 基频，可调 |
+| `swiglu_clamp` | `0.0` | SwiGLU 门控输出钳制半宽（V4 稳定性技巧） |
 
-**DeepSeek-V2/V3 核心**：
-
-| 配置项 | 默认 | 说明 |
-|--------|------|------|
-| `use_moe` | `false` | FFN → MoE 混合专家（top-k 路由 + 负载均衡辅助损失） |
-| `n_experts` / `n_top_k` | `8` / `2` | 专家总数 / 每 token 激活的专家数 |
-| `use_mla` | `false` | 多头潜在注意力：KV 低秩压缩 + 部分 RoPE |
-| `use_mtp` | `false` | 多 token 预测：训练时额外预测未来 token |
-
-**DeepSeek-V4 新技术**（`training/config/train_chinese_v4_*.yaml` 逐项验证）：
+**MoE 混合专家**（DeepSeek-V3/V4）：
 
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
-| `swiglu_clamp` | `0.0` | SwiGLU 门控输出钳制半宽（0 = 关）。V4 稳定性技巧：从源头压制被 MoE 路由放大的异常值 |
-| `use_muon` | `false` | Muon 优化器替代 AdamW：矩阵参数做 Newton-Schulz 正交化 |
-| `use_mhc` | `false` | 流形约束超连接替代残差：双流混合 + 双随机矩阵（谱范数=1，信号不放大） |
-| `use_anticipatory_routing` | `false` | 预判路由：离散路由选择用 EMA 旧参数，与骨干更新解耦（防 loss spike） |
-| `use_csa` | `false` | 压缩稀疏注意力：块级 KV 压缩 + top-k 稀疏选择 + 滑窗（O(T²)→O(T·(nb+win))） |
-| `use_hca` | `false` | 重度压缩注意力：全局摘要信号（配合 use_csa 使用） |
+| `use_moe` | `false` | FFN → MoE（top-k 路由 + 负载均衡） |
+| `n_experts` / `n_top_k` | `8` / `2` | 路由专家数 / 每 token 激活数 |
+| `use_shared_expert` | `false` | **V4**：始终激活的共享专家（捕获共性特征） |
+| `use_aux_free_balance` | `false` | **V4**：aux-free 偏置修正替代 Switch aux loss |
+| `use_sqrtsoftplus` | `false` | **V4**：路由打分 √softplus 替代 softmax |
+
+**注意力**（DeepSeek-V2 MLA 与 V4 CSA 二选一）：
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `use_mla` | `false` | MLA 多头潜在注意力（低秩压缩 KV + 部分 RoPE） |
+| `use_csa` | `false` | **V4** CSA 压缩稀疏注意力：块级压缩 + top-k 稀疏 + 滑窗（O(T²)→O(T·(nb+win))） |
+| `csa_compress` / `csa_topk` / `csa_window` | `16` / `4` / `64` | CSA 超参 |
+| `use_csa_learnable` | `true` | **V4**：可学习门控池化替代平均池化 |
+| `use_hca` | `false` | **V4** HCA 重度压缩全局信号 |
+
+**训练目标与优化器**：
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `use_mtp` | `false` | **V4** 多 token 预测（额外预测 t+2，输出头与 lm_head 共享） |
+| `mtp_weight` | `0.3` | MTP 损失权重 |
+| `use_muon` | `false` | **V4** Muon 优化器（矩阵参数正交化，embedding/lm_head/norm 用 AdamW 保护） |
+| `muon_ns_steps` | `10` | Newton-Schulz 迭代次数（系数 (2,-1.5,0.5)） |
 
 **YAML 配置系统**（替代原版 exec Python 配置）：
 - 实验配置放 `config/*.yaml`，由 `config_loader.py` 加载
 - 命令行覆盖：`uv run python train.py config/xxx.yaml --n_layer=4`
 - 配置值带类型检查，写错类型直接报错（比如 YAML 里 `1e-3` 会被解析成字符串，会立即被拦下）
 
-**默认 small 模型**：4 层 / 128 维 / 256 上下文 ≈ **0.83M 参数**，RTX 5060 上约 1 分钟一轮训练，适合快速迭代实验。
+**默认 small 模型**：4 层 / 96 维 / 8000 词表 + MoE(4×2) + 共享专家 ≈ **2.6M 参数**，RTX 5060 上约 1 分钟一轮训练，适合快速迭代实验。
 
 **实验基础设施**：
 - 冒烟测试 `inference/scripts/smoke_test.py`：秒级验证模型前向/反向 + 参数量对比
@@ -75,8 +85,8 @@ nanoGPT/
 ├── training/                  # 训练相关
 │   ├── train.py               # 训练循环
 │   └── config/                # 实验配置（YAML）
-│       ├── train_chinese.yaml             # 快速调试用（base，非 MoE）
-│       └── train_chinese_v4_csa.yaml      # 默认对话模型（CSA/HCA + MoE）
+│       ├── train_chinese.yaml      # 唯一正式配置（CSA/HCA + MoE）
+│       └── test.yaml               # 快速冒烟（几十步验证代码不崩）
 ├── inference/                 # 推理与部署
 │   ├── sample.py              # Python 文本采样（任何架构都能跑）
 │   ├── bench.py               # 性能基准
@@ -97,7 +107,7 @@ nanoGPT/
 
 ## 快速开始
 
-项目只有两个实验配置：**英文 small 基线**（做架构对比用，快）和**中文 small**（最终目标）。
+项目配置分两种：**正式训练**用 `train_chinese.yaml`（中文对话模型，CSA/HCA + MoE）；**快速冒烟**用 `test.yaml`（几十步跑完，验证代码不崩、能训起来）。
 
 **① 准备数据**（一次性）
 
@@ -108,6 +118,14 @@ uv run python data/chinese/prepare.py               # 3. 编码 → train.bin / 
 ```
 
 **② 训练中文模型**
+
+先快速冒烟（几十步，确认环境/代码没问题）：
+
+```sh
+uv run python training/train.py training/config/test.yaml
+```
+
+再正式训练：
 
 ```sh
 uv run python training/train.py training/config/train_chinese.yaml
@@ -141,7 +159,8 @@ out_dir: out/chinese
 dataset: chinese
 n_layer: 4
 n_head: 4
-n_embd: 128
+n_embd: 96
+vocab_size: 8000
 learning_rate: 0.001
 ```
 
@@ -151,25 +170,28 @@ learning_rate: 0.001
 
 ---
 
-## 实验记录与学习路线
+## 架构验证记录
 
-目标是理解 DeepSeek 的技术，全部在小模型上亲手实现验证：
+基于 DeepSeek-V4 技术报告（arXiv:2606.19348）逐项实现并在几 M 规模上验证：
 
-| 级别 | 技术 | 状态 |
+| 技术 | 状态 | 说明 |
 |------|------|------|
-| 1 | 现代化基础组件：RMSNorm + RoPE + SwiGLU | ✅ 已实现并验证（打平基线，参数量更少） |
-| 2 | MoE 混合专家（DeepSeek-V3 核心） | ✅ 已实现并验证 |
-| 3 | MLA 多头潜在注意力（DeepSeek-V2 核心） | ✅ 已实现并验证 |
-| 4 | MTP 多 token 预测（DeepSeek-V3） | ✅ 已实现并验证 |
-| 5 | V4：SwiGLU Clamping（数值稳定性） | ✅ 已实现，待对比训练 |
-| 6 | V4：Muon 优化器（Newton-Schulz 正交化） | ✅ 已实现，待对比训练 |
-| 7 | V4：mHC 流形约束超连接 | ✅ 已实现，待对比训练 |
-| 8 | V4：Anticipatory Routing（预判路由） | ✅ 已实现，待对比训练 |
-| 9 | V4：CSA/HCA 压缩稀疏注意力 | ✅ 已实现（简化教育版），待对比训练 |
+| 固定架构：RMSNorm + RoPE + SwiGLU | ✅ 硬编码 | 不再可开关 |
+| MoE 混合专家 | ✅ 激活 | top-k 路由 + 负载均衡 |
+| V4：共享专家 | ✅ **已验证有效** | val loss 5.01→4.91，已写进默认配置 |
+| V4：可学习门控池化（CSA） | ✅ **已验证有效** | val loss 5.88→5.01（vs 平均池化），已写进默认配置 |
+| V4：aux-free 偏置均衡 | ⚠️ 待调参 | 800 步差 0.11，需调 balance_factor |
+| V4：√softplus 路由打分 | 🔬 待验证 | 开关可用 |
+| V4：Muon 优化器（NS 系数 (2,-1.5,0.5)） | ⚠️ 待调 lr | 需专门 lr 缩放，不能直接用 AdamW 的 |
+| V4：MTP 多 token 预测 | ⚠️ 待长训验证 | 800 步主 loss 差 0.17，数据效率收益需更久显现 |
+| V2：MLA 多头潜在注意力 | ✅ 已实现 | 与 CSA 互斥，可切换 |
+| V4：SwiGLU Clamp | ✅ 已实现 | 稳定性技巧，配置启用 |
+| ~~mHC~~ | ❌ 移除 | 2 流版是概念错误（V4 是 4-copy），4 层模型不需要 |
+| ~~预判路由~~ | ❌ 移除 | 非 V4 概念（混淆了 aux-free 偏置修正） |
 
-**数据集**：已从字符级换为 **BPE 子词分词**（魔搭中文对话语料 ~153MB，8000 词表，ByteLevel 预分词）。8000 词表专为日常中文设计：压缩率 ~1.3x（比 30000 只降 13%），但嵌入表从 2.88M 砍到 0.77M，transformer 参数占比大幅提升。数据流程：`download_dialogue.py`（魔搭下载对话）→ `train_tokenizer.py`（训 BPE，`--vocab-size` 可调）→ `prepare.py`（编码成 train.bin/val.bin）。数据文件全部 git 忽略、按需下载。
+**数据集**：**BPE 子词分词**（魔搭中文对话语料 ~153MB，8000 词表，ByteLevel 预分词）。数据流程：`download_dialogue.py`（魔搭下载对话）→ `train_tokenizer.py`（训 BPE）→ `prepare.py`（编码成 train.bin/val.bin）。
 
-**默认模型**：`train_chinese_v4_csa.yaml`（CSA/HCA + MoE，~4.3M 参数）——项目已从"逐项对比 V4 技术"转向"持续训练一个对话模型"，其余对比配置已删除。
+**默认模型**：`training/config/train_chinese.yaml`（CSA/HCA + MoE，~2.6M 参数）。有收益的开关（共享专家、可学习门控池化）已写进默认配置。
 
 ## 版本化连续训练
 
@@ -177,13 +199,13 @@ learning_rate: 0.001
 
 ```sh
 # v0：从零初训（会存 last.pt 每次评估 + best.pt 仅在 val 变优时存）
-uv run python training/train.py training/config/train_chinese_v4_csa.yaml --max_iters=10000
+uv run python training/train.py training/config/train_chinese.yaml --max_iters=10000
 
 # 续训（同一版本继续训，恢复优化器和学习率计划）
-uv run python training/train.py training/config/train_chinese_v4_csa.yaml --init_from=resume --max_iters=15000
+uv run python training/train.py training/config/train_chinese.yaml --init_from=resume --max_iters=15000
 
 # 后训练（基于旧版本 best.pt 开新版本，优化器/学习率重置）
-uv run python training/train.py training/config/train_chinese_v4_csa.yaml \
+uv run python training/train.py training/config/train_chinese.yaml \
   --init_from=out/chinese-v4-csa/best.pt --out_dir=out/chinese-v4-csa-v2 --max_iters=5000
 ```
 
@@ -217,12 +239,15 @@ cd inference/runtime && cargo build --release
 
 | 特性 | 状态 | 说明 |
 |------|------|------|
-| RMSNorm / RoPE / SwiGLU | ✅ | 基础 modern 三件套 |
-| MoE（top-k 路由 + 专家 FFN） | ✅ | 含预判路由（加载 `router_slow`，推理不做 EMA 更新） |
+| RMSNorm / RoPE / SwiGLU | ✅ | 固定架构三件套 |
+| MoE（top-k 路由 + 专家 FFN） | ✅ | 不含共享专家（Python 新增，Rust 待补） |
 | SwiGLU Clamp | ✅ | V4 数值稳定性钳制 |
-| CSA + HCA（压缩稀疏注意力） | ✅ | 块压缩 + top-k 稀疏选择 + 滑窗 + 全局信号 |
-| mHC（双流超连接） | ✅ | Sinkhorn 投影到双随机矩阵 + 记忆流解码 |
-| MLA / MTP | ❌ | 零配置启用（V2/V3 遗留特性，无当前实验使用），需要时再补 |
+| CSA + HCA（压缩稀疏注意力） | ✅ | 块压缩 + top-k 稀疏选择 + 滑窗 + 全局信号（**仅平均池化**，可学习门控池化 Rust 待补） |
+| MLA / MTP | ❌ | Python 端有，Rust 未实现 |
+
+⚠️ **部署注意**：Python 端新增的 `use_csa_learnable`（可学习门控池化）和 `use_shared_expert`
+（共享专家）Rust 端**尚未实现**。训练时开启这两个开关的模型，部署前需要先给 Rust 端补上对应
+实现（或训练时不开启），否则 Rust 推理与 Python 权重不一致。
 
 **CLI 选项**：
 

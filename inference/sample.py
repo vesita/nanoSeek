@@ -15,8 +15,8 @@ from model import GPTConfig, GPT
 from model.config_loader import load_config
 
 # -----------------------------------------------------------------------------
-init_from = 'resume' # 要么是 'resume'（从 out_dir），要么是某个 gpt2 变体（如 'gpt2-xl'）
-out_dir = 'out' # 如果 init_from 不是 'resume'，则此参数被忽略
+init_from = 'resume' # 从 out_dir 加载 best.pt
+out_dir = 'out'
 start = "\n" # 或者 "<|endoftext|>" 等。也可以指定一个文件，用法："FILE:prompt.txt"
 num_samples = 10 # 要生成的样本数量
 max_new_tokens = 500 # 每个样本生成的 token 数量
@@ -38,21 +38,18 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # 模型
-if init_from == 'resume':
-    # 从保存在特定目录中的模型初始化
-    ckpt_path = os.path.join(out_dir, 'best.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint['model_args'])
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-elif init_from.startswith('gpt2'):
-    # 从给定的 GPT-2 模型初始化
-    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+assert init_from == 'resume', "本脚本只支持从 out_dir 加载 best.pt"
+# 从保存在特定目录中的模型初始化
+ckpt_path = os.path.join(out_dir, 'best.pt')
+checkpoint = torch.load(ckpt_path, map_location=device)
+gptconf = GPTConfig(**checkpoint['model_args'])
+model = GPT(gptconf)
+state_dict = checkpoint['model']
+unwanted_prefix = '_orig_mod.'
+for k,v in list(state_dict.items()):
+    if k.startswith(unwanted_prefix):
+        state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+model.load_state_dict(state_dict)
 
 model.eval()
 model.to(device)

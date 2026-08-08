@@ -28,6 +28,12 @@ def main():
     sd = ck['model']
     model_args = ck['model_args']
 
+    # Rust 端（model_config.json）靠这些字段判断架构。它们已从 Python 的 GPTConfig
+    # 硬编码移除（RMSNorm/SwiGLU 固定启用），但 Rust 的 Config 结构体默认 false，
+    # 必须在写配置时显式注入 true，否则 Rust 端会退回 LayerNorm / GELU。
+    model_args.setdefault('use_rmsnorm', True)
+    model_args.setdefault('use_swiglu', True)
+
     # 去掉 torch.compile 可能留下的 _orig_mod. 前缀
     sd = {k.removeprefix('_orig_mod.'): v for k, v in sd.items()}
     # 跳过 RoPE 的 cos/sin 预计算表（Rust 端按 rope_theta 自己算）

@@ -48,7 +48,7 @@ log_interval = 10
 eval_iters = 200
 eval_only = False # 如果为 True，脚本在第一次评估后立即退出
 always_save_checkpoint = False # 如果为 True，每次评估后总是保存 checkpoint；否则只在 val 变优时保存
-init_from = 'scratch' # 'scratch' 或 'resume' 或 'gpt2*'
+init_from = 'scratch' # 'scratch' 或 'resume' 或 '<路径>.pt'（后训练）
 # wandb 日志记录
 wandb_log = False # 默认禁用
 wandb_project = 'shakespeare-char'
@@ -69,33 +69,40 @@ n_layer = 4
 n_head = 4
 n_embd = 128
 dropout = 0.2 # 预训练时 0 就很好，微调时可以试试 0.1+
-bias = False # 是否在 LayerNorm 和 Linear 层内部使用 bias？
-# --- 现代化架构开关（DeepSeek / LLaMA 风格），默认关闭 = 原始 GPT-2 ---
-use_rmsnorm = False # 用 RMSNorm 替代 LayerNorm
-use_rope = False    # 用 RoPE 替代可学习的位置嵌入
-use_swiglu = False  # 用 SwiGLU 替代 GELU MLP
+bias = False # 是否在 Linear 层内部使用 bias？
+# --- 固定架构：RMSNorm + SwiGLU 硬编码；RoPE 与 wpe 二选一 ---
+use_rope = False    # True：RoPE 旋转位置编码；False：可学习位置嵌入 wpe
 rope_theta = 10000.0 # RoPE 基础频率
 swiglu_clamp = 0.0  # V4：SwiGLU 门控输出钳制半宽；0 = 关闭
-# --- DeepSeek 三大核心（MoE / MLA / MTP），默认关闭，可任意组合 ---
+# --- MoE 混合专家（DeepSeek-V3/V4），默认关闭 ---
 use_moe = False        # 混合专家：MoE 替换 FFN
-n_experts = 8          # 专家总数
+n_experts = 8          # 路由专家总数
 n_top_k = 2            # 每个 token 激活的专家数
-moe_aux_weight = 0.01  # 负载均衡辅助损失权重
-use_anticipatory_routing = False  # V4：路由决策用 EMA 旧参数（解耦，防 loss spike）
-ar_momentum = 0.99     # 慢路由 EMA 系数
+moe_aux_weight = 0.01  # 负载均衡辅助损失权重（Switch 式，use_aux_free_balance=False 时用）
+use_shared_expert = False      # V4：始终激活的共享专家
+use_aux_free_balance = False   # V4：aux-free 偏置修正替代 Switch aux loss
+balance_factor = 0.001         # aux-free 偏置每步更新幅度
+use_sqrtsoftplus = False       # V4：路由打分 √softplus 替代 softmax
+route_scale = 2.5              # √softplus 打分缩放系数
+# --- MLA 多头潜在注意力（DeepSeek-V2），与 CSA 二选一 ---
 use_mla = False        # 多头潜在注意力：低秩压缩 KV
 kv_lora_rank = 64      # KV 压缩后的潜在维度
 qk_rope_head_dim = 16  # 每头参与 RoPE 的维数
+# --- MTP 多 token 预测（DeepSeek-V3/V4），默认关闭 ---
 use_mtp = False        # 多 token 预测
 n_mtp = 1              # 额外预测的 token 数
-mtp_weight = 1.0       # MTP 损失权重
-use_muon = False       # V4：用 Muon 替代 AdamW（矩阵参数做 Newton-Schulz 正交化）
-use_mhc = False        # V4：用 mHC 双流超连接替代残差连接（谱范数 = 1，训练更稳）
-use_csa = False        # V4：CSA 压缩稀疏注意力（块级 KV 压缩 + top-k 稀疏选择 + 滑窗）
+mtp_weight = 0.3       # MTP 损失权重（DeepSeek-V3 建议 0.3）
+# --- V4 优化器：Muon（可选）替代 AdamW ---
+use_muon = False       # 矩阵参数用 Muon，embedding/lm_head/norm 用 AdamW
+muon_momentum = 0.95   # Muon 动量系数
+muon_ns_steps = 10     # Newton-Schulz 迭代次数（默认 8 激进 + 2 经典）
+# --- V4 核心：CSA/HCA 压缩稀疏注意力 ---
+use_csa = False        # CSA 压缩稀疏注意力（块级 KV 压缩 + top-k 稀疏选择 + 滑窗）
 csa_compress = 16      # 块大小：每几个 token 压成一个潜在 KV
 csa_topk = 4           # 每个 query 稀疏选几个压缩块
 csa_window = 64        # 滑窗：保留最近多少个原始 token
-use_hca = False        # V4：HCA 重度压缩全局信号
+use_hca = False        # HCA 重度压缩全局信号
+use_csa_learnable = True   # V4：可学习门控池化替代平均池化
 # adamw 优化器
 learning_rate = 1e-3 # 最大学习率
 max_iters = 5000 # 训练总迭代次数
@@ -194,15 +201,15 @@ if os.path.exists(meta_path):
 # 模型初始化
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,
-                  use_rmsnorm=use_rmsnorm, use_rope=use_rope, use_swiglu=use_swiglu, rope_theta=rope_theta,
-                  swiglu_clamp=swiglu_clamp,
+                  use_rope=use_rope, rope_theta=rope_theta, swiglu_clamp=swiglu_clamp,
                   use_moe=use_moe, n_experts=n_experts, n_top_k=n_top_k, moe_aux_weight=moe_aux_weight,
-                  use_anticipatory_routing=use_anticipatory_routing, ar_momentum=ar_momentum,
+                  use_shared_expert=use_shared_expert, use_aux_free_balance=use_aux_free_balance,
+                  balance_factor=balance_factor, use_sqrtsoftplus=use_sqrtsoftplus, route_scale=route_scale,
                   use_mla=use_mla, kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim,
                   use_mtp=use_mtp, n_mtp=n_mtp, mtp_weight=mtp_weight,
-                  use_muon=use_muon, use_mhc=use_mhc,
+                  use_muon=use_muon, muon_momentum=muon_momentum, muon_ns_steps=muon_ns_steps,
                   use_csa=use_csa, csa_compress=csa_compress, csa_topk=csa_topk,
-                  csa_window=csa_window, use_hca=use_hca)
+                  csa_window=csa_window, use_hca=use_hca, use_csa_learnable=use_csa_learnable)
 
 def _build_model_from_checkpoint(checkpoint):
     """按 checkpoint 里的 model_args 构建模型并加载权重（供 resume / 后训练复用）。"""
@@ -210,13 +217,16 @@ def _build_model_from_checkpoint(checkpoint):
     # 强制这些配置属性等于 checkpoint 里的值（架构必须一致才能加载权重）
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
-    # modern/DeepSeek 开关：老 checkpoint 里可能没这些键，用命令行/默认值兜底
-    for k in ['use_rmsnorm', 'use_rope', 'use_swiglu', 'rope_theta', 'swiglu_clamp',
+    # 架构开关：checkpoint 里没有的键用命令行/默认值兜底
+    for k in ['use_rope', 'rope_theta', 'swiglu_clamp',
               'use_moe', 'n_experts', 'n_top_k', 'moe_aux_weight',
-              'use_anticipatory_routing', 'ar_momentum',
+              'use_shared_expert', 'use_aux_free_balance', 'balance_factor',
+              'use_sqrtsoftplus', 'route_scale',
               'use_mla', 'kv_lora_rank', 'qk_rope_head_dim',
-              'use_mtp', 'n_mtp', 'mtp_weight', 'use_muon', 'use_mhc',
-              'use_csa', 'csa_compress', 'csa_topk', 'csa_window', 'use_hca']:
+              'use_mtp', 'n_mtp', 'mtp_weight',
+              'use_muon', 'muon_momentum', 'muon_ns_steps',
+              'use_csa', 'csa_compress', 'csa_topk', 'csa_window',
+              'use_hca', 'use_csa_learnable']:
         model_args[k] = checkpoint_model_args.get(k, model_args[k])
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -251,24 +261,8 @@ elif init_from.endswith('.pt'):
     checkpoint = torch.load(init_from, map_location=device)
     model = _build_model_from_checkpoint(checkpoint)
     # iter_num / best_val_loss 保持初始值（0 / 1e9），全新训练
-elif init_from.startswith('gpt2'):
-    print(f"正在从 OpenAI GPT-2 权重初始化: {init_from}")
-    # 从 OpenAI GPT-2 权重初始化
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # 读取创建出的配置参数，以便正确地把它们存进 checkpoint
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size',
-              'use_rmsnorm', 'use_rope', 'use_swiglu', 'rope_theta', 'swiglu_clamp',
-              'use_moe', 'n_experts', 'n_top_k', 'moe_aux_weight',
-              'use_anticipatory_routing', 'ar_momentum',
-              'use_mla', 'kv_lora_rank', 'qk_rope_head_dim',
-              'use_mtp', 'n_mtp', 'mtp_weight', 'use_muon', 'use_mhc',
-              'use_csa', 'csa_compress', 'csa_topk', 'csa_window', 'use_hca']:
-        model_args[k] = getattr(model.config, k)
-# 如果需要，用模型“手术”把 block size 裁剪下来
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # 这样 checkpoint 会有正确的值
+else:
+    raise ValueError(f"不支持的 init_from：{init_from}（应为 'scratch' / 'resume' / '<路径>.pt'）")
 model.to(device)
 
 # 初始化 GradScaler。如果 enabled=False，scaler 是空操作
@@ -282,15 +276,15 @@ checkpoint = None # 释放内存
 
 # 打印训练启动摘要：把散落的启动日志收敛成一个信息框，再进入 tqdm 进度条
 def print_summary():
-    modern = " + ".join(name for name, on in
-                        [("RMSNorm", use_rmsnorm), ("RoPE", use_rope), ("SwiGLU", use_swiglu)] if on)
+    attn = 'MLA' if use_mla else f'CSA/HCA (块{csa_compress}·topk{csa_topk}·窗{csa_window})'
+    ffn = f'MoE {n_experts}×top{n_top_k}' if use_moe else 'SwiGLU'
     border = "─" * 46
     print()
     print(border)
     print("  训练摘要")
     print(border)
     print(f"  数据集    {dataset} · {model.config.vocab_size} 词表 · 上下文 {block_size}")
-    print(f"  模型      {n_layer} 层 · {n_head} 头 · {n_embd} 维" + (f" · {modern}" if modern else ""))
+    print(f"  模型      {n_layer} 层 · {n_head} 头 · {n_embd} 维 · {attn} · {ffn}")
     opt_name = 'Muon' if use_muon else 'AdamW'
     print(f"  优化器    {opt_name} · lr {learning_rate:g} · wd {weight_decay:g} · betas ({beta1:g}, {beta2:g})")
     epoch_note = f" · ≈{max_iters/steps_per_epoch:.1f} epoch" if steps_per_epoch else ""

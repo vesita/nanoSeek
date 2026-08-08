@@ -1,8 +1,9 @@
-# 中文配置：small 模型（~0.9M 参数）在《西游记》上训练
-# 与 train_shakespeare_char.yaml 超参一致，仅数据集换成中文。
-# 词表大小 ~4507（由 data/chinese/meta.pkl 自动读取，无需手写）。
-# 提示：中文 token 随机预测的初始 loss ≈ ln(4507) ≈ 8.4，
-#       远高于英文 65 词表的 ~4.2，这是正常现象。
+# 唯一默认配置：中文对话模型，CSA/HCA 压缩稀疏注意力 + MoE。
+# 固定架构（硬编码）：RMSNorm + SwiGLU；RoPE 由 use_rope 开关控制。
+# 四项 V4 升级：CSA 可学习门控池化 / MoE 共享专家 + aux-free + √softplus / Muon / MTP
+# csa_compress 越小越接近全量注意力，topk 越大全局信息越全但越贵。
+# 规模：n_embd 96 + n_experts 4 + 共享专家（~2.6M 参数），适配 8000 BPE 词表。
+# 快速验证代码是否跑得通用 test.yaml（步数少、模型更小）。
 out_dir: out/chinese
 eval_interval: 250
 eval_iters: 200
@@ -10,17 +11,36 @@ log_interval: 10
 always_save_checkpoint: false
 wandb_log: false
 wandb_project: chinese
-wandb_run_name: mini-gpt
+wandb_run_name: csa-v4
 dataset: chinese
 gradient_accumulation_steps: 1
 batch_size: 64
 block_size: 256
 
-# small 模型（默认配置）
+# small 模型（~2.6M 参数，8000 词表下嵌入占 30%）
+vocab_size: 8000   # 显式指定，防止 GPTConfig 默认 50304（GPT-2 词表）
 n_layer: 4
 n_head: 4
-n_embd: 128
+n_embd: 96
 dropout: 0.2
+
+# --- 位置编码：RoPE ---
+use_rope: true
+
+# --- MoE 混合专家 ---
+use_moe: true
+n_experts: 4
+n_top_k: 2
+moe_aux_weight: 0.01
+use_shared_expert: true   # A/B 验证有效（val loss 5.01→4.91）：共享专家捕获共性特征
+
+# --- CSA/HCA 混合注意力（默认；也可换 MLA）---
+use_csa: true
+csa_compress: 16    # 每 16 个 token 压成一个潜在 KV
+csa_topk: 4         # 每个 query 稀疏选 4 个压缩块
+csa_window: 64      # 滑窗保留最近 64 个原始 token
+use_hca: true       # 加 HCA 重度压缩全局信号
+use_csa_learnable: true   # 可学习门控池化替代平均池化
 
 learning_rate: 0.001
 max_iters: 5000
