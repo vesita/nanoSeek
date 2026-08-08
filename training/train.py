@@ -65,14 +65,14 @@ gradient_accumulation_steps = 1 # 用于模拟更大的 batch size
 batch_size = 64 # 如果 gradient_accumulation_steps > 1，这是微批（micro-batch）大小
 block_size = 256
 # 模型（small）
-n_layer = 4
+n_layer = 6         # 4→6：深度换宽度，加深帮模型学长期依赖（对抗重复坍缩）
 n_head = 4
-n_embd = 128
+n_embd = 80         # 128→80：与默认 yaml 对齐；深度换宽度，规模持平（head_dim=20）
 dropout = 0.2 # 预训练时 0 就很好，微调时可以试试 0.1+
 bias = False # 是否在 Linear 层内部使用 bias？
 # --- 固定架构：RMSNorm + SwiGLU 硬编码；RoPE 与 wpe 二选一 ---
-use_rope = False    # True：RoPE 旋转位置编码；False：可学习位置嵌入 wpe
-rope_theta = 10000.0 # RoPE 基础频率
+use_rope = True     # True：RoPE 旋转位置编码；False：可学习位置嵌入 wpe
+rope_theta = 1000000.0 # RoPE 基础频率（1e6 表达更远相对距离，DeepSeek 做法）
 swiglu_clamp = 0.0  # V4：SwiGLU 门控输出钳制半宽；0 = 关闭
 # --- MoE 混合专家（DeepSeek-V3/V4），默认关闭 ---
 use_moe = False        # 混合专家：MoE 替换 FFN
@@ -89,7 +89,7 @@ use_mla = False        # 多头潜在注意力：低秩压缩 KV
 kv_lora_rank = 64      # KV 压缩后的潜在维度
 qk_rope_head_dim = 16  # 每头参与 RoPE 的维数
 # --- MTP 多 token 预测（DeepSeek-V3/V4），默认关闭 ---
-use_mtp = False        # 多 token 预测
+use_mtp = True         # 多 token 预测（V3/V4 验证过：训练信号增强，推理零开销）
 n_mtp = 1              # 额外预测的 token 数
 mtp_weight = 0.3       # MTP 损失权重（DeepSeek-V3 建议 0.3）
 # --- V4 优化器：Muon（可选）替代 AdamW ---
@@ -104,7 +104,7 @@ csa_window = 64        # 滑窗：保留最近多少个原始 token
 use_hca = False        # HCA 重度压缩全局信号
 use_csa_learnable = True   # V4：可学习门控池化替代平均池化
 # --- V4 结构设计升级（实验性，默认全关）---
-use_attn_sink = False        # Attention Sinks：每头可学习标量偏置吸收无关注意力
+use_attn_sink = True         # Attention Sinks：打破重复坍缩的必要条件（三重 A/B 验证）
 use_mhc = False              # mHC 超连接：4 流并行残差
 hc_mult = 4                  # mHC 残差流数（V4 原版 = 4）
 use_lightning_indexer = False   # 学习型块选择替代 CSA raw top-k

@@ -2,7 +2,7 @@
 # 固定架构（硬编码）：RMSNorm + SwiGLU；RoPE 由 use_rope 开关控制。
 # 四项 V4 升级：CSA 可学习门控池化 / MoE 共享专家 + aux-free + √softplus / Muon / MTP
 # csa_compress 越小越接近全量注意力，topk 越大全局信息越全但越贵。
-# 规模：n_embd 96 + n_experts 4 + 共享专家（~2.6M 参数），适配 8000 BPE 词表。
+# 规模：6×80 深度换宽度（+MTP ~2.85M 参数），适配 8000 BPE 词表。
 # 快速验证代码是否跑得通用 test.yaml（步数少、模型更小）。
 out_dir: out/chinese
 eval_interval: 250
@@ -17,15 +17,16 @@ gradient_accumulation_steps: 1
 batch_size: 64
 block_size: 256
 
-# small 模型（~2.6M 参数，8000 词表下嵌入占 30%）
+# small 模型（~2.85M 参数含 MTP；6×80 深度换宽度，规模与旧 4×96 持平）
 vocab_size: 8000   # 显式指定，防止 GPTConfig 默认 50304（GPT-2 词表）
-n_layer: 4
+n_layer: 6         # 4→6：加深，重复坍缩部分原因是太浅学不到长期依赖
 n_head: 4
-n_embd: 96
+n_embd: 80         # 96→80：深度换宽度，规模持平（head_dim=20，qk_rope_head_dim=16 仍适配）
 dropout: 0.2
 
 # --- 位置编码：RoPE ---
 use_rope: true
+rope_theta: 1000000.0   # 10000→1e6：更低的旋转频率，能表达更远的相对距离（DeepSeek 做法）
 
 # --- MoE 混合专家 ---
 use_moe: true
@@ -42,8 +43,13 @@ csa_window: 64      # 滑窗保留最近 64 个原始 token
 use_hca: true       # 加 HCA 重度压缩全局信号
 use_csa_learnable: true   # 可学习门控池化替代平均池化
 
-# --- V4 结构设计升级（实验性，默认全关）---
-# use_attn_sink: true          # Attention Sinks：每头可学习标量偏置吸收无关注意力
+# --- MTP 多 token 预测（V3/V4 验证过，训练信号增强，推理零开销）---
+use_mtp: true
+n_mtp: 1
+mtp_weight: 0.3
+
+# --- V4 结构设计升级（Sinks 已验证进默认；其余实验性默认全关）---
+use_attn_sink: true       # Attention Sinks：打破重复坍缩的必要条件（三重 A/B 验证）
 # use_mhc: true                # mHC：4 流并行残差（X_{l+1}=B·X_l+C·F(A·X_l)）
 # hc_mult: 4
 # use_lightning_indexer: true  # 学习型块选择替代 CSA raw top-k

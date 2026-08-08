@@ -61,7 +61,7 @@ nanoGPT 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 - 命令行覆盖：`uv run python train.py config/xxx.yaml --n_layer=4`
 - 配置值带类型检查，写错类型直接报错（比如 YAML 里 `1e-3` 会被解析成字符串，会立即被拦下）
 
-**默认 small 模型**：4 层 / 96 维 / 8000 词表 + MoE(4×2) + 共享专家 ≈ **2.6M 参数**，RTX 5060 上约 1 分钟一轮训练，适合快速迭代实验。
+**默认 small 模型**：6 层 / 80 维 / 8000 词表 + MoE(4×2) + 共享专家 + MTP + Attention Sinks ≈ **2.85M 参数**（深度换宽度，规模与旧 4×96 持平），RTX 5060 上约 1 分钟一轮训练，适合快速迭代实验。
 
 **实验基础设施**：
 - 冒烟测试 `inference/scripts/smoke_test.py`：秒级验证模型前向/反向 + 参数量对比
@@ -195,7 +195,7 @@ learning_rate: 0.001
 | V4：MTP 多 token 预测 | ⚠️ 待长训验证 | 800 步主 loss 差 0.17，数据效率收益需更久显现 |
 | V2：MLA 多头潜在注意力 | ✅ 已实现 | 与 CSA 互斥，可切换 |
 | V4：SwiGLU Clamp | ✅ 已实现 | 稳定性技巧，配置启用 |
-| V4：Attention Sinks | 🔬 待验证 | 开关可用，每头可学习标量偏置吸收无关注意力 |
+| V4：Attention Sinks | ✅ **已验证有效** | A/B：单独开就打破重复坍缩，loss 还略低（val 4.21 vs 4.27），详见 [dev-notes/11](dev-notes/11-AttentionSinks打破重复.md) |
 | V4：mHC 4-copy | 🔬 待验证 | **机制正确**（4 流 + Sinkhorn 双重随机 B，非之前删掉的 2 流错误版） |
 | V4：Lightning Indexer（简版） | 🔬 待验证 | 学习型块选择替代 raw top-k，KL 梯度桥接 |
 | V4：Hash 路由 | 🔬 待验证 | 前 N 层确定性路由，开关可用 |
@@ -203,7 +203,7 @@ learning_rate: 0.001
 
 **数据集**：**BPE 子词分词**（魔搭中文对话语料 ~153MB，8000 词表，ByteLevel 预分词）。数据流程：`download_dialogue.py`（魔搭下载对话）→ `train_tokenizer.py`（训 BPE）→ `prepare.py`（编码成 train.bin/val.bin）。
 
-**默认模型**：`training/config/train_chinese.yaml`（CSA/HCA + MoE，~2.6M 参数）。有收益的开关（共享专家、可学习门控池化）已写进默认配置。四个结构设计升级（Sinks/mHC/Indexer/Hash）实验性默认关闭，冒烟测试已验证可独立开启。
+**默认模型**：`training/config/train_chinese.yaml`（6×80 + MTP + Sinks + CSA/HCA + MoE，~2.85M 参数）。已验证有效的开关（共享专家、可学习门控池化、Attention Sinks）已写进默认配置。Attention Sinks 经 A/B 实证是打破重复坍缩的必要条件（见 dev-notes/11），已默认开启。其余结构设计升级（mHC/Indexer/Hash）实验性默认关闭。
 
 ## 版本化连续训练
 

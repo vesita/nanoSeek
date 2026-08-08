@@ -15,6 +15,8 @@
 | [08](08-续训要同步调lr_decay.md) | 续训要同步调 lr_decay_iters | 余弦调度不重启，学习率会卡死在 min_lr |
 | [09](09-matplotlib中文字体.md) | matplotlib 中文字体 | DejaVu Sans 没有中文字形，图里中文变方块 |
 | [10](10-torch-compile良性警告.md) | torch.compile 良性警告 | RTX 5060 只有 30 SM，max_autotune_gemm 用不了 |
+| [11](11-AttentionSinks打破重复.md) | Attention Sinks 打破重复 | A/B 实证：Sinks 单独开就消除重复坍缩，loss 还略低 |
+| [12](12-后训练不能改架构.md) | 后训练不能改架构 | `--init_from=*.pt` 时命令行开关被 checkpoint 覆盖，加 Sinks 必须从 0 训 |
 
 ## 新增笔记的约定
 
