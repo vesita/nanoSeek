@@ -18,7 +18,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 RUNTIME = os.path.join(ROOT, 'inference', 'runtime')
-BIN = os.path.join(RUNTIME, 'target', 'release', 'nanogpt-runtime')
+BIN = os.path.join(RUNTIME, 'target', 'release', 'nanoseek-runtime')
 
 def main():
     ap = argparse.ArgumentParser()

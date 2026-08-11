@@ -1,4 +1,4 @@
-//! nanoGPT 对话推理 CLI。
+//! nanoSeek 对话推理 CLI。
 //! 用法（在 inference/runtime/ 目录下）：
 //!   cargo run --release -- --prompt "悟空"                # 一次性生成
 //!   cargo run --release -- --print-logits --prompt "悟空" # 调试：打印 top-10 logits
@@ -159,7 +159,7 @@ fn main() -> Result<()> {
     }
 
     // --- 对话 REPL ---
-    println!("nanoGPT 对话推理（输入 `退出` / `exit` / Ctrl-D 结束）");
+    println!("nanoSeek 对话推理（输入 `退出` / `exit` / Ctrl-D 结束）");
     let mut context: Vec<u32> = Vec::new();
     let stdin = std::io::stdin();
     loop {

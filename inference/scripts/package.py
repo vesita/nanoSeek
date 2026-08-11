@@ -71,19 +71,19 @@ def main():
     print(f'\n=== 2/3 编译 Rust 运行时 ===')
     if not args.no_build:
         run(['cargo', 'build', '--release'], cwd=RUNTIME_DIR)
-    bin_path = os.path.join(RUNTIME_DIR, 'target', 'release', 'nanogpt-runtime')
+    bin_path = os.path.join(RUNTIME_DIR, 'target', 'release', 'nanoseek-runtime')
     if not os.path.exists(bin_path):
         sys.exit(f'错误：找不到编译产物 {bin_path}（先跑一次 cargo build）')
 
     # 3) 组装 release 目录
     print(f'\n=== 3/3 组装 release 目录 ===')
-    shutil.copy2(bin_path, os.path.join(out_dir, 'nanogpt-runtime'))
+    shutil.copy2(bin_path, os.path.join(out_dir, 'nanoseek-runtime'))
     run_sh = os.path.join(out_dir, '运行.sh')
     with open(run_sh, 'w', encoding='utf-8') as f:
         f.write('#!/bin/sh\n'
                 '# 自动定位到本脚本所在目录，再运行推理程序（这样相对路径的模型文件才找得到）\n'
                 'cd "$(dirname "$0")"\n'
-                'exec ./nanogpt-runtime "$@"\n'
+                'exec ./nanoseek-runtime "$@"\n'
                 '# 用法：\n'
                 '#   sh 运行.sh --prompt "悟空"     # 一次性生成\n'
                 '#   sh 运行.sh                     # 进入对话 REPL\n')
@@ -91,7 +91,7 @@ def main():
 
     # 汇总
     files = [
-        ('nanogpt-runtime', '推理程序（CPU，无需 Python/GPU）'),
+        ('nanoseek-runtime', '推理程序（CPU，无需 Python/GPU）'),
         ('model.safetensors', '模型权重'),
         ('model_config.json', '架构配置'),
         ('tokenizer.json', 'BPE 分词器'),
@@ -104,8 +104,8 @@ def main():
             print(f'  {fn:<22} {fmt(os.path.getsize(p)):>8}  {desc}')
     print('\n运行方式：')
     print(f'  cd {os.path.relpath(out_dir, ROOT)}')
-    print('  ./nanogpt-runtime --prompt "悟空"      # 一次性生成')
-    print('  ./nanogpt-runtime                      # 对话 REPL')
+    print('  ./nanoseek-runtime --prompt "悟空"      # 一次性生成')
+    print('  ./nanoseek-runtime                      # 对话 REPL')
     print('  sh 运行.sh --prompt "悟空"             # 或通过启动脚本')
 
 

@@ -1,8 +1,8 @@
-# nanoGPT 学习魔改版
+# nanoSeek 学习魔改版
 
 在 [karpathy/nanoGPT](https://github.com/karpathy/nanoGPT) 的基础上改造的深度学习实验项目：**用 8GB 显存的小模型，亲手复现 DeepSeek 风格的技术**。
 
-nanoGPT 的极简设计（全部代码就 `model.py` + `train.py` 两个文件）让它成为理想的实验台——没有框架抽象，每一行都能看懂、都能改。
+nanoSeek 的极简设计（全部代码就 `model.py` + `train.py` 两个文件）让它成为理想的实验台——没有框架抽象，每一行都能看懂、都能改。
 
 ---
 
@@ -86,7 +86,7 @@ uv run python inference/scripts/smoke_test.py   # 验证环境 + 模型可用
 ## 项目结构
 
 ```
-nanoGPT/
+nanoSeek/
 ├── model/                     # 模型核心
 │   ├── __init__.py            # 重导出 GPT / GPTConfig 等
 │   ├── model.py               # GPT 模型（V2/V3/V4 全部架构开关）
