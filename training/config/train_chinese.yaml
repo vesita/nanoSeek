@@ -50,8 +50,8 @@ mtp_weight: 0.3
 
 # --- V4 结构设计升级（Sinks 已验证进默认；其余实验性默认全关）---
 use_attn_sink: true       # Attention Sinks：打破重复坍缩的必要条件（三重 A/B 验证）
-# use_mhc: true                # mHC：4 流并行残差（X_{l+1}=B·X_l+C·F(A·X_l)）
-# hc_mult: 4
+use_mhc: true                 # mHC：4 流并行残差（X_{l+1}=B·X_l+C·F(A·X_l)）——1500 步归因收敛加速（dev-notes/13）
+hc_mult: 4
 # use_lightning_indexer: true  # 学习型块选择替代 CSA raw top-k
 # num_hash_layers: 2           # 前 2 层用 hash 路由
 
