@@ -241,10 +241,10 @@ uv run python inference/runtime/scripts/convert.py --ckpt out/chinese-all/best.p
 cd inference/runtime && cargo build --release
 
 # 3. 一次性生成
-./target/release/nanogpt-runtime --prompt "悟空" --max-new-tokens 100
+./target/release/nanoseek-runtime --prompt "悟空" --max-new-tokens 100
 
 # 4. 进入对话 REPL（输入 `退出` / `exit` / Ctrl-D 结束）
-./target/release/nanogpt-runtime
+./target/release/nanoseek-runtime
 ```
 
 **Rust 端支持的架构**（和 `model.py` 逐位对齐，对拍误差 ~1e-6）：
@@ -281,7 +281,7 @@ cd inference/runtime && cargo build --release
 - 对拍验证：同一 prompt 下 Rust 与 Python 的 logits 应逐位对齐（最大误差 < 1e-5）。
   有 `inference/scripts/compare_logits.py` 一条命令完成（convert → build → 双端 dump → diff），
   也可手动跑：Python 端 `uv run python inference/sample.py --out_dir=out/<实验> --start="悟空" --dump_logits=/tmp/py.txt`，
-  Rust 端 `./target/release/nanogpt-runtime --dump-logits /tmp/rust.txt --prompt "悟空"`，然后 diff 两个文件。
+  Rust 端 `./target/release/nanoseek-runtime --dump-logits /tmp/rust.txt --prompt "悟空"`，然后 diff 两个文件。
 
 ---
 
