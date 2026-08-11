@@ -9,6 +9,7 @@
 """
 import os
 import pickle
+import random
 import requests
 import numpy as np
 from tokenizers import Tokenizer
@@ -76,19 +77,33 @@ def main():
     vocab_size = tokenizer.get_vocab_size()
     print(f'BPE 分词器：{vocab_size} token')
 
-    # 3) 读取所有 .txt 拼成一个语料
-    parts = []
+    # 3) 读取所有 .txt，按"空行分隔的样本"（每条对话）拆开。
+    #    旧实现是按文件拼接后整段硬切 90/10，会让 val 恰好落在最后一个文件
+    #    （zhuangxialie 单轮指令）的后半段，而 train 主要是对话 → 分布错位，
+    #    train-val gap 巨大（val 7.17 vs train 4.44）。
+    #    策略（用户 2026-08-11）：val 只验证"对话"（核心目标），train 学全面。
+    #    对话类文件（闲聊/多轮）单独 90/10 切：对话 90% 进 train、10% 进 val；
+    #    非对话类文件（单轮指令/逻辑/古风）全部进 train，不参与 val。
+    DIALOGUE_FILES = {'dailychat_dialogue.txt', 'muice_dialogue.txt', 'multi_turn_dialogue.txt'}
+    train_samples, val_samples = [], []
     for fn in sorted(os.listdir(DATA_DIR)):
-        if fn.endswith('.txt'):
-            with open(os.path.join(DATA_DIR, fn), 'r', encoding='utf-8') as f:
-                parts.append(f.read())
-    data = '\n'.join(parts)
-    print(f'合并 {len(parts)} 个文件，{len(data):,} 字符')
-
-    # 4) 90/10 分切
-    n = len(data)
-    train_data = data[:int(n * 0.9)]
-    val_data = data[int(n * 0.9):]
+        if not fn.endswith('.txt'):
+            continue
+        with open(os.path.join(DATA_DIR, fn), 'r', encoding='utf-8') as f:
+            text = f.read()
+        blocks = [b.strip() for b in text.split('\n\n') if b.strip()]
+        if fn in DIALOGUE_FILES:
+            random.seed(1337)  # 固定 seed：重复运行切分一致，实验结果可复现
+            random.shuffle(blocks)
+            n = int(len(blocks) * 0.9)
+            train_samples += blocks[:n]
+            val_samples += blocks[n:]
+        else:
+            train_samples += blocks  # 非对话全部进训练，让模型学全面
+    print(f'训练 {len(train_samples)} 条 / 验证 {len(val_samples)} 条（仅对话）')
+    train_data = '\n\n'.join(train_samples)
+    val_data = '\n\n'.join(val_samples)
+    print(f'{len(train_data):,} 训练字符 / {len(val_data):,} 验证字符')
 
     # 5) 编码 + 写 bin
     encode_to_bin(train_data, tokenizer, os.path.join(DATA_DIR, 'train.bin'))

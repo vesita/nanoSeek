@@ -54,9 +54,75 @@ def extract_zhuangxialie(ex):
     return '\n'.join(turns) if turns else None
 
 
+def extract_muice(ex):
+    """Moemuu/Muice-Dataset：{system, conversation=[{human,assistant}]}，中文多轮闲聊。
+
+    多轮对话流是当前数据最缺的（现有全是单轮指令），这是补"对话感"的核心。
+    system 是角色设定（如"你是一个名为沐雪的可爱AI女孩子"），训练时丢弃，
+    只保留 human/assistant 交替的对话流。
+    """
+    conv = ex.get('conversation', [])
+    if not conv:
+        return None
+    turns = []
+    for m in conv:
+        if not isinstance(m, dict):
+            continue
+        h = str(m.get('human', '')).strip()
+        a = str(m.get('assistant', '')).strip()
+        if h:
+            turns.append(f'用户：{h}')
+        if a:
+            turns.append(f'模型：{a}')
+    return '\n'.join(turns) if turns else None
+
+
+def extract_dailychat(ex):
+    """yyy6778/dailychat：{instruction, input, output}，中文单轮日常对话（口语化）。"""
+    q = str(ex.get('instruction', '')).strip()
+    inp = str(ex.get('input', '')).strip()
+    a = str(ex.get('output', '')).strip()
+    full_q = f'{q}\n{inp}'.strip() if inp else q
+    if not full_q or not a:
+        return None
+    return f'用户：{full_q}\n模型：{a}'
+
+
+def extract_multi_turn(ex):
+    """justgo10000/Multi-turn-dialogue：{prompt=[{role,content}...], chosen, rejected}。
+
+    多轮对话流（心理/情感咨询，当前数据最缺的"你来我往"）。
+    prompt 是对话历史，但**永远以最后一条用户消息结尾**（DPO 格式），
+    chosen/rejected 才是候选回复——所以必须把 chosen 补成结尾的 模型： 回复，
+    否则每个样本都以未回答的 用户： 收尾，等于教模型"下一条该输出 用户："。
+    """
+    prompt = ex.get('prompt') or ex.get('messages')
+    if not prompt:
+        return None
+    turns = []
+    for m in prompt:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get('role', ''))
+        content = str(m.get('content', '')).strip()
+        if not content:
+            continue
+        if role == 'user':
+            turns.append(f'用户：{content}')
+        elif role == 'assistant':
+            turns.append(f'模型：{content}')
+    chosen = str(ex.get('chosen', '')).strip()
+    if chosen:
+        turns.append(f'模型：{chosen}')
+    return '\n'.join(turns) if turns else None
+
+
 EXTRACTORS = {
     'shareai': ('shareAI/shareAI-Llama3-DPO-zh-en-emoji', extract_shareai),
     'zhuangxialie': ('zhuangxialie/Llama3-Chinese-Dataset', extract_zhuangxialie),
+    'muice': ('Moemuu/Muice-Dataset', extract_muice),
+    'dailychat': ('yyy6778/dailychat', extract_dailychat),
+    'multi_turn': ('justgo10000/Multi-turn-dialogue', extract_multi_turn),
 }
 
 
@@ -71,17 +137,30 @@ def download_one(dataset_id, extractor, out_path, max_samples, force):
     tmp_path = out_path + '.tmp'
     ds = MsDataset.load(dataset_id, split='train', use_streaming=True)
     written = 0
+    bad = 0
     with open(tmp_path, 'w', encoding='utf-8') as f:
-        for i, ex in enumerate(ds):
-            if max_samples and i >= max_samples:
-                break
-            text = extractor(ex)
-            if text:
-                f.write(text + '\n\n')
-                written += 1
-            if written % 5000 == 0:
-                print(f'  已写 {written} 轮对话...')
-    # 全部成功后才原子改名，避免半截文件被 prepare 误读
+        try:
+            for i, ex in enumerate(ds):
+                if max_samples and i >= max_samples:
+                    break
+                try:
+                    text = extractor(ex)
+                except Exception:
+                    # 个别坏行（schema 不一致等）跳过，不影响整批下载
+                    bad += 1
+                    continue
+                if text:
+                    f.write(text + '\n\n')
+                    written += 1
+                if written % 5000 == 0:
+                    print(f'  已写 {written} 轮对话...')
+        except Exception as e:
+            # 数据集尾部常混入 schema 不一致的批，流式迭代器会整体抛 CastError。
+            # 已写出的内容完整有效，保留前缀提前收尾即可，不算失败。
+            print(f'  ⚠ 迭代中断（{type(e).__name__}），保留已写的 {written} 条')
+    if bad:
+        print(f'  跳过坏行 {bad} 条')
+    # 原子改名：即使迭代中断，已写的也是完整样本序列（每条一个 write），可安全使用
     os.replace(tmp_path, out_path)
     print(f'完成 ✅ {out_path}  （{written} 轮对话，{os.path.getsize(out_path) / 1e6:.1f} MB）')
 
