@@ -367,6 +367,33 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+def _backup_old_run(out_dir):
+    """重复训练到同一 out_dir 前，把已有旧实验产物归档到 out_dir/old/，仅保留最近一份。
+
+    背景：固定命令格式下，重复跑同一 out_dir 会把上次的 results.csv / ckpt / loss_curve
+    整个覆盖掉，想对比/找回旧结果就没了。这里在写任何产物前，先把 out_dir 里已有的
+    文件整体挪到 old/ 子目录——想找回时看 old/ 即可。
+
+    "仅保留一个 old"：若 old/ 已存在，先删掉再挪新的（更早的版本丢弃，只留最近一份旧实验）。
+    """
+    import shutil
+    old_dir = os.path.join(out_dir, 'old')
+    items = [f for f in os.listdir(out_dir) if f != 'old']
+    if not items:
+        return  # 全新目录，无需备份
+    if os.path.isdir(old_dir):
+        shutil.rmtree(old_dir)  # 只保留最近一份 old
+    os.makedirs(old_dir, exist_ok=True)
+    for f in items:
+        shutil.move(os.path.join(out_dir, f), os.path.join(old_dir, f))
+    print(f"⚠ 检测到 {out_dir} 已有旧实验产物，已归档到 old/（仅保留最近一份）")
+
+
+# 覆盖保护：写 results.csv / SummaryWriter 之前执行。
+# resume 除外——续训要读回 out_dir/best.pt，不能把老 ckpt 挪走。
+if master_process and init_from != 'resume':
+    _backup_old_run(out_dir)
+
 writer = None
 if tensorboard_log and master_process:
     from torch.utils.tensorboard import SummaryWriter
