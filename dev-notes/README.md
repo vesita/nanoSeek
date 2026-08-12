@@ -17,6 +17,10 @@
 | [10](10-torch-compile良性警告.md) | torch.compile 良性警告 | RTX 5060 只有 30 SM，max_autotune_gemm 用不了 |
 | [11](11-AttentionSinks打破重复.md) | Attention Sinks 打破重复 | A/B 实证：Sinks 单独开就消除重复坍缩，loss 还略低 |
 | [12](12-后训练不能改架构.md) | 后训练不能改架构 | `--init_from=*.pt` 时命令行开关被 checkpoint 覆盖，加 Sinks 必须从 0 训 |
+| [13](13-mHC与IndexerHash归因.md) | mHC / Indexer / Hash 单独归因 | 1500 步串行 A/B：mHC 收敛加速（进默认），Indexer/Hash 拖慢（实验性关闭） |
+| [14](14-mHC训满验证-Sinks失效最终确认.md) | mHC 训满验证：Sinks 训满失效最终确认 | val 历史最低 1.297 但采样全角空格死循环；Sinks 必要不充分，训满必失效 |
+| [15](15-Windows交叉编译用gnu不用msvc.md) | Windows 交叉编译用 gnu 不用 msvc | zig 不内置 MSVC 头（new.h），-gnu 一次通过 |
+| [16](16-repetition-penalty缓解复述.md) | 解码重复惩罚缓解复述 | --repeat-penalty 压结构标签复读；治标，治本是训满，RL 不是现在 |
 
 ## 新增笔记的约定
 

@@ -224,6 +224,7 @@ impl GPT {
         n: usize,
         temperature: f64,
         top_k: Option<usize>,
+        repeat_penalty: f64,
         eos_id: Option<u32>,
         rng: &mut R,
         mut on_token: F,
@@ -238,7 +239,8 @@ impl GPT {
                 &tokens[..]
             };
             let logits = self.forward(ctx)?; // (vocab,)
-            let next = sample(&logits, temperature, top_k, rng)?;
+            // 把当前上下文作为"已见 token"传给采样：模型越倾向于复述结构标签，压得越狠
+            let next = sample(&logits, temperature, top_k, repeat_penalty, ctx, rng)?;
             // 遇到 <eos> 立即停止：不输出、也不拼进上下文，否则会继续生成垃圾
             if Some(next) == eos_id {
                 break;
@@ -259,10 +261,11 @@ impl GPT {
         n: usize,
         temperature: f64,
         top_k: Option<usize>,
+        repeat_penalty: f64,
         eos_id: Option<u32>,
         rng: &mut R,
     ) -> Result<Vec<u32>> {
-        self.generate_stream(prompt, n, temperature, top_k, eos_id, rng, |_| {})
+        self.generate_stream(prompt, n, temperature, top_k, repeat_penalty, eos_id, rng, |_| {})
     }
 }
 
@@ -694,11 +697,13 @@ fn layer_norm(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tens
     Ok(x)
 }
 
-/// 温度 + top-k + softmax + 多项式采样，和 model.py 的 generate 一致。
+/// 温度 → 重复惩罚 → top-k → softmax → 多项式采样，和 model.py 的 generate 一致。
 fn sample<R: Rng>(
     logits: &Tensor,
     temperature: f64,
     top_k: Option<usize>,
+    repeat_penalty: f64,
+    seen: &[u32], // 已出现的 token（重复惩罚要压的对象）
     rng: &mut R,
 ) -> Result<u32> {
     let mut logits: Vec<f32> = logits.to_vec1()?;
@@ -706,6 +711,22 @@ fn sample<R: Rng>(
     // 温度缩放
     for l in logits.iter_mut() {
         *l /= temperature as f32;
+    }
+
+    // 重复惩罚（CTRL 标准做法）：已出现的 token，正 logits 除以、负 logits 乘以，
+    // 两者都把它压向低概率——抑制模型复述"模型：""用户："这类结构标签。
+    // 同一个 token 出现几次就压几次（出现越频繁压得越狠）。
+    // penalty > 1 才生效；=1.0 时完全等价于原逻辑，零开销。
+    if repeat_penalty > 1.0 {
+        let p = repeat_penalty as f32;
+        for &t in seen {
+            let l = &mut logits[t as usize];
+            if *l >= 0.0 {
+                *l /= p;
+            } else {
+                *l *= p;
+            }
+        }
     }
 
     // top-k：只保留概率最高的前 k 个 token

@@ -24,6 +24,7 @@ fn main() -> Result<()> {
     let mut max_new_tokens = 300usize;
     let mut temperature = 0.8f64;
     let mut top_k: Option<usize> = Some(200);
+    let mut repeat_penalty = 1.0f64; // 重复惩罚：>1 生效（常用 1.1~1.3），1.0 关闭
     let mut seed = 1337u64;
     let mut print_logits = false;
     let mut dump_logits: Option<String> = None;
@@ -63,6 +64,10 @@ fn main() -> Result<()> {
             "--top-k" => {
                 i += 1;
                 top_k = Some(args[i].parse()?);
+            }
+            "--repeat-penalty" => {
+                i += 1;
+                repeat_penalty = args[i].parse()?;
             }
             "--seed" => {
                 i += 1;
@@ -125,6 +130,9 @@ fn main() -> Result<()> {
     if !feats.is_empty() {
         println!("特性: {}", feats.join(" + "));
     }
+    if repeat_penalty > 1.0 {
+        println!("采样: temperature={temperature} top_k={top_k:?} repeat_penalty={repeat_penalty}");
+    }
 
     // --- 一次性生成（给了 --prompt） ---
     if let Some(p) = prompt {
@@ -153,7 +161,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         // 流式生成：逐 token 打印
-        stream_print(&gpt, &tok, &ids, max_new_tokens, temperature, top_k, &mut rng)?;
+        stream_print(&gpt, &tok, &ids, max_new_tokens, temperature, top_k, repeat_penalty, &mut rng)?;
         println!();
         return Ok(());
     }
@@ -181,7 +189,7 @@ fn main() -> Result<()> {
         // 否则模型认不出对话结构。数据里 "用户：...\n模型：" 之后就是模型回答，无空格。
         context.extend(tok.encode(&format!("用户：{line}\n模型："))?);
         print!("模型: ");
-        let new_tokens = stream_print(&gpt, &tok, &context, max_new_tokens, temperature, top_k, &mut rng)?;
+        let new_tokens = stream_print(&gpt, &tok, &context, max_new_tokens, temperature, top_k, repeat_penalty, &mut rng)?;
         println!();
         context.extend(new_tokens);
     }
@@ -197,6 +205,7 @@ fn stream_print(
     max_new_tokens: usize,
     temperature: f64,
     top_k: Option<usize>,
+    repeat_penalty: f64,
     rng: &mut rand::rngs::StdRng,
 ) -> Result<Vec<u32>> {
     let eos_id = tok.eos_id(); // 遇到 <eos> 就停止，避免生成垃圾
@@ -206,6 +215,7 @@ fn stream_print(
         max_new_tokens,
         temperature,
         top_k,
+        repeat_penalty,
         eos_id,
         rng,
         |t| {
