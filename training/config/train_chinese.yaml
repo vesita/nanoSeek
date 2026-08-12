@@ -4,7 +4,9 @@
 # csa_compress 越小越接近全量注意力，topk 越大全局信息越全但越贵。
 # 规模：6×80 深度换宽度（+MTP ~2.85M 参数），适配 8000 BPE 词表。
 # 快速验证代码是否跑得通用 test.yaml（步数少、模型更小）。
-out_dir: out/chinese
+# out_dir 指向当前表现最好的模型目录（chinese-data2，新数据 + 全特性，val 0.98 @2000）。
+# 重训会用 out_dir/old 保护机制归档旧实验。
+out_dir: out/chinese-data2
 eval_interval: 250
 eval_iters: 100
 log_interval: 10

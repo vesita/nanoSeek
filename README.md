@@ -61,7 +61,7 @@ nanoSeek 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 - 命令行覆盖：`uv run python train.py config/xxx.yaml --n_layer=4`
 - 配置值带类型检查，写错类型直接报错（比如 YAML 里 `1e-3` 会被解析成字符串，会立即被拦下）
 
-**默认 small 模型**：6 层 / 80 维 / 8000 词表 + MoE(4×2) + 共享专家 + MTP + Attention Sinks ≈ **2.85M 参数**（深度换宽度，规模与旧 4×96 持平），RTX 5060 上约 1 分钟一轮训练，适合快速迭代实验。
+**默认 small 模型**：6 层 / 80 维 / 8000 词表 + MoE(4×2) + 共享专家 + MTP + Attention Sinks + mHC ≈ **2.85M 参数**（深度换宽度，规模与旧 4×96 持平），RTX 5060 上约 1 分钟一轮训练，适合快速迭代实验。当前默认模型：`out/chinese-data2`（新数据 + 全特性，val 0.98 @2000 步）。
 
 **实验基础设施**：
 - 冒烟测试 `inference/scripts/smoke_test.py`：秒级验证模型前向/反向 + 参数量对比
@@ -145,7 +145,7 @@ uv run python training/train.py training/config/train_chinese.yaml
 **③ 采样看效果**
 
 ```sh
-uv run python inference/sample.py --out_dir=out/chinese --start="悟空" --num_samples=3 --max_new_tokens=300
+uv run python inference/sample.py --out_dir=out/chinese-data2 --start="悟空" --num_samples=3 --max_new_tokens=300
 ```
 
 **④ 版本化续训**（详见下方「版本化连续训练」）：`--init_from=resume` 续训、`--init_from=<路径>.pt` 基于已有模型做后训练。
@@ -164,11 +164,11 @@ git add -A && git commit -m "实验：..."
 
 ```yaml
 # training/config/train_chinese.yaml
-out_dir: out/chinese
+out_dir: out/chinese-data2
 dataset: chinese
-n_layer: 4
+n_layer: 6
 n_head: 4
-n_embd: 96
+n_embd: 80
 vocab_size: 8000
 learning_rate: 0.001
 ```
@@ -203,7 +203,7 @@ learning_rate: 0.001
 
 **数据集**：**BPE 子词分词**（魔搭中文对话语料 ~153MB，8000 词表，ByteLevel 预分词）。数据流程：`download_dialogue.py`（魔搭下载对话）→ `train_tokenizer.py`（训 BPE）→ `prepare.py`（编码成 train.bin/val.bin）。
 
-**默认模型**：`training/config/train_chinese.yaml`（6×80 + MTP + Sinks + CSA/HCA + MoE，~2.85M 参数）。已验证有效的开关（共享专家、可学习门控池化、Attention Sinks）已写进默认配置。Attention Sinks 经 A/B 实证是打破重复坍缩的必要条件（见 dev-notes/11），已默认开启。其余结构设计升级（mHC/Indexer/Hash）实验性默认关闭。
+**默认模型**：`training/config/train_chinese.yaml`（6×80 + MTP + Sinks + CSA/HCA + MoE + mHC，~2.85M 参数），默认 checkpoint 为 `out/chinese-data2/best.pt`。已验证有效的开关（共享专家、可学习门控池化、Attention Sinks、mHC）已写进默认配置。Attention Sinks 经 A/B 实证是打破重复坍缩的必要条件（见 dev-notes/11），mHC 经 1500 步归因收敛加速（见 dev-notes/13），已默认开启。其余结构设计升级（Indexer/Hash）实验性默认关闭。
 
 ## 版本化连续训练
 
@@ -218,7 +218,7 @@ uv run python training/train.py training/config/train_chinese.yaml --init_from=r
 
 # 后训练（基于旧版本 best.pt 开新版本，优化器/学习率重置）
 uv run python training/train.py training/config/train_chinese.yaml \
-  --init_from=out/chinese-all/best.pt --out_dir=out/chinese-all-v2 --max_iters=5000
+  --init_from=out/chinese-data2/best.pt --out_dir=out/chinese-data2-v2 --max_iters=5000
 ```
 
 - `best.pt`：val loss 最优的 checkpoint，续训/部署默认用它
@@ -234,8 +234,8 @@ uv run python training/train.py training/config/train_chinese.yaml \
 **部署流程**（训练产物 → 可对话模型）：
 
 ```sh
-# 1. 转换 checkpoint（默认转换全特性模型）
-uv run python inference/runtime/scripts/convert.py --ckpt out/chinese-all/best.pt --dataset chinese
+# 1. 转换 checkpoint（默认转换当前最佳模型 out/chinese-data2/best.pt）
+uv run python inference/runtime/scripts/convert.py --ckpt out/chinese-data2/best.pt --dataset chinese
 
 # 2. 编译 Rust 运行时
 cd inference/runtime && cargo build --release
@@ -256,12 +256,14 @@ cd inference/runtime && cargo build --release
 | SwiGLU Clamp | ✅ | V4 数值稳定性钳制 |
 | CSA + HCA（压缩稀疏注意力） | ✅ | 块压缩 + top-k 稀疏选择 + 滑窗 + 全局信号，含 V4 可学习门控池化 |
 | V4 Attention Sinks / mHC / Lightning Indexer / Hash 路由 | ✅ | 结构设计升级，与 Python 逐位对齐 |
-| MLA / MTP | ❌ | Python 端有，Rust 未实现 |
+| MTP | ✅ | 训练增强头，推理不需要——convert.py 跳过 MTP 权重，主干输出不受影响 |
+| MLA | ❌ | Python 端有，Rust 未实现 |
 
-⚠️ **部署注意**：MLA / MTP 仍只在 Python 端，Rust 未实现。训练时开启这两个开关的
-模型无法部署；其余 V4 特性（含四个结构设计升级）Rust 已全部支持。Rust 端验证方法：
-用 `--print-logits` / `--dump-logits` 配合 `inference/sample.py` 的 `--dump_logits`
-逐位对拍（见下方「对拍验证」）。
+⚠️ **部署注意**：MLA 仍只在 Python 端，Rust 未实现。开启 MLA 的模型无法部署。
+MTP 训练的模型可正常部署（MTP 是训练时辅助预测头，推理只用主干模型的最终 logits，
+convert.py 已自动跳过 MTP 权重）；其余 V4 特性（含四个结构设计升级）Rust 已全部支持。
+Rust 端验证方法：用 `--print-logits` / `--dump-logits` 配合 `inference/sample.py` 的
+`--dump_logits` 逐位对拍（见下方「对拍验证」）。
 
 **CLI 选项**：
 

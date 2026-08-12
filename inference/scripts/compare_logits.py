@@ -6,7 +6,7 @@ Rust/Python 逐位对拍工具：同步部署端的"守门员"。
 （最大误差应 < 0.01；top-5 排序应完全一致）。
 
 用法（从项目根目录）：
-    uv run python inference/scripts/compare_logits.py                          # 默认 out/chinese-all/best.pt
+    uv run python inference/scripts/compare_logits.py                          # 默认 out/chinese-data2/best.pt
     uv run python inference/scripts/compare_logits.py --ckpt out/chinese/best.pt
     uv run python inference/scripts/compare_logits.py --prompt "用户：你好\n模型："
 """
@@ -22,7 +22,7 @@ BIN = os.path.join(RUNTIME, 'target', 'release', 'nanoseek-runtime')
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--ckpt', default='out/chinese-all/best.pt', help='训练好的 checkpoint 路径')
+    ap.add_argument('--ckpt', default='out/chinese-data2/best.pt', help='训练好的 checkpoint 路径')
     ap.add_argument('--dataset', default='chinese', help='数据集名（找 tokenizer.json）')
     ap.add_argument('--prompt', default='悟空', help='对拍用的 prompt（默认短 prompt，快）')
     ap.add_argument('--max-err', type=float, default=0.01,

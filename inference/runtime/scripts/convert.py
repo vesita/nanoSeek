@@ -6,7 +6,7 @@
     tokenizer.json       BPE 分词器（从 data/<dataset>/ 复制，Python/Rust 共用）
 
 用法（从项目根目录）：
-    uv run python inference/runtime/scripts/convert.py --ckpt out/chinese-all/best.pt --dataset chinese
+    uv run python inference/runtime/scripts/convert.py --ckpt out/chinese-data2/best.pt --dataset chinese
 """
 import argparse
 import json
@@ -19,7 +19,7 @@ from safetensors.torch import save_file
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--ckpt', default='out/chinese-all/best.pt', help='训练好的 checkpoint 路径（默认全特性模型）')
+    ap.add_argument('--ckpt', default='out/chinese-data2/best.pt', help='训练好的 checkpoint 路径（默认当前最佳模型）')
     ap.add_argument('--dataset', default='chinese', help='数据集名，用来找 data/<dataset>/tokenizer.json')
     ap.add_argument('--out', default='inference/runtime', help='输出目录（Rust 项目根）')
     args = ap.parse_args()
@@ -38,6 +38,9 @@ def main():
     sd = {k.removeprefix('_orig_mod.'): v for k, v in sd.items()}
     # 跳过 RoPE 的 cos/sin 预计算表（Rust 端按 rope_theta 自己算）
     sd = {k: v for k, v in sd.items() if not (k.endswith('.cos') or k.endswith('.sin'))}
+    # 跳过 MTP 模块权重：MTP 是训练时的辅助预测头，推理时主模型输出已含最终 logits，
+    # Rust 端不实现 MTP，载入多余的 ~100 万参数纯属浪费（上次转换把 mtp_modules.* 全带进去了）
+    sd = {k: v for k, v in sd.items() if 'mtp_modules' not in k}
     # 丢掉 lm_head.weight：它和 wte.weight 是 weight tying 共享的同一份数据，
     # safetensors 不允许共享内存张量重复保存；Rust 端直接用 wte 做输出投影
     sd = {k: v for k, v in sd.items() if k != 'lm_head.weight'}
