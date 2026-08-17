@@ -61,7 +61,7 @@ nanoSeek 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 - 命令行覆盖：`uv run python train.py config/xxx.yaml --n_layer=4`
 - 配置值带类型检查，写错类型直接报错（比如 YAML 里 `1e-3` 会被解析成字符串，会立即被拦下）
 
-**默认 small 模型**：6 层 / 80 维 / 8000 词表 + MoE(4×2) + 共享专家 + MTP + Attention Sinks + mHC ≈ **2.85M 参数**（深度换宽度，规模与旧 4×96 持平），RTX 5060 上约 1 分钟一轮训练，适合快速迭代实验。当前默认模型：`out/chinese-data2`（新数据 + 全特性，val 0.98 @2000 步）。
+**默认 small 模型**：6 层 / 80 维 / 8000 词表 + MoE(4×2) + 共享专家 + MTP + Attention Sinks + mHC + QK-Norm + Z-Loss + turn-level EOS 数据 ≈ **2.85M 参数**（深度换宽度，规模与旧 4×96 持平），RTX 5060 上约 1 分钟一轮训练，适合快速迭代实验。当前默认模型：`out/chinese-data2-eos`（EOS 数据 + 全特性已验证，训练中）。
 
 **实验基础设施**：
 - 冒烟测试 `inference/scripts/smoke_test.py`：秒级验证模型前向/反向 + 参数量对比
@@ -255,13 +255,13 @@ block_order: ffn_attn
 | V4：mHC 4-copy | 🔬 待验证 | **机制正确**（4 流 + Sinkhorn 双重随机 B，非之前删掉的 2 流错误版） |
 | V4：Lightning Indexer（简版） | 🔬 待验证 | 学习型块选择替代 raw top-k，KL 梯度桥接 |
 | V4：Hash 路由 | 🔬 待验证 | 前 N 层确定性路由，开关可用 |
-| 近零参数稳定性：QK-Norm | ✅ **已验证有效** | L2 归一化 q/k + 每头可学习 scale（+24 参数）。1500 步 val 1.002→0.951（−0.052），详见 [dev-notes/25](dev-notes/25-QK-Norm与Router-Z-Loss-1500步A-B.md) |
-| 近零参数稳定性：Router Z-Loss | ✅ **已验证有效** | z=logsumexp(router)² 正则（0 参数）。单独 −0.020；与 QK 合开 **−0.189 超线性**（val 1.002→0.813），建议进默认配置 |
+| 近零参数稳定性：QK-Norm | ✅ **已验证有效，已写进默认配置** | L2 归一化 q/k + 每头可学习 scale（+24 参数）。1500 步 val 1.002→0.951（−0.052），详见 [dev-notes/25](dev-notes/25-QK-Norm与Router-Z-Loss-1500步A-B.md) |
+| 近零参数稳定性：Router Z-Loss | ✅ **已验证有效，已写进默认配置** | z=logsumexp(router)² 正则（0 参数）。单独 −0.020；与 QK 合开 **−0.189 超线性**（val 1.002→0.813），详见 [dev-notes/25](dev-notes/25-QK-Norm与Router-Z-Loss-1500步A-B.md) |
 | ~~预判路由~~ | ❌ 移除 | 非 V4 概念（混淆了 aux-free 偏置修正） |
 
 **数据集**：**BPE 子词分词**（魔搭中文对话语料 ~153MB，8000 词表，ByteLevel 预分词）。数据流程：`download_dialogue.py`（魔搭下载对话）→ `train_tokenizer.py`（训 BPE）→ `prepare.py`（编码成 train.bin/val.bin）。
 
-**默认模型**：`training/config/train_chinese.yaml`（6×80 + MTP + Sinks + CSA/HCA + MoE + mHC，~2.85M 参数），默认 checkpoint 为 `out/chinese-data2/best.pt`。已验证有效的开关（共享专家、可学习门控池化、Attention Sinks、mHC）已写进默认配置。Attention Sinks 经 A/B 实证是打破重复坍缩的必要条件（见 dev-notes/11），mHC 经 1500 步归因收敛加速（见 dev-notes/13），已默认开启。其余结构设计升级（Indexer/Hash）实验性默认关闭。**QK-Norm + Router Z-Loss（dev-notes/25：合开 1500 步 val 1.002→0.813，近零参数）建议合入默认配置，尚未合入。**
+**默认模型**：`training/config/train_chinese.yaml`（6×80 + MTP + Sinks + CSA/HCA + MoE + mHC + QK-Norm + Z-Loss，~2.85M 参数），默认 checkpoint 为 `out/chinese-data2-eos/best.pt`（EOS 数据 + 全特性验证通过）。已验证有效的开关（共享专家、可学习门控池化、Attention Sinks、mHC、QK-Norm、Router Z-Loss）已全部写进默认配置。Attention Sinks 经 A/B 实证是打破重复坍缩的必要条件（见 dev-notes/11），mHC 经 1500 步归因收敛加速（见 dev-notes/13），QK+Z 合开超线性收敛加速（见 dev-notes/25）——均已默认开启。其余结构设计升级（Indexer/Hash）实验性默认关闭。数据采用 `prepare.py --task-ratio 0 --insert-eos`（纯对话 + turn-level EOS，模型学会"话说完→吐 `<eos>`"）。
 
 **开发踩坑笔记（Dev Notes）**：`dev-notes/` 已按 4 大主题整理——[A 重复坍缩与训练稳定性](dev-notes/A-重复坍缩与训练稳定性.md)（核心研究线）、[B 结构消融与拓扑实验](dev-notes/B-结构消融与拓扑实验.md)、[C 数据与词表治理](dev-notes/C-数据与词表治理.md)、[D 工程与工具踩坑](dev-notes/D-工程与工具踩坑.md)。速查入口见 [dev-notes/README.md](dev-notes/README.md)；原始 25 篇逐条笔记全保留，可溯源。
 
@@ -278,7 +278,7 @@ uv run python training/train.py training/config/train_chinese.yaml --init_from=r
 
 # 后训练（基于旧版本 best.pt 开新版本，优化器/学习率重置）
 uv run python training/train.py training/config/train_chinese.yaml \
-  --init_from=out/chinese-data2/best.pt --out_dir=out/chinese-data2-v2 --max_iters=5000
+  --init_from=out/chinese-data2-eos/best.pt --out_dir=out/chinese-data2-eos-v2 --max_iters=5000
 ```
 
 - `best.pt`：val loss 最优的 checkpoint，续训/部署默认用它
