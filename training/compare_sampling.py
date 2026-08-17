@@ -6,6 +6,7 @@
 """
 import sys
 import re
+import argparse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -18,7 +19,7 @@ from inference.scripts.sample_py import build_model_from_checkpoint, generate
 from inference.scripts.eval_dialogue import (DIALOGUE_PROMPTS, MAX_NEW_TOKENS, TEMPERATURE,
                                              TOP_K, REPEAT_PENALTY, SEED, evaluate_one)
 
-MODELS = [
+DEFAULT_MODELS = [
     ("out/chinese-data2-ab-base", "base 基线"),
     ("out/chinese-data2-ab-qk",   "qk   QK-Norm"),
     ("out/chinese-data2-ab-z",    "z    Router Z-Loss"),
@@ -27,9 +28,14 @@ MODELS = [
 ]
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dirs", nargs="*", default=None,
+                    help="要对比的 out/ 子目录；默认 = 4 个 A/B 臂 + 生产参考")
+    a = ap.parse_args()
+    models = [(d, f"{Path(d).name}") for d in a.dirs] if a.dirs else DEFAULT_MODELS
     tok = Tokenizer.from_file("data/chinese/tokenizer.json")
     results = []
-    for d, label in MODELS:
+    for d, label in models:
         if not (Path(d) / "best.pt").exists():
             print(f"⚠ 跳过（无 best.pt）: {d}")
             continue
@@ -50,12 +56,12 @@ def main():
 
     # ---- 汇总表 ----
     print("\n\n======== 采样智能度对比（同 6 prompt × seed 1337，temp 0.8 / top-k 200 / rep-pen 1.2） ========")
-    print(f"{'模型':<28} | {'val@1500':>8} | {'len':>5} | {'rep2':>6} | {'rep3':>6} | {'rep4':>6} | "
+    print(f"{'模型':<20} | {'val':>7} | {'len':>5} | {'rep2':>6} | {'rep3':>6} | {'rep4':>6} | "
           f"{'ws%':>5} | {'d1':>6} | {'d2':>6} | {'turns':>5}")
-    print("-" * 108)
+    print("-" * 100)
     for r in results:
         val = "—"
-        print(f"{r['label']:<28} | {val:>8} | {r['avg_len_tokens']:>5} | {r['rep2']:>6} | {r['rep3']:>6} | "
+        print(f"{r['label']:<20} | {val:>7} | {r['avg_len_tokens']:>5} | {r['rep2']:>6} | {r['rep3']:>6} | "
               f"{r['rep4']:>6} | {int(r['ws_ratio']*100):>4}% | {r['distinct1']:>6} | "
               f"{r['distinct2']:>6} | {r['turn_structure']:>5}")
     print("\nrepN=字符 n-gram 重复率(越低越好) | ws%=空白占比(越低越好) | d1/d2=多样性(越高越好) | turns=轮次结构(越高越好)")
