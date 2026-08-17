@@ -1068,7 +1068,7 @@ class GPT(nn.Module):
         if targets is not None:
             # 如果给了目标 targets，就同时计算损失
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
             if self.config.use_moe:
                 # 把各层 MoE 的负载均衡辅助损失加到总损失上
                 moe_loss = torch.zeros(1, device=x.device, dtype=x.dtype)
@@ -1114,12 +1114,15 @@ class GPT(nn.Module):
                 hidden = h[:, :-1]      # 上级模块输出预测的是 t+k+1，再前进一步即可
                 off = k + 1
             length = hidden.shape[1]
-            next_emb = self.transformer.wte(targets[:, off : off+length])       # (B, len, C)
+            # 对 embedding 查找用 clamp 替换 -100（loss masking 屏蔽位），
+            # 这些位置在 cross_entropy 中仍被 ignore_index=-100 忽略。
+            safe_targets = targets.clamp(min=0)
+            next_emb = self.transformer.wte(safe_targets[:, off : off+length])       # (B, len, C)
             mtp_targets = targets[:, off+1 : off+1+length]                      # (B, len)
             h = self.mtp_modules[k](hidden, next_emb)                           # (B, len, C)
             logits = self.mtp_head(h)
             mtp_loss = mtp_loss + F.cross_entropy(
-                logits.view(-1, logits.size(-1)), mtp_targets.reshape(-1), ignore_index=-1)
+                logits.view(-1, logits.size(-1)), mtp_targets.reshape(-1), ignore_index=-100)
         return mtp_loss / self.config.n_mtp
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):

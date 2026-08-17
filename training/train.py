@@ -254,7 +254,7 @@ def get_batch(split):
     # 用户轮次和分隔符设 ignore_index=-1，不参与梯度计算。
     for i in range(batch_size):
         mask = build_assistant_mask(y[i])
-        y[i][~mask] = -1
+        y[i, ~mask] = -100
     if device_type == 'cuda':
         # 固定 x、y 的内存，这样我们可以异步（non_blocking=True）把它们搬到 GPU
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
