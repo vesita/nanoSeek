@@ -253,11 +253,15 @@ block_order: ffn_attn
 | V4：mHC 4-copy | 🔬 待验证 | **机制正确**（4 流 + Sinkhorn 双重随机 B，非之前删掉的 2 流错误版） |
 | V4：Lightning Indexer（简版） | 🔬 待验证 | 学习型块选择替代 raw top-k，KL 梯度桥接 |
 | V4：Hash 路由 | 🔬 待验证 | 前 N 层确定性路由，开关可用 |
+| 近零参数稳定性：QK-Norm | ✅ **已验证有效** | L2 归一化 q/k + 每头可学习 scale（+24 参数）。1500 步 val 1.002→0.951（−0.052），详见 [dev-notes/25](dev-notes/25-QK-Norm与Router-Z-Loss-1500步A-B.md) |
+| 近零参数稳定性：Router Z-Loss | ✅ **已验证有效** | z=logsumexp(router)² 正则（0 参数）。单独 −0.020；与 QK 合开 **−0.189 超线性**（val 1.002→0.813），建议进默认配置 |
 | ~~预判路由~~ | ❌ 移除 | 非 V4 概念（混淆了 aux-free 偏置修正） |
 
 **数据集**：**BPE 子词分词**（魔搭中文对话语料 ~153MB，8000 词表，ByteLevel 预分词）。数据流程：`download_dialogue.py`（魔搭下载对话）→ `train_tokenizer.py`（训 BPE）→ `prepare.py`（编码成 train.bin/val.bin）。
 
-**默认模型**：`training/config/train_chinese.yaml`（6×80 + MTP + Sinks + CSA/HCA + MoE + mHC，~2.85M 参数），默认 checkpoint 为 `out/chinese-data2/best.pt`。已验证有效的开关（共享专家、可学习门控池化、Attention Sinks、mHC）已写进默认配置。Attention Sinks 经 A/B 实证是打破重复坍缩的必要条件（见 dev-notes/11），mHC 经 1500 步归因收敛加速（见 dev-notes/13），已默认开启。其余结构设计升级（Indexer/Hash）实验性默认关闭。
+**默认模型**：`training/config/train_chinese.yaml`（6×80 + MTP + Sinks + CSA/HCA + MoE + mHC，~2.85M 参数），默认 checkpoint 为 `out/chinese-data2/best.pt`。已验证有效的开关（共享专家、可学习门控池化、Attention Sinks、mHC）已写进默认配置。Attention Sinks 经 A/B 实证是打破重复坍缩的必要条件（见 dev-notes/11），mHC 经 1500 步归因收敛加速（见 dev-notes/13），已默认开启。其余结构设计升级（Indexer/Hash）实验性默认关闭。**QK-Norm + Router Z-Loss（dev-notes/25：合开 1500 步 val 1.002→0.813，近零参数）建议合入默认配置，尚未合入。**
+
+**开发踩坑笔记（Dev Notes）**：`dev-notes/` 已按 4 大主题整理——[A 重复坍缩与训练稳定性](dev-notes/A-重复坍缩与训练稳定性.md)（核心研究线）、[B 结构消融与拓扑实验](dev-notes/B-结构消融与拓扑实验.md)、[C 数据与词表治理](dev-notes/C-数据与词表治理.md)、[D 工程与工具踩坑](dev-notes/D-工程与工具踩坑.md)。速查入口见 [dev-notes/README.md](dev-notes/README.md)；原始 25 篇逐条笔记全保留，可溯源。
 
 ## 版本化连续训练
 
