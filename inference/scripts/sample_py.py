@@ -40,11 +40,40 @@ def build_model_from_checkpoint(out_dir):
     return model, ckpt
 
 
+def _truncate_at_turn(gen_ids, tok):
+    """生成内容里出现下一轮标签（\n用户：/\n模型：）→ 截断到标签之前（治喋喋不休）。
+
+    模型学会对话骨架后常自己续写"用户：…"，这是天然轮次边界：话已说"完"才开下一轮。
+    在字符层找标签位置，再回退到最近的 token 边界（BPE 标签可能跨 token）。
+    """
+    text = tok.decode(gen_ids)
+    for marker in ("\n用户：", "\n模型：", "\nUser:", "\nModel:"):
+        pos = text.find(marker)
+        if pos >= 0:
+            if pos == 0:
+                return [], True
+            for k in range(len(gen_ids) + 1):
+                if len(tok.decode(gen_ids[:k])) > pos:
+                    return gen_ids[:max(k - 1, 0)], True
+            return gen_ids, False
+    return gen_ids, False
+
+
 @torch.no_grad()
-def generate(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_penalty):
+def generate(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_penalty,
+             stop_on_turn=False, stop_on_eos=False, clip_at_sentence=False):
+    """生成（返回 prompt + 生成全文，保持旧接口）。
+
+    治理"喋喋不休"的三个可选旋钮（默认全关，行为与旧版一致）：
+    - stop_on_turn：检测到 \n用户：/\n模型： 立即截断（轮次边界即结束点）
+    - stop_on_eos：采样到 <eos> 立即停止（dev-notes/02：训练数据里的结束符）
+    - clip_at_sentence：预算用尽时回退到最后一个句号/问号/叹号处，不留半句
+    """
     idx = tok.encode(prompt).ids
     idx = torch.tensor([idx], dtype=torch.long)
-    seen = list(idx[0].tolist())
+    new_start = idx.shape[1]          # 生成区起点（截断/裁剪只看这里）
+    seen = list(idx[0].tolist())      # 重复惩罚的上下文 = prompt + 已生成
+    eos_id = tok.token_to_id("<eos>") if stop_on_eos else None
     for _ in range(max_new_tokens):
         idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
         logits, _ = model(idx_cond)
@@ -60,8 +89,30 @@ def generate(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_pena
             v[v < topv[-1]] = -float("Inf")
         probs = F.softmax(v, dim=-1)
         nxt = torch.multinomial(probs, 1)
-        seen.append(int(nxt.item()))
+        nxt_id = int(nxt.item())
+        if eos_id is not None and nxt_id == eos_id:
+            break                        # EOS：该停了，终止符不输出
+        seen.append(nxt_id)
         idx = torch.cat((idx, nxt.unsqueeze(0)), dim=1)
+        if stop_on_turn:
+            gen_ids = idx[0][new_start:].tolist()
+            truncated, hit = _truncate_at_turn(gen_ids, tok)
+            if hit:
+                keep = torch.tensor([truncated], dtype=torch.long)
+                idx = torch.cat([idx[:, :new_start], keep], dim=1)
+                break
+    gen_ids = idx[0][new_start:].tolist()
+    if clip_at_sentence:
+        text = tok.decode(gen_ids).rstrip()
+        if text and text[-1] not in "。！？…!?~～":
+            pos = max(text.rfind(c) for c in "。！？…!?~～")
+            if pos >= 0:
+                for k in range(len(gen_ids) + 1):
+                    if len(tok.decode(gen_ids[:k])) > pos:   # 覆盖到终止符为止
+                        gen_ids = gen_ids[:k]
+                        break
+        idx = torch.cat([idx[:, :new_start],
+                         torch.tensor([gen_ids], dtype=torch.long)], dim=1)
     return tok.decode(idx[0].tolist())
 
 
@@ -73,6 +124,12 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-k", type=int, default=200)
     ap.add_argument("--repeat-penalty", type=float, default=1.2)
+    ap.add_argument("--stop-on-turn", action="store_true",
+                    help="检测到 \n用户：/\n模型： 标签即截断（轮次边界=结束点，治喋喋不休）")
+    ap.add_argument("--stop-on-eos", action="store_true",
+                    help="采样到 <eos> 即停止（训练数据里的结束符）")
+    ap.add_argument("--clip-sentence", action="store_true",
+                    help="预算用尽时回退到最后一个句号/问号/叹号处，不留半句")
     ap.add_argument("--seed", type=int, default=1337)
     a = ap.parse_args()
 
@@ -82,7 +139,8 @@ def main():
     n = sum(p.numel() for p in model.parameters())
     print(f"[{a.out_dir}] {n:,} 参数 | no_attn_layers={ckpt['model_args'].get('no_attn_layers')} | block_order={ckpt['model_args'].get('block_order')}")
 
-    out = generate(model, tok, a.prompt, a.max_new_tokens, a.temperature, a.top_k, a.repeat_penalty)
+    out = generate(model, tok, a.prompt, a.max_new_tokens, a.temperature, a.top_k,
+                   a.repeat_penalty, a.stop_on_turn, a.stop_on_eos, a.clip_sentence)
     # 打印 prompt + 生成全文
     print("--- 生成 ---")
     print(a.prompt + out[len(a.prompt):] if out.startswith(a.prompt) else out)
