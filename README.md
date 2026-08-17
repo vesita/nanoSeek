@@ -125,6 +125,8 @@ nanoSeek/
 uv run python data/chinese/download_dialogue.py     # 1. 从魔搭下载中文对话语料
 uv run python data/chinese/train_tokenizer.py       # 2. 训 BPE 分词器 → tokenizer.json
 uv run python data/chinese/prepare.py               # 3. 编码 → train.bin / val.bin
+#    （默认生成「纯对话 + turn-level EOS」数据：模型学会"话说完→吐 <eos>"，
+#      与默认 train_chinese.yaml 对应。旧行为用 --task-ratio 1.0 --no-insert-eos 复现）
 ```
 
 **② 训练中文模型**
