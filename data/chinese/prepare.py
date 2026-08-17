@@ -55,6 +55,38 @@ def download_if_missing(local_name, book_name):
     print(f'警告：未能下载《{book_name}》，跳过。')
 
 
+def insert_eos_after_replies(block: str) -> str:
+    """在每条「模型：」回复结束后插入结束符 <eos>（字面量，编码时映射为 special token id 3）。
+
+    动机（2026-08-17，dev-notes/26）：训练分布里从来没有「结束」概念，小模型自回归只会
+    一直续写下一轮 → 喋喋不休。给每条回复补 <eos>（chat 微调的 turn-level 终止符惯例，
+    Llama-3 <|eot_id|> / Qwen <|im_end|> 同思路），模型才能学会「话说完 → 吐终止符」，
+    解码端遇 <eos> 即停（sample_py.generate_ids 的 stop_on_eos；Rust 端按 dev-notes/02）。
+    行级状态机处理多行回复：只在回复的最后一行后才插；用户轮次/空行不插。
+    """
+    lines = block.split("\n")
+    out = []
+    in_reply = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("用户：") or stripped.startswith("模型："):
+            if in_reply:
+                out.append("<eos>")            # 上一个模型回复在此结束
+            in_reply = stripped.startswith("模型：")
+            out.append(line)
+        elif not stripped:
+            if in_reply:
+                out.append("<eos>")            # 回复被空行截断（兜底）
+                in_reply = False
+            if line:
+                out.append(line)
+        else:
+            out.append(line)                   # 回复续行（多行回复）
+    if in_reply:                               # 块尾仍是模型回复
+        out.append("<eos>")
+    return "\n".join(out)
+
+
 def encode_to_bin(text, tokenizer, out_path):
     """分块编码文本为 uint16 token ids，增量写入 bin 文件。"""
     with open(out_path, 'wb') as f:
@@ -84,6 +116,7 @@ def write_manifest(args, tokenizer, train_samples, val_samples,
         "prepare_args": {
             "with_books": args.with_books,
             "task_ratio": args.task_ratio,
+            "insert_eos": args.insert_eos,
         },
         "tokenizer": meta,
         "counts": {
@@ -127,6 +160,8 @@ def main():
                     help='顺带下载四大名著补充语料（默认只用手头已有的 txt）')
     ap.add_argument('--task-ratio', type=float, default=1.0,
                     help='非对话(任务/指令)样本保留比例：1.0=全保留(默认/现状)，0=剔除，0.1=留10%')
+    ap.add_argument('--insert-eos', action='store_true',
+                    help='每条 模型： 回复后插入 <eos>（turn-level 终止符，治喋喋不休，2026-08-17）')
     args = ap.parse_args()
 
     # 1) 可选：补齐四大名著（次要语料，网络不稳时默认跳过）
@@ -174,6 +209,9 @@ def main():
             n = max(1, int(len(blocks) * args.task_ratio))
             train_samples += blocks[:n]
         # task_ratio == 0：任务/指令样本剔除，train 只剩对话
+    if args.insert_eos:
+        train_samples = [insert_eos_after_replies(b) for b in train_samples]
+        val_samples = [insert_eos_after_replies(b) for b in val_samples]
     print(f'训练 {len(train_samples)} 条 / 验证 {len(val_samples)} 条（仅对话）')
     train_data = '\n\n'.join(train_samples)
     val_data = '\n\n'.join(val_samples)

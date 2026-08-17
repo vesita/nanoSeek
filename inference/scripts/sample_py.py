@@ -60,21 +60,22 @@ def _truncate_at_turn(gen_ids, tok):
 
 
 @torch.no_grad()
-def generate(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_penalty,
-             stop_on_turn=False, stop_on_eos=False, clip_at_sentence=False):
-    """生成（返回 prompt + 生成全文，保持旧接口）。
+def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_penalty,
+                 stop_on_turn=False, stop_on_eos=False, clip_at_sentence=False):
+    """生成并返回 (完整 token 列表, eos_pos)。
 
-    治理"喋喋不休"的三个可选旋钮（默认全关，行为与旧版一致）：
-    - stop_on_turn：检测到 \n用户：/\n模型： 立即截断（轮次边界即结束点）
-    - stop_on_eos：采样到 <eos> 立即停止（dev-notes/02：训练数据里的结束符）
-    - clip_at_sentence：预算用尽时回退到最后一个句号/问号/叹号处，不留半句
+    与 generate() 逻辑完全一致，但返回 token 级结果：
+    - 完整 token 列表（prompt + 生成，EOS 之前的所有 token）
+    - eos_pos：模型自然吐出 <eos> 的生成区位置（-1 = 没吐）
+    <eos> 解码为空串，字符串层检测不到，必须在 token 级看。
     """
     idx = tok.encode(prompt).ids
     idx = torch.tensor([idx], dtype=torch.long)
-    new_start = idx.shape[1]          # 生成区起点（截断/裁剪只看这里）
-    seen = list(idx[0].tolist())      # 重复惩罚的上下文 = prompt + 已生成
-    eos_id = tok.token_to_id("<eos>") if stop_on_eos else None
-    for _ in range(max_new_tokens):
+    new_start = idx.shape[1]
+    seen = list(idx[0].tolist())
+    eos_id = tok.token_to_id("<eos>")
+    eos_pos = -1
+    for step in range(max_new_tokens):
         idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
         logits, _ = model(idx_cond)
         logits = logits[:, -1, :] / temperature
@@ -90,8 +91,9 @@ def generate(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_pena
         probs = F.softmax(v, dim=-1)
         nxt = torch.multinomial(probs, 1)
         nxt_id = int(nxt.item())
-        if eos_id is not None and nxt_id == eos_id:
-            break                        # EOS：该停了，终止符不输出
+        if stop_on_eos and nxt_id == eos_id:
+            eos_pos = step            # 模型自己说"完了"：记录并停（EOS 不进输出）
+            break
         seen.append(nxt_id)
         idx = torch.cat((idx, nxt.unsqueeze(0)), dim=1)
         if stop_on_turn:
@@ -100,20 +102,37 @@ def generate(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_pena
             if hit:
                 keep = torch.tensor([truncated], dtype=torch.long)
                 idx = torch.cat([idx[:, :new_start], keep], dim=1)
+                if eos_pos == -1:
+                    eos_pos = step + 1    # 轮次截断 = 模型自然收尾的中止点
                 break
-    gen_ids = idx[0][new_start:].tolist()
+    gen = idx[0].tolist()
     if clip_at_sentence:
+        gen_ids = gen[new_start:]
         text = tok.decode(gen_ids).rstrip()
         if text and text[-1] not in "。！？…!?~～":
             pos = max(text.rfind(c) for c in "。！？…!?~～")
             if pos >= 0:
                 for k in range(len(gen_ids) + 1):
-                    if len(tok.decode(gen_ids[:k])) > pos:   # 覆盖到终止符为止
-                        gen_ids = gen_ids[:k]
+                    if len(tok.decode(gen_ids[:k])) > pos:
+                        gen = gen[:new_start] + gen_ids[:k]
                         break
-        idx = torch.cat([idx[:, :new_start],
-                         torch.tensor([gen_ids], dtype=torch.long)], dim=1)
-    return tok.decode(idx[0].tolist())
+    # 未开 stop_on_eos 时也找 EOS：模型吐了终止符 → 记录位置并截断
+    if eos_pos == -1:
+        for i, t in enumerate(gen[new_start:]):
+            if t == eos_id:
+                eos_pos = i
+                gen = gen[:new_start + i]   # EOS 及其后不输出
+                break
+    return gen, eos_pos
+
+
+@torch.no_grad()
+def generate(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_penalty,
+             stop_on_turn=False, stop_on_eos=False, clip_at_sentence=False):
+    """生成（返回 prompt + 生成全文，保持旧接口）。轴钮语义见 generate_ids。"""
+    ids, _ = generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k,
+                          repeat_penalty, stop_on_turn, stop_on_eos, clip_at_sentence)
+    return tok.decode(ids)
 
 
 def main():
