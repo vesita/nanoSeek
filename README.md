@@ -61,7 +61,7 @@ nanoSeek 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 - 命令行覆盖：`uv run python train.py config/xxx.yaml --n_layer=4`
 - 配置值带类型检查，写错类型直接报错（比如 YAML 里 `1e-3` 会被解析成字符串，会立即被拦下）
 
-**默认 small 模型**：6 层 / 80 维 / 8000 词表 + MoE(4×2) + 共享专家 + MTP + Attention Sinks + mHC + QK-Norm + Z-Loss + turn-level EOS 数据 ≈ **2.85M 参数**（深度换宽度，规模与旧 4×96 持平），RTX 5060 上约 1 分钟一轮训练，适合快速迭代实验。当前默认模型：`out/chinese-data2-eos`（EOS 数据 + 全特性已验证，训练中）。
+**默认 small 模型**：6 层 / 80 维 / 8000 词表 + MoE(4×2) + 共享专家 + MTP + Attention Sinks + mHC + QK-Norm + Z-Loss + turn-level EOS 数据 ≈ **2.85M 参数**（深度换宽度，规模与旧 4×96 持平），RTX 5060 上约 1 分钟一轮训练，适合快速迭代实验。当前默认模型：`out/chinese-data2-eos`（全部 6 份语料 + 全特性已验证，1500 步，val 1.8340）。
 
 **实验基础设施**：
 - 冒烟测试 `inference/scripts/smoke_test.py`：秒级验证模型前向/反向 + 参数量对比

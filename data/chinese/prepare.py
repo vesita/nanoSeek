@@ -4,14 +4,13 @@
 流程：download_dialogue.py 下载对话语料 → train_tokenizer.py 训出 tokenizer.json
 → 本脚本把所有 txt 编码成 token ids，写出 train.bin / val.bin / meta.pkl。
 
-用法（从项目根目录）——默认即「纯对话 + turn-level EOS」正式数据（与默认
+用法（从项目根目录）——默认即「全部数据 + turn-level EOS」（与默认
 train_chinese.yaml 对应）：
     uv run python data/chinese/prepare.py
-    # --task-ratio：非对话(任务/指令)样本保留比例。1.0=全保留；0=剔除（train
-    #   只剩对话，2026-08-12 数据治理用 0）；0.1=留 10%。
-    # --insert-eos：每条「模型：」回复后插 <eos>（turn-level 终止符，2026-08-17，
-    #   让模型学会"话说完→吐 <eos>"，治喋喋不休。默认开启，与 EOS 版数据一致）。
-    正式数据 = --task-ratio 0 --insert-eos（当前默认）。
+    # --task-ratio：非对话(任务/指令)样本保留比例。1.0=全保留（默认，所有 txt 都进训练）；
+    #   0=剔除（train 只剩对话）；0.1=留 10%。
+    # --insert-eos：每条「模型：」回复后插 <eos>（turn-level 终止符，默认开启）。
+    # agent_dialogue.txt 归入 DIALOGUE_FILES，享受 90/10 验证切分。
 """
 import datetime
 import hashlib
@@ -162,8 +161,8 @@ def main():
     ap = argparse.ArgumentParser(description='编码语料为 token ids')
     ap.add_argument('--with-books', action='store_true',
                     help='顺带下载四大名著补充语料（默认只用手头已有的 txt）')
-    ap.add_argument('--task-ratio', type=float, default=0.0,
-                    help='非对话(任务/指令)样本保留比例：0=剔除(默认,纯对话)，1.0=全保留(旧现状)，0.1=留10%')
+    ap.add_argument('--task-ratio', type=float, default=1.0,
+                    help='非对话(任务/指令)样本保留比例：1.0=全保留(默认,所有数据)，0=剔除，0.1=留10%')
     ap.add_argument('--insert-eos', action='store_true', default=True,
                     help='每条 模型： 回复后插入 <eos>（turn-level 终止符，治喋喋不休，默认开启）')
     ap.add_argument('--no-insert-eos', action='store_true',
@@ -171,7 +170,6 @@ def main():
     args = ap.parse_args()
     if args.no_insert_eos:
         args.insert_eos = False
-    args = ap.parse_args()
 
     # 1) 可选：补齐四大名著（次要语料，网络不稳时默认跳过）
     if args.with_books:
@@ -192,12 +190,13 @@ def main():
     #    策略（用户 2026-08-11）：val 只验证"对话"（核心目标），train 学全面。
     #    对话类文件（闲聊/多轮）单独 90/10 切：对话 90% 进 train、10% 进 val；
     #    非对话类文件（单轮指令/逻辑/古风）全部进 train，不参与 val。
-    DIALOGUE_FILES = {'dailychat_dialogue.txt', 'muice_dialogue.txt', 'multi_turn_dialogue.txt'}
+    DIALOGUE_FILES = {'dailychat_dialogue.txt', 'muice_dialogue.txt', 'multi_turn_dialogue.txt',
+                       'agent_dialogue.txt'}
     train_samples, val_samples = [], []
     for fn in sorted(os.listdir(DATA_DIR)):
         if not fn.endswith('.txt'):
             continue
-        with open(os.path.join(DATA_DIR, fn), 'r', encoding='utf-8') as f:
+        with open(os.path.join(DATA_DIR, fn), 'r', encoding='utf-8', errors='replace') as f:
             text = f.read()
         blocks = [b.strip() for b in text.split('\n\n') if b.strip()]
         if fn in DIALOGUE_FILES:
