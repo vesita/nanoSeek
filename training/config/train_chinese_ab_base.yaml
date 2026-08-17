@@ -1,0 +1,8 @@
+# A/B 对照组：当前默认架构（无 QK-Norm / Router Z-Loss），训练 1500 步。
+# 继承正式配置，仅关早停、缩短到 1500 步。
+extends: train_chinese.yaml
+
+out_dir: out/chinese-data2-ab-base
+enable_early_stop: false
+wandb_run_name: ab-base-1500
+max_iters: 1500

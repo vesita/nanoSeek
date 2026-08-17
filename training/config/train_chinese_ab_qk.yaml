@@ -1,0 +1,9 @@
+# A/B 实验组：只开 QK-Norm（L2 归一化 q/k + 每头可学习 scale），训练 1500 步。
+# 与 ab_base 的唯一差异：use_qk_norm=true（z_loss 保持关闭）。
+extends: train_chinese.yaml
+
+out_dir: out/chinese-data2-ab-qk
+enable_early_stop: false
+wandb_run_name: ab-qk-1500
+max_iters: 1500
+use_qk_norm: true

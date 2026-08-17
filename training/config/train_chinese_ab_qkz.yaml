@@ -1,0 +1,10 @@
+# A/B 实验组：QK-Norm + Router Z-Loss，训练 1500 步。
+# 只比 base 多开两个近零参数稳定性开关。
+extends: train_chinese.yaml
+
+out_dir: out/chinese-data2-ab-qkz
+enable_early_stop: false
+wandb_run_name: ab-qkz-1500
+max_iters: 1500
+use_qk_norm: true
+z_loss_weight: 0.0001

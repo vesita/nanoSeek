@@ -126,6 +126,8 @@ no_attn_layers = []          # 稀疏注意力布线：跳过注意力的层索�
 n_memory_tokens = 0          # 显式记忆 token：序列前插入 K 个可学习嵌入（0=关闭，实验性）
 use_lse_residual = False     # 对数放缩残差：对数域 soft-max 合并替代线性相加（零参数，实验性）
 use_lse_gate = False         # 对数放缩门控混合：α·x+(1-α)·LSE(x,F)，α 可学习（每层标量）
+use_qk_norm = False          # QK-Norm：q/k L2 归一化 + 每头可学习 scale（近零参数，压重复坍缩）
+z_loss_weight = 0.0          # Router Z-Loss 权重；0 = 关闭，建议 1e-4 起步
 # adamw 优化器
 learning_rate = 1e-3 # 最大学习率
 max_iters = 5000 # 训练总迭代次数
@@ -253,7 +255,9 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   block_order=block_order, no_attn_layers=no_attn_layers,
                   n_memory_tokens=n_memory_tokens,
                   use_lse_residual=use_lse_residual,
-                  use_lse_gate=use_lse_gate)
+                  use_lse_gate=use_lse_gate,
+                    use_qk_norm=use_qk_norm,
+                    z_loss_weight=z_loss_weight)
 
 def _build_model_from_checkpoint(checkpoint):
     """按 checkpoint 里的 model_args 构建模型并加载权重（供 resume / 后训练复用）。"""
@@ -273,7 +277,8 @@ def _build_model_from_checkpoint(checkpoint):
               'use_hca', 'use_csa_learnable',
               'use_attn_sink', 'use_mhc', 'hc_mult',
               'use_lightning_indexer', 'num_hash_layers', 'block_order', 'no_attn_layers',
-              'n_memory_tokens', 'use_lse_residual', 'use_lse_gate']:
+              'n_memory_tokens', 'use_lse_residual', 'use_lse_gate',
+               'use_qk_norm', 'z_loss_weight']:
         model_args[k] = checkpoint_model_args.get(k, model_args[k])
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)

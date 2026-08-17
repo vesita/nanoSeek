@@ -113,6 +113,11 @@ class CausalSelfAttention(nn.Module):
         # RoPE 只作用于每个 head 的前 qk_rope_head_dim 维，其余是"无位置"的内容维。
         self.use_mla = config.use_mla
         self.use_csa = config.use_csa
+        # QK-Norm：对 q/k 做 L2 归一化 + 每头可学习 scale。
+        # scale 初始 = sqrt(head_dim)，forward 里再乘 1/sqrt(head_dim)，起点等价于原始 q·k/d。
+        self.use_qk_norm = config.use_qk_norm
+        if self.use_qk_norm:
+            self.qk_scale = nn.Parameter(torch.full((config.n_head,), self.head_dim ** 0.5))
         self.rope_head_dim = config.qk_rope_head_dim if (config.use_mla or config.use_csa) else (config.n_embd // config.n_head)
         if config.use_csa:
             # CSA/HCA 的独立 Q/K/V 投影（与 MLA 的 KV 压缩路径分开，更直白）。
@@ -159,15 +164,28 @@ class CausalSelfAttention(nn.Module):
             max_len = config.block_size + config.n_memory_tokens
             self.register_buffer("bias", torch.tril(torch.ones(max_len, max_len))
                                         .view(1, 1, max_len, max_len))
-        # 用 RoPE 的话，预计算 cos/sin 表并注册成 buffer（随模型移动设备、进 checkpoint）
+        # 用 RoPE 的话，预计算 cos/sin 表并注册成 buffer（随模型移动设备、进 checkpoint）。
+        # MLA 只旋转每头的前 qk_rope_head_dim 维，表长和 rope_head_dim 一致。
+        # 记忆 token 前缀会让有效序列长到 block_size+K，表要扩到 block_size+n_memory_tokens。
+        # n_memory_tokens=0 时表长不变 → 老 checkpoint 的 cos/sin buffer 形状零变化，兼容不破。
         if self.use_rope:
-            # MLA 只旋转每头的前 qk_rope_head_dim 维，表长和 rope_head_dim 一致。
-            # 记忆 token 前缀会让有效序列长到 block_size+K，表要扩到 block_size+n_memory_tokens。
-            # n_memory_tokens=0 时表长不变 → 老 checkpoint 的 cos/sin buffer 形状零变化，兼容不破。
             max_len = config.block_size + config.n_memory_tokens
             cos, sin = precompute_rope_freqs(self.rope_head_dim, max_len, config.rope_theta)
             self.register_buffer("cos", cos)  # (max_len, rope_head_dim)
-            self.register_buffer("sin", sin)
+            self.register_buffer("sin", sin)  # (max_len, rope_head_dim)
+
+        # QK-Norm：q/k 分别是 (B, T, nh, d)；返回归一化后的 q/k（保留 head 维）。
+        # 只对参与点积的 q/k 做，v 不做。
+        # 语义：q = normalize(q) * qk_scale，k = normalize(k)。qk_scale 初始 = sqrt(head_dim)，
+        # 等价于原始 q·k/sqrt(d) 的按头缩放；开启后不再额外除 sqrt(d)。
+    def _apply_qk_norm(self, q, k):
+        if not self.use_qk_norm:
+            return q, k
+        # scale: (nh,)，按 head 广播到 (B,T,nh,d)
+        scale = self.qk_scale.view(1, 1, -1, 1)
+        q = F.normalize(q, dim=-1) * scale
+        k = F.normalize(k, dim=-1)
+        return q, k
 
     def forward(self, x):
         B, T, C = x.size() # batch 大小、序列长度、嵌入维度 (n_embd)
@@ -184,6 +202,8 @@ class CausalSelfAttention(nn.Module):
             kv_latent = self.kv_act(self.kv_down(x))          # (B, T, kv_lora_rank)
             k = self.k_up(kv_latent).view(B, T, self.n_head, self.head_dim)
             v = self.v_up(kv_latent).view(B, T, self.n_head, self.head_dim)
+            if self.use_qk_norm:
+                q, k = self._apply_qk_norm(q, k)  # RoPE 是范数保持的旋转，前后顺序等价
             if self.use_rope:
                 # 部分 RoPE：每头只有前 rope_head_dim 维参与旋转，剩余是"无位置"内容维。
                 # 让模型自己决定每个 head 需要多少位置信息（都能从同一 low-rank 潜在表达还原）
@@ -199,6 +219,8 @@ class CausalSelfAttention(nn.Module):
             q = q.view(B, T, self.n_head, self.head_dim)
             k = k.view(B, T, self.n_head, self.head_dim)
             v = v.view(B, T, self.n_head, self.head_dim)
+            if self.use_qk_norm:
+                q, k = self._apply_qk_norm(q, k)  # RoPE 是范数保持的旋转，前后顺序等价
 
             if self.use_rope:
                 # 旋转位置编码：只对 q 和 k 做（v 不旋转），这样 q·k 携带相对位置
@@ -210,12 +232,21 @@ class CausalSelfAttention(nn.Module):
         v = v.transpose(1, 2)
 
         # 因果自注意力；自注意力：(B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # QK-Norm 时 q 已自带 qk_scale（初始 = sqrt(d)），scale 必须传 1.0：
+        # 若传 None/省略，SDPA 会按默认 1/sqrt(head_dim) 再除一次，与下方手动路径
+        # （use_qk_norm 时不再除 sqrt(d)）不一致——flash 开/关会得到不同 logits。
+        attn_scale = 1.0 if self.use_qk_norm else 1.0 / math.sqrt(k.size(-1))
         if self.flash:
-            # 使用 Flash Attention CUDA 内核的高效 attention
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            # 使用 Flash Attention CUDA 内核的高效 attention。
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=None,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=True, scale=attn_scale)
         else:
             # 手动实现 attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = q @ k.transpose(-2, -1)
+            if not self.use_qk_norm:
+                att = att * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             if self.use_attn_sink:
                 # Attention Sink：追加一列 sink[h]（value 用零向量占位）。
@@ -257,6 +288,8 @@ class CausalSelfAttention(nn.Module):
         q = self.q_proj_csa(x).view(B, T, nh, d)
         k = self.k_proj_csa(x).view(B, T, nh, d)
         v = self.v_proj_csa(x).view(B, T, nh, d)
+        if self.use_qk_norm:
+            q, k = self._apply_qk_norm(q, k)  # RoPE 是范数保持的旋转，前后顺序等价
 
         if self.use_rope:
             # 部分 RoPE：只旋转前 rope_head_dim 维（与 MLA 一致）
@@ -288,7 +321,9 @@ class CausalSelfAttention(nn.Module):
             bq = torch.arange(T, device=x.device) // m                # 每个 query 属于哪个块
             causal_block = bq.unsqueeze(-1) > torch.arange(nb, device=x.device)  # (T, nb)
             has_prior = causal_block.any(dim=-1)                      # (T,) 该 query 有没有历史块
-            s_blk = torch.einsum('bthd,bnhd->bthn', q, k_blocks) / math.sqrt(d)  # (B,T,nh,nb)
+            s_blk = torch.einsum('bthd,bnhd->bthn', q, k_blocks)
+            if not self.use_qk_norm:
+                s_blk = s_blk / math.sqrt(d)  # (B,T,nh,nb)
             s_blk = s_blk.masked_fill(~causal_block.unsqueeze(0).unsqueeze(2), float('-inf'))
 
             if self.config.use_lightning_indexer:
@@ -345,7 +380,9 @@ class CausalSelfAttention(nn.Module):
         win = min(win, T)
         i = torch.arange(T, device=x.device)
         win_causal = (i.unsqueeze(-1) <= i.unsqueeze(0)) & (i.unsqueeze(0) - i.unsqueeze(-1) <= win)
-        s_win = torch.einsum('bthd,bjhd->bthj', q, k) / math.sqrt(d)  # (B,T,nh,T)
+        s_win = torch.einsum('bthd,bjhd->bthj', q, k)
+        if not self.use_qk_norm:
+            s_win = s_win / math.sqrt(d)  # (B,T,nh,T)
         s_win = s_win.masked_fill(~win_causal.unsqueeze(0).unsqueeze(2), float('-inf'))
         v_win = v
         if self.use_attn_sink:
@@ -434,6 +471,7 @@ class MoE(nn.Module):
         self.n_experts = config.n_experts
         self.n_top_k = config.n_top_k
         self.moe_aux_weight = config.moe_aux_weight
+        self.router_z_loss_weight = config.z_loss_weight
         self.use_shared_expert = config.use_shared_expert
         self.use_aux_free_balance = config.use_aux_free_balance
         self.use_sqrtsoftplus = config.use_sqrtsoftplus
@@ -451,6 +489,7 @@ class MoE(nn.Module):
             self.shared_expert = SwiGLU(config)
         # 本次前向累积的辅助损失，forward 后由 GPT 取走并清零
         self.aux_loss = torch.tensor(0.0)
+        self.z_loss = torch.tensor(0.0)
         if self.use_aux_free_balance:
             # aux-free 偏置修正：每个专家一个 bias，加到路由 logits 上影响 top-k 选择。
             # 不参与梯度（requires_grad=False），每步根据负载偏差用 balance_factor 更新，
@@ -475,6 +514,7 @@ class MoE(nn.Module):
             ], dim=-1)  # (N, k)
             top_k_probs = x_flat.new_full((N, self.n_top_k), 1.0 / self.n_top_k)  # 均匀权重
             self.aux_loss = torch.tensor(0.0, device=x_flat.device, dtype=x_flat.dtype)
+            self.z_loss = torch.tensor(0.0, device=x_flat.device, dtype=x_flat.dtype)
             # 跳过负载均衡：哈希本身均匀分配，天然均衡
         else:
             # 路由打分：给每个 token 在每个专家上打一个分
@@ -482,6 +522,13 @@ class MoE(nn.Module):
             # aux-free 偏置修正：bias 加到 logits 上影响 top-k 选择（bias 不参与梯度）
             if self.use_aux_free_balance:
                 router_logits = router_logits + self.router_bias
+            # Router Z-Loss：惩罚 logsumexp(router_logits) 的平方，防止路由 logits 过大。
+            if self.router_z_loss_weight > 0:
+                self.z_loss = self.router_z_loss_weight * (
+                    torch.logsumexp(router_logits, dim=-1).square().mean()
+                )
+            else:
+                self.z_loss = torch.tensor(0.0, device=router_logits.device, dtype=router_logits.dtype)
             # 软概率：Switch aux loss 用（aux-free 模式下不参与损失）
             router_probs = F.softmax(router_logits, dim=-1)   # (N, n_experts)
             if self.use_sqrtsoftplus:
@@ -525,9 +572,10 @@ class MoE(nn.Module):
         return output.view(B, T, C)
 
     def get_aux_loss(self):
-        """取出本次前向累积的辅助损失并清零。"""
-        loss = self.aux_loss
+        """取出本次前向累积的辅助损失（负载均衡 + Router Z-Loss）并清零。"""
+        loss = self.aux_loss + self.z_loss
         self.aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+        self.z_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
         return loss
 
 class Block(nn.Module):
@@ -901,6 +949,17 @@ class GPTConfig:
     # 模型自己权衡每条残差路径的软硬程度。每层 1 个标量，参数量极小（6 层 = 6 参数）。
     # 与 mHC 不互斥（gate-mix 是标准单流残差内部混合，非 mHC 那种 4 流拓扑）。
     use_lse_gate: bool = False
+    # --- 注意力稳定性：QK-Norm（零/近零参数）---
+    # 对 q/k 做 L2 归一化 + 每头可学习 scale，再乘 1/sqrt(head_dim)。
+    # 目标：把注意力 logits 的尺度拉平，压制「过度自信 → 重复坍缩」，对标准注意力、
+    # CSA、MLA 都生效。scale 初始 = sqrt(head_dim)，前向等价于原始 `q·k/sqrt(d)`
+    # 的按头缩放，不会改变起点快照。
+    use_qk_norm: bool = False
+    # --- MoE 稳定性：Router Z-Loss ---
+    # DeepSeek 系列用于稳定 MoE 路由的辅助正则：z = logsumexp(router_logits)，
+    # 惩罚 z² 的平均，防止路由 logits 数值过大导致训练波动 / 专家崩溃。
+    # 权重 0 = 关闭；建议从 1e-4 起步。
+    z_loss_weight: float = 0.0
 
 class GPT(nn.Module):
 
