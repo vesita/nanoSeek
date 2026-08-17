@@ -1,0 +1,7 @@
+# 拓扑实验 A（fa 臂）：ffn_attn —— 块内子层顺序对调。
+# 继承主配置，仅差异：block_order=ffn_attn + out_dir/run_name。
+extends: train_chinese.yaml
+
+out_dir: out/chinese-data2-fa
+wandb_run_name: csa-v4-fa
+block_order: ffn_attn

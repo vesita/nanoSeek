@@ -22,7 +22,9 @@ import sys
 import time
 import math
 import pickle
+import random
 import threading
+import hashlib
 from contextlib import nullcontext
 
 # 脚本在 training/ 子目录，Python 默认不会把项目根目录加进模块搜索路径。
@@ -67,6 +69,11 @@ tensorboard_log = False
 # 数据
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1 # 用于模拟更大的 batch size
+# 生成自蒸馏（方向 1，Expert Iteration 轻量版）——预算中性混合：
+# distill_bin 非空时，train 的每个 batch 以概率 p_distill 从蒸馏数据切块（其余从 train.bin 切）。
+# 总 token 量不变，唯一变量 = 训练预算里蒸馏样本的占比。生成脚本见 training/self_distill.py。
+distill_bin = ''   # 空 = 关闭；非空 = 蒸馏数据路径（如 data/chinese/distill.bin）
+p_distill = 0.0    # 训练预算里蒸馏样本占比（0~1）
 batch_size = 64 # 如果 gradient_accumulation_steps > 1，这是微批（micro-batch）大小
 block_size = 256
 # 模型（small）
@@ -114,6 +121,11 @@ use_mhc = False              # mHC 超连接：4 流并行残差
 hc_mult = 4                  # mHC 残差流数（V4 原版 = 4）
 use_lightning_indexer = False   # 学习型块选择替代 CSA raw top-k
 num_hash_layers = 0          # 前 N 层用 hash 路由（0 = 禁用）
+block_order = "attn_ffn"     # 计算图重排：块内子层顺序（attn_ffn | ffn_attn）
+no_attn_layers = []          # 稀疏注意力布线：跳过注意力的层索引（0-based，空=所有层都有）
+n_memory_tokens = 0          # 显式记忆 token：序列前插入 K 个可学习嵌入（0=关闭，实验性）
+use_lse_residual = False     # 对数放缩残差：对数域 soft-max 合并替代线性相加（零参数，实验性）
+use_lse_gate = False         # 对数放缩门控混合：α·x+(1-α)·LSE(x,F)，α 可学习（每层标量）
 # adamw 优化器
 learning_rate = 1e-3 # 最大学习率
 max_iters = 5000 # 训练总迭代次数
@@ -173,6 +185,15 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # 简易数据加载器
 data_dir = os.path.join('data', dataset)
 
+# 数据溯源：记录 data/<dataset>/manifest.json 的哈希，方便追查“这个模型用的哪版数据”
+data_manifest_path = os.path.join(data_dir, 'manifest.json')
+if os.path.exists(data_manifest_path):
+    try:
+        with open(data_manifest_path, 'rb') as _f:
+            config['data_manifest_sha256'] = hashlib.sha256(_f.read()).hexdigest()
+    except OSError as _e:
+        print(f'warning: 读取数据清单 {data_manifest_path} 失败：{_e}')
+
 # 每个 epoch 的步数（YOLO 式进度条显示轮次用）
 try:
     _train_tokens = os.path.getsize(os.path.join(data_dir, 'train.bin')) // 2  # uint16
@@ -184,9 +205,15 @@ def get_batch(split):
     # 我们每个 batch 都重新创建 np.memmap，以避免内存泄漏，参见
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        # 预算中性混合：以概率 p_distill 从蒸馏数据切块；distill.bin 太短（< 2*block_size
+        # 个字节，即不足一个窗口）时退回 train.bin，避免 randint 越界。
+        use_distill = (distill_bin and p_distill > 0 and random.random() < p_distill
+                       and os.path.exists(distill_bin)
+                       and os.path.getsize(distill_bin) > 2 * block_size)
+        path = distill_bin if use_distill else os.path.join(data_dir, 'train.bin')
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        path = os.path.join(data_dir, 'val.bin')
+    data = np.memmap(path, dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
@@ -222,7 +249,11 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_csa=use_csa, csa_compress=csa_compress, csa_topk=csa_topk,
                   csa_window=csa_window, use_hca=use_hca, use_csa_learnable=use_csa_learnable,
                   use_attn_sink=use_attn_sink, use_mhc=use_mhc, hc_mult=hc_mult,
-                  use_lightning_indexer=use_lightning_indexer, num_hash_layers=num_hash_layers)
+                  use_lightning_indexer=use_lightning_indexer, num_hash_layers=num_hash_layers,
+                  block_order=block_order, no_attn_layers=no_attn_layers,
+                  n_memory_tokens=n_memory_tokens,
+                  use_lse_residual=use_lse_residual,
+                  use_lse_gate=use_lse_gate)
 
 def _build_model_from_checkpoint(checkpoint):
     """按 checkpoint 里的 model_args 构建模型并加载权重（供 resume / 后训练复用）。"""
@@ -241,7 +272,8 @@ def _build_model_from_checkpoint(checkpoint):
               'use_csa', 'csa_compress', 'csa_topk', 'csa_window',
               'use_hca', 'use_csa_learnable',
               'use_attn_sink', 'use_mhc', 'hc_mult',
-              'use_lightning_indexer', 'num_hash_layers']:
+              'use_lightning_indexer', 'num_hash_layers', 'block_order', 'no_attn_layers',
+              'n_memory_tokens', 'use_lse_residual', 'use_lse_gate']:
         model_args[k] = checkpoint_model_args.get(k, model_args[k])
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -536,7 +568,8 @@ while True:
             results_csv.flush()  # 及时落盘：训练中断也能读到已写出的部分
         if iter_num > 0:
             # YOLO 式：last.pt 每次评估都存（最新状态），best.pt 只在 val 变优时存
-            is_best = losses['val'] < best_val_loss
+            prev_best = best_val_loss                 # 保存本次评估前的 best，早停判断用（修复，见下）
+            is_best = losses['val'] < prev_best
             if is_best:
                 best_val_loss = losses['val']
             checkpoint = {
@@ -555,8 +588,10 @@ while True:
             # 早停：val 连续 patience 次评估无实质改善 → 提前终止。
             # 改善判定用 min_val_improve 阈值（严格低于才重置计数），避免微小抖动干扰。
             # 注意 is_best 是"比历史 best 低"即算，这里要"比 best 低出 min_val_improve"才算实质改善。
+            # 修复（2026-08-12，dev-notes/22）：必须用 prev_best（本次评估前的 best）判断，
+            # 用更新后的 best_val_loss 时每次创新低两者相等，永远判"无改善"，patience 次即误停。
             if enable_early_stop and iter_num >= min_iters:
-                if losses['val'] < best_val_loss - min_val_improve:
+                if losses['val'] < prev_best - min_val_improve:
                     no_improve_count = 0  # 有实质改善，重置计数
                 else:
                     no_improve_count += 1

@@ -51,6 +51,22 @@ CASES = [
     ("mHC+CSA", dict(use_mhc=True, hc_mult=4, use_csa=True, csa_compress=16, csa_topk=2, csa_window=32, use_hca=True)),
     ("LightIndex", dict(use_csa=True, csa_compress=16, csa_topk=2, csa_window=32, use_lightning_indexer=True)),
     ("Hash路由", dict(use_moe=True, n_experts=4, n_top_k=2, num_hash_layers=1)),
+    # --- 计算图重排（拓扑实验 A）---
+    ("ffn_attn", dict(block_order="ffn_attn")),
+    ("ffn_attn+mHC", dict(block_order="ffn_attn", use_mhc=True, hc_mult=4)),
+    # --- 稀疏注意力布线（拓扑实验 B）---
+    ("稀疏布线", dict(no_attn_layers=[0, 2, 4])),
+    ("稀疏布线+mHC", dict(no_attn_layers=[0, 2, 4], use_mhc=True, hc_mult=4)),
+    # --- 显式记忆 token（拓扑实验 C）---
+    ("记忆token", dict(n_memory_tokens=16)),
+    ("记忆token+mHC", dict(n_memory_tokens=16, use_mhc=True, hc_mult=4)),
+    # --- 对数放缩残差（LSE 数值连接实验）---
+    ("LSE残差", dict(use_lse_residual=True)),
+    ("LSE残差+CSA", dict(use_lse_residual=True, use_csa=True, csa_compress=16, csa_topk=2, csa_window=32)),
+    # --- 对数放缩门控混合（LSE gate-mix v2）---
+    ("LSE门控", dict(use_lse_gate=True)),
+    ("LSE门控+CSA", dict(use_lse_gate=True, use_csa=True, csa_compress=16, csa_topk=2, csa_window=32)),
+    ("LSE门控+mHC", dict(use_lse_gate=True, use_mhc=True, hc_mult=4)),
     ("全特性", dict(use_mhc=True, hc_mult=4, use_attn_sink=True,
                     use_moe=True, n_experts=4, n_top_k=2, use_shared_expert=True,
                     use_aux_free_balance=True, num_hash_layers=1,
@@ -109,6 +125,58 @@ with torch.no_grad():
 print(f"极端输入下：开钳制 |out| max = {out_clamped:.3f}，关钳制 = {out_unclamped:.3f}")
 assert out_unclamped > 10.0, "对照组输出太小，测试没有意义（输入不够极端）"
 assert out_clamped < out_unclamped / 10, "SwiGLU Clamp 没有有效压制极端输出！"
+
+# 验证对数放缩门控混合（LSE gate-mix v2）：α=sigmoid(raw_gate) 初始 0.5、可学习、且
+# 在 α=0（纯 LSE）时退化为有界残差。构造 Block 直接检查 gate 参数与梯度。
+gate_model = make_model(use_lse_gate=True)
+gate_blocks = [b for b in gate_model.transformer.h]
+assert all(hasattr(b, "raw_gate") for b in gate_blocks), "gate-mix 的每个 Block 应有 raw_gate！"
+alpha0 = torch.sigmoid(gate_blocks[0].raw_gate).item()
+print(f"LSE 门控初始 α = {alpha0:.3f}（应 = 0.5，线性/LSE 均衡起点）")
+assert abs(alpha0 - 0.5) < 1e-4, "raw_gate 初始 0 → sigmoid ≈ 0.5"
+# 可学习：训练几步后 raw_gate 应有梯度且能更新
+opt = gate_model.configure_optimizers(weight_decay=0.1, learning_rate=1e-2, betas=(0.9, 0.99), device_type='cpu')
+gx = torch.randint(0, 65, (4, 64)); gy = torch.randint(0, 65, (4, 64))
+for _ in range(5):
+    opt.zero_grad(); _, l = gate_model(gx, gy); l.backward(); opt.step()
+assert all(b.raw_gate.grad is not None and not torch.isnan(b.raw_gate.grad).any() for b in gate_blocks), \
+    "raw_gate 应有干净梯度！"
+at = torch.sigmoid(gate_blocks[0].raw_gate).item()
+print(f"训练 5 步后 α 更新到 {at:.3f}（≠0.5，确实在学）")
+assert abs(at - 0.5) > 1e-6, "raw_gate 未通过训练更新，α 应发生移动"
+# 与 mHC 兼容、与纯 v1 残差互斥
+assert make_model(use_lse_gate=True, use_mhc=True), "gate-mix 应与 mHC 共存"
+try:
+    make_model(use_lse_residual=True, use_lse_gate=True)
+    raise SystemExit("应触发 v1/v2 互斥断言")
+except AssertionError:
+    pass
+print("LSE 门控：α 可学习且与 mHC 兼容、与纯 v1 互斥 ✅")
+
+# 验证对数放缩残差（LSE）：有界收缩 + 软选择偏置 + 数值稳定（负输入不溢出）
+from model import logsumexp_residual
+big_a = torch.randn(4, 16, 80) * 100          # 极端大的输入
+big_b = torch.randn(4, 16, 80) * 100
+out_lse = logsumexp_residual(big_a, big_b)
+# 性质 1（有界）：|LSE - max(a,b)| ≤ log2，且 LSE 远小于线性相加的极端值
+bound_err = (out_lse - torch.maximum(big_a, big_b)).abs().max().item()
+add_max = (big_a + big_b).abs().max().item()
+print(f"LSE 残差：|LSE - max| max = {bound_err:.3f}（应 ≤ log2≈0.693）| "
+      f"LSE max = {out_lse.abs().max().item():.3f} vs 线性相加 max = {add_max:.3f}")
+assert bound_err <= 0.693 + 1e-4, "LSE 残差超出 soft-max 上界（max+log2），有界性失效！"
+assert out_lse.abs().max().item() < add_max, "LSE 残差没有抑制极端值（应比线性相加温和）"
+# 性质 2（软选择）：当一分支远大于另一支时，输出 ≈ 大分支（不含被抑制分支的贡献）
+a_small = torch.randn(4, 16, 80) * 1.0
+b_neg = torch.full_like(a_small, -1e3)       # 极端负 = exp(·)→0，被完全抑制
+sel = logsumexp_residual(a_small, b_neg)
+print(f"LSE 软选择：大分支主导时 |LSE - a| max = {(sel - a_small).abs().max().item():.4f}（应≈0）")
+assert (sel - a_small).abs().max().item() < 1e-6, "LSE 在大分支主导时应完全抑制被抑制分支！"
+# 性质 3（梯度）：logaddexp 处处可微，残差变小不影响反向传播
+a_g = a_small.clone().requires_grad_(True)
+y_g = logsumexp_residual(a_g, a_small * 0.5)
+y_g.sum().backward()
+assert a_g.grad is not None and not torch.isnan(a_g.grad).any(), "LSE 残差梯度出现 NaN！"
+print("LSE 残差：梯度干净（logaddexp 处处可微）")
 
 # 验证 Muon 优化器：先单测混相 Newton-Schulz 正交化，再端到端训练几步
 from model import Muon, zeropower_via_newtonschulz

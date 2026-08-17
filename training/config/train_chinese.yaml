@@ -56,6 +56,11 @@ use_mhc: true                 # mHC：4 流并行残差（X_{l+1}=B·X_l+C·F(A�
 hc_mult: 4
 # use_lightning_indexer: true  # 学习型块选择替代 CSA raw top-k
 # num_hash_layers: 2           # 前 2 层用 hash 路由
+# 计算图重排（拓扑实验 A）：块内子层顺序。attn_ffn（默认）| ffn_attn。
+# 零参数、零权重名变更，只换执行顺序。ffn_attn 的对照配置见 train_chinese_fa.yaml。
+block_order: attn_ffn
+no_attn_layers: []       # 稀疏注意力布线（拓扑实验 B）：空=所有层都有注意力
+n_memory_tokens: 0       # 显式记忆 token（拓扑实验 C）：0=关闭；对照配置见 train_chinese_mem.yaml
 
 learning_rate: 0.001
 max_iters: 5000

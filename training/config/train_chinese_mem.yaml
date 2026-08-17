@@ -1,0 +1,7 @@
+# 拓扑实验 C（显式记忆 token）：序列前插入 K=16 个可学习嵌入。
+# 继承主配置，仅差异：n_memory_tokens=16 + out_dir/run_name。
+extends: train_chinese.yaml
+
+out_dir: out/chinese-data2-mem
+wandb_run_name: csa-v4-mem
+n_memory_tokens: 16

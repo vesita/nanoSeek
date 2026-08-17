@@ -1,0 +1,10 @@
+# LSE A/B 对照臂 A：线性残差（无 LSE）。
+# 继承主配置；关闭 mHC 与 LSE，训 1500 步。
+extends: train_chinese.yaml
+
+out_dir: out/chinese-data2-lin
+enable_early_stop: false
+wandb_run_name: lin-1500
+use_mhc: false
+use_lse_residual: false
+max_iters: 1500

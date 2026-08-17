@@ -1,0 +1,7 @@
+# 拓扑实验 B2（稀疏注意力 + 补充网络层，规模补回基线）。
+# 继承主配置，仅差异：no_attn_layers=[0,2,4] + out_dir/run_name。
+extends: train_chinese.yaml
+
+out_dir: out/chinese-data2-sparse2
+wandb_run_name: csa-v4-sparse2
+no_attn_layers: [0, 2, 4]

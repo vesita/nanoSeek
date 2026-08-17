@@ -87,6 +87,7 @@ uv run python inference/scripts/smoke_test.py   # 验证环境 + 模型可用
 
 ```
 nanoSeek/
+├── cli.py                     # 统一命令行入口（带默认预设，推荐方式）
 ├── model/                     # 模型核心
 │   ├── __init__.py            # 重导出 GPT / GPTConfig 等
 │   ├── model.py               # GPT 模型（V2/V3/V4 全部架构开关）
@@ -102,7 +103,7 @@ nanoSeek/
 │   ├── runtime/               # Rust 推理框架（candle，CPU 推理 + 对话 REPL）
 │   │   ├── src/               # model.rs / attention.rs / main.rs / tokenizer.rs
 │   │   └── scripts/convert.py # checkpoint → safetensors + tokenizer.json
-│   └── scripts/               # smoke_test.py（冒烟）/ package.py（打包）/ compare_logits.py（对拍）
+│   └── scripts/               # smoke_test.py（冒烟）/ package.py（打包）/ compare_logits.py（对拍）/ archive.py（模型归档）
 ├── data/                      # 数据集脚本（数据文件按需下载，git 忽略）
 │   └── chinese/
 │       ├── prepare.py         # 语料 → train.bin / val.bin
@@ -158,6 +159,51 @@ git add -A && git commit -m "实验：..."
 
 ---
 
+## 统一 CLI（推荐）
+
+项目根目录提供了 `cli.py`，把散落的脚本收敛成一条命令，并内置「默认预设」。大多数日常操作不需要再记长路径：
+
+```sh
+# 训练：默认预设 = 正式中文对话配置 train_chinese.yaml
+uv run python cli.py train
+
+# 快速冒烟训练：几十步秒级验证
+uv run python cli.py train --preset smoke
+
+# 采样：默认加载 out/chinese-data2
+uv run python cli.py sample --prompt "悟空"
+
+# 准备数据（下载 → 分词器 → 编码）
+uv run python cli.py data
+
+# 查看可用的训练预设
+uv run python cli.py presets
+
+# 其他
+uv run python cli.py smoke       # 架构冒烟测试
+uv run python cli.py bench       # 性能基准
+uv run python cli.py eval        # 对话智能度评估
+uv run python cli.py convert     # 转换 → Rust 权重（默认 out/chinese-data2）
+uv run python cli.py package     # 打包独立部署目录
+uv run python cli.py distill     # 生成自蒸馏数据
+uv run python cli.py archive     # 模型归档/索引
+uv run python cli.py selftest    # 快速自检
+```
+
+**模型归档**：`cli.py archive` 会扫描 `out/` 下所有实验目录，读取 `results.csv` / `best.pt`，生成每个实验的 `manifest.json` 和汇总 `out/index.json`，之后用 `cli.py archive` 即可按 val loss / 架构特征快速横向对比。
+
+**数据与发布溯源**：`data/chinese/prepare.py` 会额外生成 `manifest.json`（源文件哈希、切分参数、train/val 统计）；`package.py` 会在 release 目录写 `manifest.json`（来源 checkpoint、git commit、目标平台、架构配置）。
+
+`cli.py` 统一了两种参数风格：`--key value` 和 `--key=value` 都可以用，连字符会自动转成底层脚本的下划线命名（如 `--max-iters 1000` → `--max_iters=1000`）。查看某个子命令帮助：
+
+```sh
+uv run python cli.py train --help
+```
+
+> 底层原有脚本（`training/train.py`、`inference/sample.py` 等）仍然可以直接运行，`cli.py` 只是在前面加了一层更友好的默认值与入口。
+
+---
+
 ## 配置系统
 
 配置文件是 YAML，键对应 `train.py` 里的全局变量：
@@ -176,6 +222,14 @@ learning_rate: 0.001
 - **命令行覆盖**：`--key=value`，值和 `train.py` 默认值类型必须一致。布尔/浮点也能覆盖，比如 `--use_rmsnorm=true --use_rope=true --use_swiglu=true` 就相当于原来的 modern 配置
 - **类型检查**：YAML 里的值会和 `train.py` 全局变量比对类型，不一致立刻报错。比如 PyYAML 把 `1e-3` 解析成字符串，这种坑会被当场抓住
 - **浮点写法注意**：YAML 里写浮点记得带小数点（`0.001` 而不是 `1e-3`），否则会被解析成字符串
+- **配置继承**：子配置用 `extends: train_chinese.yaml`（或 `base:`）继承父配置，只需写差异项。路径相对于当前配置文件所在目录。例如：
+
+```yaml
+# training/config/train_chinese_fa.yaml
+extends: train_chinese.yaml
+out_dir: out/chinese-data2-fa
+block_order: ffn_attn
+```
 
 ---
 
@@ -289,17 +343,19 @@ Rust 端验证方法：用 `--print-logits` / `--dump-logits` 配合 `inference/
 
 ## 常见操作速查
 
-| 操作 | 命令 |
-|------|------|
-| 冒烟测试 | `uv run python inference/scripts/smoke_test.py` |
-| 训练 | `uv run python train.py config/<实验名>.yaml` |
-| 采样 | `uv run python inference/sample.py --out_dir=out/<实验名>` |
-| 部署到 Rust | `uv run python inference/runtime/scripts/convert.py --ckpt out/<实验>/best.pt --dataset chinese` → `cd inference/runtime && cargo run --release -- --prompt "悟空"` |
-| Rust/Python 对拍 | `uv run python inference/scripts/compare_logits.py --ckpt out/<实验>/best.pt`（一条命令：convert→build→双端 dump→diff） |
-| 看 checkpoint 里的配置 | `torch.load('out/xxx/best.pt', weights_only=False)['model_args']` |
-| TensorBoard 对比曲线 | `uv run tensorboard --logdir out/`（需在配置里开 `tensorboard_log: true`） |
-| 提交实验 | `git add -A && git commit -m "..."` |
-| 回退到上个实验 | `git checkout <上一个commit>` |
+| 操作 | 推荐命令（cli.py） | 等价原始命令 |
+|------|---------------------|---------------|
+| 冒烟测试 | `uv run python cli.py smoke` | `uv run python inference/scripts/smoke_test.py` |
+| 快速自检 | `uv run python cli.py selftest` | — |
+| 训练 | `uv run python cli.py train --preset smoke` / `cli.py train` | `uv run python training/train.py training/config/test.yaml` / `.../train_chinese.yaml` |
+| 采样 | `uv run python cli.py sample --prompt "..."` | `uv run python inference/sample.py --out_dir=out/<实验名> --start="..."` |
+| 部署到 Rust | `uv run python cli.py convert` | `uv run python inference/runtime/scripts/convert.py --ckpt out/<实验>/best.pt --dataset chinese` → `cd inference/runtime && cargo run --release -- --prompt "悟空"` |
+| Rust/Python 对拍 | `uv run python cli.py compare --ckpt out/<实验>/best.pt` | `uv run python inference/scripts/compare_logits.py --ckpt out/<实验>/best.pt` |
+| 模型归档/索引 | `uv run python cli.py archive` / `cli.py archive --write` | `uv run python inference/scripts/archive.py` |
+| 看 checkpoint 里的配置 | `torch.load('out/xxx/best.pt', weights_only=False)['model_args']` | |
+| TensorBoard 对比曲线 | `uv run tensorboard --logdir out/`（需在配置里开 `tensorboard_log: true`） | |
+| 提交实验 | `git add -A && git commit -m "..."` | |
+| 回退到上个实验 | `git checkout <上一个commit>` | |
 
 **训练体验**（实验目录只留可读文件：`best.pt` / `results.csv` / `loss_curve.png`）：
 - **`results.csv`**（YOLO 式）：每个评估点一行 `step, train/loss, val/loss, lr, mfu, time`，纯文本、Excel 可直接打开、训练中断也能读到已落盘部分

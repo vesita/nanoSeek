@@ -10,6 +10,7 @@ from .model import (
     Muon,
     zeropower_via_newtonschulz,
     sinkhorn_knopp,
+    logsumexp_residual,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "Muon",
     "zeropower_via_newtonschulz",
     "sinkhorn_knopp",
+    "logsumexp_residual",
 ]

@@ -1,0 +1,8 @@
+# 拓扑实验 B1（稀疏注意力布线，冻结废参数版，历史复现记录）。
+# 继承主配置，仅差异：no_attn_layers=[0,2,4] + out_dir/run_name。
+# 注意：当前代码已改为 B2 语义，重跑会得到 B2 行为。
+extends: train_chinese.yaml
+
+out_dir: out/chinese-data2-sparse
+wandb_run_name: csa-v4-sparse
+no_attn_layers: [0, 2, 4]

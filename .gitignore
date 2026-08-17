@@ -12,6 +12,10 @@ data/*/tokenizer.json
 data/*/train.bin
 data/*/val.bin
 data/*/meta.pkl
+data/*/manifest.json
+# 数据备份/中间产物（如 train.bin.bak-*）
+data/*/*.bak*
+*.bak*
 
 # Rust 推理框架转换产物（由 inference/runtime/scripts/convert.py 重新生成）
 inference/runtime/target/

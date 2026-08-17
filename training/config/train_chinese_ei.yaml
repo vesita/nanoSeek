@@ -1,0 +1,8 @@
+# 方向 1：生成自蒸馏（Expert Iteration 轻量版）——预算中性混合训练。
+# 继承主配置，仅差异：distill_bin 指向蒸馏数据 + p_distill=0.2。
+extends: train_chinese.yaml
+
+out_dir: out/chinese-data2-ei
+wandb_run_name: csa-v4-ei
+distill_bin: data/chinese/distill.bin
+p_distill: 0.2

@@ -5,8 +5,13 @@
 → 本脚本把所有 txt 编码成 token ids，写出 train.bin / val.bin / meta.pkl。
 
 用法（从项目根目录）：
-    uv run python data/chinese/prepare.py
+    uv run python data/chinese/prepare.py --task-ratio=0
+    # --task-ratio：非对话(任务/指令)样本保留比例。1.0=全保留(默认/现状)；
+    # 0=剔除（train 只剩对话）；0.1=留 10%。数据治理（2026-08-12）用 0 生成纯对话数据。
 """
+import datetime
+import hashlib
+import json
 import os
 import pickle
 import random
@@ -58,11 +63,70 @@ def encode_to_bin(text, tokenizer, out_path):
             np.array(ids, dtype=np.uint16).tofile(f)
 
 
+def sha256_file(path):
+    """计算文件 SHA-256，用于数据溯源/一致性校验。"""
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write_manifest(args, tokenizer, train_samples, val_samples,
+                   train_data, val_data, meta):
+    """把数据集的来源、切分、哈希等信息写进 manifest.json。
+
+    以后训练 checkpoint 可以记录这个文件的哈希，就能回答“这个模型用的哪版数据”。
+    """
+    manifest = {
+        "dataset": "chinese",
+        "created_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "prepare_args": {
+            "with_books": args.with_books,
+            "task_ratio": args.task_ratio,
+        },
+        "tokenizer": meta,
+        "counts": {
+            "train_samples": len(train_samples),
+            "val_samples": len(val_samples),
+            "train_chars": len(train_data),
+            "val_chars": len(val_data),
+            "train_tokens": os.path.getsize(os.path.join(DATA_DIR, 'train.bin')) // 2,
+            "val_tokens": os.path.getsize(os.path.join(DATA_DIR, 'val.bin')) // 2,
+        },
+        "source_files": [],
+        "artifacts": {},
+    }
+    for fn in sorted(os.listdir(DATA_DIR)):
+        if not fn.endswith('.txt'):
+            continue
+        path = os.path.join(DATA_DIR, fn)
+        manifest["source_files"].append({
+            "file": fn,
+            "size_bytes": os.path.getsize(path),
+            "sha256": sha256_file(path),
+            "mtime": datetime.datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds"),
+        })
+    for name in ('train.bin', 'val.bin', 'tokenizer.json', 'meta.pkl'):
+        path = os.path.join(DATA_DIR, name)
+        if os.path.exists(path):
+            manifest["artifacts"][name] = {
+                "size_bytes": os.path.getsize(path),
+                "sha256": sha256_file(path),
+            }
+    manifest_path = os.path.join(DATA_DIR, 'manifest.json')
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    print(f'数据清单已写入：{manifest_path}')
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description='编码语料为 token ids')
     ap.add_argument('--with-books', action='store_true',
                     help='顺带下载四大名著补充语料（默认只用手头已有的 txt）')
+    ap.add_argument('--task-ratio', type=float, default=1.0,
+                    help='非对话(任务/指令)样本保留比例：1.0=全保留(默认/现状)，0=剔除，0.1=留10%')
     args = ap.parse_args()
 
     # 1) 可选：补齐四大名著（次要语料，网络不稳时默认跳过）
@@ -98,8 +162,18 @@ def main():
             n = int(len(blocks) * 0.9)
             train_samples += blocks[:n]
             val_samples += blocks[n:]
-        else:
-            train_samples += blocks  # 非对话全部进训练，让模型学全面
+        elif args.task_ratio >= 1.0:
+            train_samples += blocks  # 默认：非对话(任务/指令)全部进训练，让模型学全面
+        elif args.task_ratio > 0:
+            # 数据治理（2026-08-12）：任务/指令样本按比例抽样进 train。
+            # 根因：zhuangxialie(149MB 单轮指令)占 train 55%，模型自由生成学成
+            # "碎片拼贴"（对对联/实体识别/热评等任务模板拼贴，dev-notes 见 21）。
+            # 降比例让对话主导；每个文件独立 seed 保证可复现。
+            random.seed(1337 + sum(ord(c) for c in fn))
+            random.shuffle(blocks)
+            n = max(1, int(len(blocks) * args.task_ratio))
+            train_samples += blocks[:n]
+        # task_ratio == 0：任务/指令样本剔除，train 只剩对话
     print(f'训练 {len(train_samples)} 条 / 验证 {len(val_samples)} 条（仅对话）')
     train_data = '\n\n'.join(train_samples)
     val_data = '\n\n'.join(val_samples)
@@ -118,7 +192,9 @@ def main():
     }
     with open(os.path.join(DATA_DIR, 'meta.pkl'), 'wb') as f:
         pickle.dump(meta, f)
-    print('完成 ✅ train.bin / val.bin / meta.pkl 已生成')
+    write_manifest(args, tokenizer, train_samples, val_samples,
+                   train_data, val_data, meta)
+    print('完成 ✅ train.bin / val.bin / meta.pkl / manifest.json 已生成')
 
 
 if __name__ == '__main__':

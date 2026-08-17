@@ -14,6 +14,8 @@ release 目录包含：推理程序 + 模型权重 + 架构配置 + 词表 + 运
     uv run python inference/scripts/package.py --ckpt out/chinese-data2/best.pt --name csa-v1
 """
 import argparse
+import datetime
+import json
 import os
 import shutil
 import subprocess
@@ -46,6 +48,49 @@ def fmt(nbytes):
         if nbytes < 1024 or unit == 'GB':
             return f'{nbytes:.1f} {unit}'
         nbytes /= 1024
+
+
+def git_commit():
+    """返回当前 git 短 commit；不在 git 仓库时返回 None。"""
+    try:
+        return subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'], cwd=ROOT, text=True
+        ).strip() or None
+    except Exception:
+        return None
+
+
+def write_release_manifest(out_dir, ckpt, dataset, target, name):
+    """在 release 目录写 manifest.json，记录来源 checkpoint、commit、架构等。"""
+    manifest = {
+        "name": name,
+        "target": target,
+        "source_ckpt": os.path.relpath(ckpt, ROOT),
+        "dataset": dataset,
+        "git_commit": git_commit(),
+        "created_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "files": [],
+        "model_config": None,
+        "total_size_bytes": dir_size(out_dir),
+    }
+    for fn in sorted(os.listdir(out_dir)):
+        p = os.path.join(out_dir, fn)
+        if os.path.isfile(p):
+            manifest["files"].append({
+                "file": fn,
+                "size_bytes": os.path.getsize(p),
+            })
+    config_path = os.path.join(out_dir, 'model_config.json')
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, encoding='utf-8') as f:
+                manifest["model_config"] = json.load(f)
+        except Exception as e:
+            print(f'⚠ 读取 {config_path} 失败：{e}')
+    manifest_path = os.path.join(out_dir, 'manifest.json')
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    print(f'发布清单已写入：{manifest_path}')
 
 
 def main():
@@ -140,6 +185,8 @@ def main():
                     '#   sh 运行.sh                          # 进入对话 REPL\n')
         os.chmod(run_script, 0o755)
 
+    write_release_manifest(out_dir, ckpt, args.dataset, args.target, name)
+
     # 汇总
     files = [
         (bin_name, '推理程序（CPU，无需 Python/GPU）'),
@@ -147,6 +194,7 @@ def main():
         ('model_config.json', '架构配置'),
         ('tokenizer.json', 'BPE 分词器'),
         (run_name, '启动脚本'),
+        ('manifest.json', '发布清单（来源/commit/架构）'),
     ]
     print(f'\n打包完成 ✅  {out_dir}  （共 {fmt(dir_size(out_dir))}）')
     for fn, desc in files:

@@ -10,11 +10,34 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+# -----------------------------------------------------------------------------
+# 对数放缩残差（log-scaled / log-sum-exp residual，简称 LSE 残差）
+# 普通残差是「线性域相加」：x ← x + F(x)。这里换成「对数域 soft-max 合并」：
+#     LSE(x, F) = log(exp(x) + exp(F)) = max(x, F) + log(1 + exp(-|x - F|))
+# 三个性质让它直接对症「重复坍缩 / loss 骗低 / SwiGLU 数值尖刺」：
+#   1) 数值稳定：logaddexp 对任意实数（含负）都不会溢出，梯度也干净。
+#   2) 有界收缩：LSE ≤ max(x,F) + log2 —— 结果永远压在最强的分支附近，
+#      不像加法那样随层数无限涨大（SwiGLU 的极端值就是线性相加层层放大的）。
+#   3) 软选择偏置：某分支占优时输出≈该分支 + 一个 log 小项，而不是把两条
+#      信号直接相加——模型被迫「选一个主路」而不是「叠加便宜的高频极端 token」。
+# 零参数、纯数值连接改变，规模严格不变 —— 与 block_order / no_attn_layers 同类。
+# 内置一个常数 lse_log2_offset 做「放缩」：=1 即纯 LSE；调大则向加法退化
+# （当 offset 很大时 LSE≈x+F，等价于普通残差，可用作平滑消融）。
+# -----------------------------------------------------------------------------
+
+def logsumexp_residual(x, y):
+    """对数域 soft-max 合并两个残差分支，替代线性相加。
+    x, y: (B, T, C) 任意实数（靠 logaddexp 内部做 max-平移，负值也稳）。
+    返回 LSE(x, y)，有界于 max(x,y)+log2。
+    """
+    m = torch.maximum(x, y)
+    return m + torch.logaddexp(x - m, y - m)
 
 class RMSNorm(nn.Module):
     """RMSNorm：LLaMA / DeepSeek 的标准归一化。
@@ -131,14 +154,19 @@ class CausalSelfAttention(nn.Module):
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("警告：正在使用慢速 attention。Flash Attention 需要 PyTorch >= 2.0")
-            # 因果掩码，确保 attention 只作用于输入序列左侧的位置
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+            # 因果掩码，确保 attention 只作用于输入序列左侧的位置。
+            # 记忆 token 前缀 → 有效长度 block_size+n_memory_tokens，掩码同宽。
+            max_len = config.block_size + config.n_memory_tokens
+            self.register_buffer("bias", torch.tril(torch.ones(max_len, max_len))
+                                        .view(1, 1, max_len, max_len))
         # 用 RoPE 的话，预计算 cos/sin 表并注册成 buffer（随模型移动设备、进 checkpoint）
         if self.use_rope:
-            # MLA 只旋转每头的前 qk_rope_head_dim 维，表长和 rope_head_dim 一致
-            cos, sin = precompute_rope_freqs(self.rope_head_dim, config.block_size, config.rope_theta)
-            self.register_buffer("cos", cos)  # (block_size, rope_head_dim)
+            # MLA 只旋转每头的前 qk_rope_head_dim 维，表长和 rope_head_dim 一致。
+            # 记忆 token 前缀会让有效序列长到 block_size+K，表要扩到 block_size+n_memory_tokens。
+            # n_memory_tokens=0 时表长不变 → 老 checkpoint 的 cos/sin buffer 形状零变化，兼容不破。
+            max_len = config.block_size + config.n_memory_tokens
+            cos, sin = precompute_rope_freqs(self.rope_head_dim, max_len, config.rope_theta)
+            self.register_buffer("cos", cos)  # (max_len, rope_head_dim)
             self.register_buffer("sin", sin)
 
     def forward(self, x):
@@ -370,10 +398,10 @@ class SwiGLU(nn.Module):
     取 h = 8/3·embd 时两者参数量持平 —— 这就是 LLaMA 用 hidden = 8/3·n_embd 的来历。
     """
 
-    def __init__(self, config):
+    def __init__(self, config, hidden_scale=8 / 3):
         super().__init__()
         self.config = config  # 保存 config，forward 里可能要用到钳制等技巧
-        hidden = int(8 * config.n_embd / 3)  # ≈ 2.67·n_embd
+        hidden = int(hidden_scale * config.n_embd)  # 默认 ≈ 2.67·n_embd；hidden_scale=3 时参数量≈注意力层（补注意力槽）
         self.c_fc   = nn.Linear(config.n_embd, hidden, bias=config.bias)  # 值分支
         self.c_fc2  = nn.Linear(config.n_embd, hidden, bias=config.bias)  # 门控分支
         self.c_proj = nn.Linear(hidden, config.n_embd, bias=config.bias)
@@ -508,9 +536,23 @@ class Block(nn.Module):
         super().__init__()
         self.config = config
         self.use_mhc = config.use_mhc
+        # 对数放缩残差 v1：与 mHC 互斥（mHC 已有自己的 4 流残差拓扑，v1 只服务标准路径）。
+        assert not (config.use_mhc and config.use_lse_residual), \
+            "use_lse_residual 与 use_mhc 互斥：LSE 对数域残差 v1 只作用在标准单流路径！"
+        self.use_lse_residual = config.use_lse_residual
+        # 对数放缩门控混合 v2：非 4 流拓扑，与 mHC 不互斥，但 v1 纯残差是它的退化特例。
+        assert not (config.use_lse_residual and config.use_lse_gate), \
+            "use_lse_residual（纯硬替换）与 use_lse_gate（门控混合）只能开一个——gate-mix 已含 v1"
+        self.use_lse_gate = config.use_lse_gate
+        # 稀疏注意力布线：本层是否跳过注意力子层（只跑 FFN）。
+        self.skip_attn = layer_idx in config.no_attn_layers
+        # 稀疏注意力布线：skip 层的注意力槽替换为 FFN（hidden_scale=3 → 57,600 参数 ≈
+        # CausalSelfAttention 57,604，仅差 attn_sink 的 4 参数/层）→ 规模严格补回基线，
+        # 只剩"无注意力"这一个拓扑变量，且所有参数真正参与训练（无冻结废参数）。
+        # 布线从 A F 变 F F（FFN 变换 ×2）。
+        self.attn = SwiGLU(config, hidden_scale=3) if self.skip_attn else CausalSelfAttention(config)
         # 固定架构：RMSNorm + 残差；FFN 用 MoE（可选）或 SwiGLU
         self.ln_1 = RMSNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MoE(config, use_hash=layer_idx < config.num_hash_layers) \
             if config.use_moe else SwiGLU(config)
@@ -529,11 +571,35 @@ class Block(nn.Module):
             # 初始化：A/C 全 0 → sigmoid=0.5（各流等权）；B 全 0 → exp(0)=1 → sinkhorn
             # 后均匀混合（对称起点，不扭曲初始行为）。
 
+        # v2 门控混合：可学习标量 α = sigmoid(raw_gate)，起点 sigmoid(0)=0.5（线性/LSE 均衡）。
+        # 每层一个标量，attn/ffn 两个子层残差共享同一个 α（见 forward 的 res 定义）。
+        if self.use_lse_gate:
+            self.raw_gate = nn.Parameter(torch.zeros(1))
+
     def forward(self, x):
         if self.use_mhc:
             return self._mhc_forward(x)
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        # skip_attn 层的 attn 槽已是宽 FFN（SwiGLU），走同样双子层路径，无特殊分支。
+        # 计算图重排：默认 attn→ffn；block_order="ffn_attn" 时先 FFN 后注意力。
+        # norm 与子层绑定不可拆：attn 永远用 ln_1，mlp 永远用 ln_2，只调换两段顺序。
+        # 残差合并：三种模式
+        #   0) 线性加法           : x + F(x)
+        #   1) 纯 LSE (v1)        : LSE(x, F(x))
+        #   2) 门控混合 (v2)      : α·x + (1-α)·LSE(x, F(x))，α = sigmoid(raw_gate) 可学习
+        # 门控混合保留线性主通道（学力）∩ LSE 分支（抗尖刺/抗过度自信）。
+        if self.use_lse_residual:
+            res = lambda a, b: logsumexp_residual(a, b)
+        elif self.use_lse_gate:
+            alpha = torch.sigmoid(self.raw_gate)
+            res = lambda a, b: alpha * a + (1.0 - alpha) * logsumexp_residual(a, b)
+        else:
+            res = lambda a, b: a + b
+        if self.config.block_order == "ffn_attn":
+            x = res(x, self.mlp(self.ln_2(x)))
+            x = res(x, self.attn(self.ln_1(x)))
+        else:
+            x = res(x, self.attn(self.ln_1(x)))
+            x = res(x, self.mlp(self.ln_2(x)))
         return x
 
     def _mhc_forward(self, x):
@@ -542,29 +608,33 @@ class Block(nn.Module):
         x: (B, T, hc, d)  4 个并行残差流。
         每步：A（1×hc，sigmoid）把 4 流压成 1 流给子层 F；子层只算 1 次；
         C（hc×1，sigmoid）把子层输出展开回 4 流；B（hc×hc，双重随机）混合残差流。
+        默认先注意力后 FFN；block_order="ffn_attn" 时对调。
         """
-        B, T = x.shape[0], x.shape[1]
-        hc, d = self.hc_mult, x.shape[-1]
-
-        # --- 子层 1：注意力 ---
-        A = torch.sigmoid(self.raw_A_attn)                     # (1, hc)
-        h_in = (x * A.view(1, 1, hc, 1)).sum(dim=2)            # (B, T, d)
-        h_out = self.attn(self.ln_1(h_in))                     # (B, T, d) 子层只跑 1 次
-        C = torch.sigmoid(self.raw_C_attn)                     # (hc, 1)
-        delta = h_out.unsqueeze(2) * C.view(1, 1, hc, 1)       # (B, T, hc, d)
-        B_ds = sinkhorn_knopp(F.softplus(self.raw_B_attn))     # (hc, hc) 双重随机
-        x = torch.einsum('bthd,hc->btcd', x, B_ds) + delta     # 残差混合 + 子层增量
-
-        # --- 子层 2：FFN（MoE 或 SwiGLU）---
-        A = torch.sigmoid(self.raw_A_ffn)
-        h_in = (x * A.view(1, 1, hc, 1)).sum(dim=2)
-        h_out = self.mlp(self.ln_2(h_in))
-        C = torch.sigmoid(self.raw_C_ffn)
-        delta = h_out.unsqueeze(2) * C.view(1, 1, hc, 1)
-        B_ds = sinkhorn_knopp(F.softplus(self.raw_B_ffn))
-        x = torch.einsum('bthd,hc->btcd', x, B_ds) + delta
-
+        hc = self.hc_mult
+        # skip_attn 层的 attn 槽已是宽 FFN，is_attn=True 子层照样跑（SwiGLU 变换），
+        # 只是不涉及注意力；两组 A/B/C 都参与训练。
+        if self.config.block_order == "ffn_attn":
+            x = self._mhc_sublayer(x, hc, is_attn=False)  # FFN 先
+            x = self._mhc_sublayer(x, hc, is_attn=True)   # 注意力后
+        else:
+            x = self._mhc_sublayer(x, hc, is_attn=True)   # 注意力先
+            x = self._mhc_sublayer(x, hc, is_attn=False)  # FFN 后
         return x
+
+    def _mhc_sublayer(self, x, hc, is_attn):
+        """mHC 单个子层：A 压流 → 子层 F 跑 1 次 → C 展开 → B 混合残差。
+        is_attn=True 取 attn 组 A/B/C + ln_1/attn；False 取 ffn 组 + ln_2/mlp。
+        两组权重各自跟随所属子层，重排顺序时无需 remap。
+        """
+        A = torch.sigmoid(self.raw_A_attn if is_attn else self.raw_A_ffn)
+        h_in = (x * A.view(1, 1, hc, 1)).sum(dim=2)            # (B, T, d)
+        h_out = (self.attn(self.ln_1(h_in)) if is_attn
+                 else self.mlp(self.ln_2(h_in)))               # 子层只跑 1 次
+        C = torch.sigmoid(self.raw_C_attn if is_attn else self.raw_C_ffn)
+        delta = h_out.unsqueeze(2) * C.view(1, 1, hc, 1)       # (B, T, hc, d)
+        B_ds = sinkhorn_knopp(F.softplus(
+            self.raw_B_attn if is_attn else self.raw_B_ffn))   # (hc, hc) 双重随机
+        return torch.einsum('bthd,hc->btcd', x, B_ds) + delta  # 残差混合 + 子层增量
 
     def get_moe_aux_loss(self):
         """如果本块是 MoE，返回其辅助损失；否则返回 None（GPT 据此累加）。"""
@@ -804,6 +874,33 @@ class GPTConfig:
     use_lightning_indexer: bool = False
     # Hash 路由：前 num_hash_layers 层用 hash(token_id)%n_experts 确定性分配（0 = 禁用）。
     num_hash_layers: int = 0
+    # 计算图重排（拓扑实验）：块内子层顺序。
+    # "attn_ffn"（默认，标准 Pre-LN 布线）| "ffn_attn"（先 FFN 后注意力）。
+    # 只交换执行顺序，不新增参数、不改权重名（attn 永远用 ln_1，mlp 永远用 ln_2）。
+    block_order: str = "attn_ffn"
+    # 稀疏注意力布线（拓扑实验）：这些层索引跳过注意力（只跑 FFN 子层）。
+    # 参数保留但不参与前向 → 参数量严格不变，纯接线改变；空列表 = 所有层都有注意力。
+    # 例：[0, 2, 4] → 6 层里第 1/3/5 层只跑 FFN，注意力稀疏布在第 2/4/6 层。
+    no_attn_layers: list = field(default_factory=list)
+    # 显式记忆 token（拓扑实验，Python-only）：序列前插入 K 个可学习嵌入，参与每一层
+    # 注意力+FFN，作为跨 token 的长程全局工作区（直击 Sinks 训满失效/采样死循环的病根）。
+    # 0 = 关闭（与老模型完全一致，checkpoint 兼容不破）。
+    # 建议 K = csa_compress 的整数倍（如 16），使记忆块与压缩块边界对齐、真实 token 的
+    # 块划分零偏移。参数量 = K×n_embd（K=16, d=80 → 1,280，全部参与训练）。
+    n_memory_tokens: int = 0
+    # --- 对数放缩残差（数值连接实验，零参数）---
+    # 普通残差线性相加 x+F(x)；开启后换成对数域 soft-max 合并 LSE(x,F(x))。
+    # 有界收缩（≤max+log2）+ 软选择偏置，直接压制 SwiGLU 极端值和「loss 骗低」。
+    # 与 mHC 互斥（mHC 已有自己的 4 流残差拓扑，v1 只在标准路径应用）。
+    use_lse_residual: bool = False
+    # --- 对数放缩门控混合（LSE gate-mix，v2）---
+    # 对上轮「纯 LSE 硬替换拖累学力」的修正：残差合并变成可学习标量 α 的插值
+    #     x ← α·x + (1-α)·LSE(x, F(x))，α = sigmoid(raw_gate)，raw_gate 初始 0 → α=0.5
+    # - α→1：偏向纯线性（保留 lin 臂的强学力 / 表征累加）
+    # - α→0：偏向纯 LSE（偏 lse 臂的抗尖刺 / 抗过度自信 → 抗重复坍缩）
+    # 模型自己权衡每条残差路径的软硬程度。每层 1 个标量，参数量极小（6 层 = 6 参数）。
+    # 与 mHC 不互斥（gate-mix 是标准单流残差内部混合，非 mHC 那种 4 流拓扑）。
+    use_lse_gate: bool = False
 
 class GPT(nn.Module):
 
@@ -819,6 +916,11 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config, layer_idx=i) for i in range(config.n_layer)]),
             ln_f = RMSNorm(config.n_embd),
         ))
+        # 显式记忆 token（拓扑实验）：K×n_embd 可学习嵌入，forward 里拼到序列前、
+        # 参与每一层注意力+FFN、过完所有层后剥离。是模型可写入/检索的跨 token 长程工作区。
+        # 用 nn.Parameter 直接挂在 GPT 上（不进 ModuleDict，避免干扰 wte/lm_head 的 key 结构）。
+        if config.n_memory_tokens > 0:
+            self.memory_tokens = nn.Parameter(torch.zeros(config.n_memory_tokens, config.n_embd))
         # 用 RoPE 时，位置信息由 attention 内部注入，不需要可学习的位置编码表
         if not config.use_rope:
             self.transformer['wpe'] = nn.Embedding(config.block_size, config.n_embd)
@@ -842,6 +944,10 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        # memory_tokens 是裸 Parameter，_init_weights（apply 遍历子模块）不会碰到它，手动初始化。
+        # 同嵌入标准：N(0, 0.02)。K=16 时 16×80=1,280 参数，全参与训练。
+        if config.n_memory_tokens > 0:
+            torch.nn.init.normal_(self.memory_tokens, mean=0.0, std=0.02)
 
         # 报告参数量
         print("参数量：%.2fM" % (self.get_num_params()/1e6,))
@@ -882,14 +988,22 @@ class GPT(nn.Module):
             pos = torch.arange(0, t, dtype=torch.long, device=device) # 形状 (t)
             pos_emb = self.transformer.wpe(pos) # 形状为 (t, n_embd) 的位置嵌入
             x = self.transformer.drop(tok_emb + pos_emb)
+        # 显式记忆 token：拼到序列前，作为每一层的全局工作区（真实 token 的相对位置不变）。
+        # RoPE 表已扩到 block_size+K，前缀位置 0..K-1 正常旋转。
+        if self.config.n_memory_tokens > 0:
+            mem = self.memory_tokens.unsqueeze(0).expand(b, -1, -1)  # (b, K, n_embd)
+            x = torch.cat([mem, x], dim=1)                            # (b, K+t, n_embd)
         if self.config.use_mhc:
             # mHC：4 个残差流从同一个嵌入出发（在流维扩展）
-            x = x.unsqueeze(2).expand(b, t, self.config.hc_mult, self.config.n_embd)
+            x = x.unsqueeze(2).expand(b, x.size(1), self.config.hc_mult, self.config.n_embd)
         for block in self.transformer.h:
             x = block(x)
         if self.config.use_mhc:
             # 4 流均值回到 1 流，再给 ln_f / lm_head（V4 用可学习合并，这里用均值简化）
             x = x.mean(dim=2)
+        if self.config.n_memory_tokens > 0:
+            # 剥离记忆 token 前缀：它们不该喂给 lm_head/MTP（会生成无意义 token）
+            x = x[:, self.config.n_memory_tokens:, :]
         x = self.transformer.ln_f(x)
 
         if targets is not None:

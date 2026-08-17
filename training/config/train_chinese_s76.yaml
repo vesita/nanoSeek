@@ -1,0 +1,7 @@
+# 拓扑实验 B 的归因对照（规模匹配）：6×76 全注意力。
+# 继承主配置，仅差异：n_embd 80→76 + out_dir/run_name。
+extends: train_chinese.yaml
+
+out_dir: out/chinese-data2-s76
+wandb_run_name: csa-v4-s76
+n_embd: 76

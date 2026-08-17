@@ -1,0 +1,11 @@
+# LSE 门控混合（gate-mix v2）实验臂。
+# 继承主配置；关闭 mHC，开启 use_lse_gate，训 1500 步。
+extends: train_chinese.yaml
+
+out_dir: out/chinese-data2-gate
+enable_early_stop: false
+wandb_run_name: lse-gate-1500
+use_mhc: false
+use_lse_residual: false
+use_lse_gate: true
+max_iters: 1500
