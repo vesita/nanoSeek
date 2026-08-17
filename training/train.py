@@ -203,6 +203,37 @@ try:
 except OSError:
     steps_per_epoch = None
 
+def build_assistant_mask(ids_1d):
+    """返回 bool mask：True = assistant 回复 token（计算 loss），False = 忽略。
+
+    扫描 token 序列，识别「模型：」[306,228] 到「用户：」[308,228] 或「\n\n」[177,177]
+    之间的区域（即模型回复），只在这些区域计算 loss（chat 微调惯例）。
+    """
+    mask = torch.zeros(len(ids_1d), dtype=torch.bool, device=ids_1d.device)
+    i = 0
+    in_reply = False
+    while i < len(ids_1d):
+        tok = ids_1d[i].item()
+        if i + 1 < len(ids_1d):
+            nxt = ids_1d[i + 1].item()
+            if tok == 306 and nxt == 228:   # 模型：
+                in_reply = True
+                i += 2
+                continue
+            if tok == 308 and nxt == 228:   # 用户：
+                in_reply = False
+                i += 2
+                continue
+            if tok == 177 and nxt == 177:   # \n\n 块分隔符
+                in_reply = False
+                i += 2
+                continue
+        if in_reply:
+            mask[i] = True
+        i += 1
+    return mask
+
+
 def get_batch(split):
     # 我们每个 batch 都重新创建 np.memmap，以避免内存泄漏，参见
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -219,6 +250,11 @@ def get_batch(split):
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    # loss masking：只对 assistant 回复 token 算 loss（chat 微调惯例），
+    # 用户轮次和分隔符设 ignore_index=-1，不参与梯度计算。
+    for i in range(batch_size):
+        mask = build_assistant_mask(y[i])
+        y[i][~mask] = -1
     if device_type == 'cuda':
         # 固定 x、y 的内存，这样我们可以异步（non_blocking=True）把它们搬到 GPU
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
