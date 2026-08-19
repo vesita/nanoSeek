@@ -206,10 +206,16 @@ except OSError:
     steps_per_epoch = None
 
 def build_assistant_mask(ids_1d):
-    """返回 bool mask：True = assistant 回复 token（计算 loss），False = 忽略。
+    """返回 bool mask：True = 计算 loss，False = 忽略。
 
     扫描 token 序列，识别「模型：」[306,228] 到「用户：」[308,228] 或「\n\n」[177,177]
     之间的区域（即模型回复），只在这些区域计算 loss（chat 微调惯例）。
+
+    2026-08-19（D 多轮诊断修复）：轮次边界标签「用户：」「模型：」也纳入 loss——
+    之前它们被跳过，模型从没学过「回复+<eos> → 下一轮 用户：」的转移（dev-notes/28：
+    turns=0/10，EOS 后只会继续吐话术）。现在模型学会对话骨架，原始生成会在
+    <eos> 后自然接「用户：」续轮。用户/模型的内容仍被 mask（保持 assistant 焦点，
+    且 chat 应用里用户输入由外部提供，无需模型学）。
     """
     mask = torch.zeros(len(ids_1d), dtype=torch.bool, device=ids_1d.device)
     i = 0
@@ -219,10 +225,12 @@ def build_assistant_mask(ids_1d):
         if i + 1 < len(ids_1d):
             nxt = ids_1d[i + 1].item()
             if tok == 306 and nxt == 228:   # 模型：
+                mask[i] = True; mask[i + 1] = True   # 轮次边界标签也学（对话骨架）
                 in_reply = True
                 i += 2
                 continue
             if tok == 308 and nxt == 228:   # 用户：
+                mask[i] = True; mask[i + 1] = True   # 学「EOS → 下一轮 用户：」转移
                 in_reply = False
                 i += 2
                 continue

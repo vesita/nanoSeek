@@ -72,6 +72,7 @@ mHC            = 收敛加速 -0.34（13），进默认；Indexer/Hash 关闭
 | [24](24-LSE门控混合gate-mix可学习alpha甜点.md) | LSE gate-mix 甜点 | 可学习 α 同时拿到「LSE 抗重复 ∩ 线性学力」，对话智能最均衡 |
 | [25](25-QK-Norm与Router-Z-Loss-1500步A-B.md) | QK-Norm + Router Z-Loss 归因 | 2×2 A/B：单独各有小赢（−0.05/−0.02），**合开超线性**（val 1.002→0.813）；近零参数 |
 | [26](26-让模型学会吐EOS-turn-level终止符训练验证.md) | 让模型学会吐 &lt;eos&gt; | turn-level EOS 训练：数据每条回复后插 &lt;eos&gt; 重训，模型**自吐终止符 6/6**（非 EOS 臂 0/6），avg_len 200→78 |
+| [27](27-数据重平衡与多轮修复.md) | 数据重平衡 + 多轮修复 | zhuangxialie 57%→25%（--task-ratio 0.25，顺带训练覆盖率 33%→60%）；mask 纳入轮次边界标签让模型学会 EOS→用户： 续轮 |
 
 ## 新增笔记的约定
 
