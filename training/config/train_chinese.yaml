@@ -5,10 +5,11 @@
 # 规模：6×80 深度换宽度（+MTP ~2.85M 参数），适配 8000 BPE 词表。
 # 快速验证代码是否跑得通用 test.yaml（步数少、模型更小）。
 # out_dir 指向默认模型（reb：重平衡数据 + 轮次标签 loss，val 1.2700 @1500；A1/B1/C1 胜者）。
-# 2026-08-19 迁移：ab2-qkv → reb（--task-ratio 0.25 重平衡 + mask 纳入轮次边界标签）。
+# 2026-08-19 迁移：ab2-qkv → reb（--task-ratio 0.25 重平衡 + mask 纳入轮次边界标签）；
+# 命名清理：chinese-data2-reb → chinese-reb（v0.2 定版）。
 # 旧模型（lm/eos/ab1/ab2/ab3）加载需显式 --use_csa_fused_qkv=false。
 # 重训会用 out_dir/old 保护机制归档旧实验。
-out_dir: out/chinese-data2-reb
+out_dir: out/chinese-reb
 eval_interval: 250
 eval_iters: 100
 log_interval: 10

@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from inference.scripts.sample_py import build_model_from_checkpoint, generate
 from tokenizers import Tokenizer
 
-OUT_DIR = "out/chinese-data2-reb"  # ← 换模型改这里（默认指针：重平衡基线，A1/B1/C1 胜者）
+OUT_DIR = "out/chinese-reb"  # ← 换模型改这里（默认指针：v0.2 定版，reb）
 
 model, ckpt = build_model_from_checkpoint(OUT_DIR)
 tok = Tokenizer.from_file("data/chinese/tokenizer.json")

@@ -152,11 +152,8 @@ def main():
     a = ap.parse_args()
 
     default_dirs = [
-        # 当前在册模型（2026-08-19：A/B 三连后的全部臂；缺失的自动跳过）
-        "out/chinese-data2-lm",      # 基线：loss masking，旧代码（手动滑窗）
-        "out/chinese-data2-ab1-sdpa",  # A/B 1：滑窗 SDPA（+修复 sink 丢弃 bug）
-        "out/chinese-data2-ab2-qkv",   # A/B 2：+融合 QKV（默认指针）
-        "out/chinese-data2-ab3-bmm",   # A/B 3：+einsum→bmm（保留开关，默认关）
+        # 当前默认模型（v0.2 定版；历史实验在 out/archive/，缺失的自动跳过）
+        "out/chinese-reb",
     ]
     historical = []
     dirs = a.dirs if a.dirs else (default_dirs + historical)

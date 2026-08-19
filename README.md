@@ -10,7 +10,7 @@ nanoSeek 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 
 当前方向已达质量天花板（详见 [dev-notes/29](dev-notes/29-数据构成实验与质量天花板.md)、[dev-notes/30](dev-notes/30-5000步重复坍缩验证.md)），定版 0.2：
 
-- **默认模型**：`out/chinese-data2-reb`（val 1.2700 @1500 步，全系列最优）
+- **默认模型**：`out/chinese-reb`（val 1.2700 @1500 步，全系列最优）
   - 1500 步 = 本架构防重复坍缩的质量保护点（更多步数 → 采样退化）
   - EOS 自吐 10/10、rep3≈0、回复短；内容为心理咨询话术风格（语料构成决定）
 - **Rust 端已适配**：`inference/runtime` 新增 QK-Norm 支持 + 融合 QKV 转换拆分，
