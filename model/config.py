@@ -50,6 +50,14 @@ class GPTConfig:
     csa_window: int = 64        # 滑窗：保留最近多少个原始 token（局部细节）
     use_hca: bool = False       # 加 HCA：重度压缩全局信号（无稀疏选择）
     use_csa_learnable: bool = True  # V4：可学习门控池化替代平均池化（压缩块内 m 个 token）
+    # --- CSA 计算结构优化（数学等价，仅换计算路径，2026-08-17）---
+    # use_csa_fused_qkv：Q/K/V 三个独立投影合并成一个 3×n_embd 大线性（省 2/3 kernel launch）。
+    #   注意：权重布局改变（c_qkv_csa.weight 替代 q/k/v_proj_csa.weight），旧 checkpoint 不兼容，
+    #   仅新训练可用；训练时数学等价于三个独立 Linear（拼接权重）。
+    use_csa_fused_qkv: bool = False
+    # use_csa_bmm：CSA 路径的分数/聚合 einsum 换成显式批量 matmul（bmm 走 cuBLAS gemm，
+    #   省 einsum 内部 permute/reshape 调度开销）。逐位数学等价，权重布局不变。
+    use_csa_bmm: bool = False
     # --- V4 结构设计升级（实验性，默认全关）---
     # Attention Sinks：每头一个可学习标量偏置，作为 softmax 的"垃圾桶"吸收无关注意力。
     use_attn_sink: bool = False

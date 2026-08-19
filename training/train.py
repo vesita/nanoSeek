@@ -115,6 +115,8 @@ csa_topk = 4           # 每个 query 稀疏选几个压缩块
 csa_window = 64        # 滑窗：保留最近多少个原始 token
 use_hca = False        # HCA 重度压缩全局信号
 use_csa_learnable = True   # V4：可学习门控池化替代平均池化
+use_csa_fused_qkv = False  # CSA 计算优化：Q/K/V 三合一（权重布局变，仅新训练）
+use_csa_bmm = False        # CSA 计算优化：einsum → 显式批量 matmul（逐位等价）
 # --- V4 结构设计升级（实验性，默认全关）---
 use_attn_sink = True         # Attention Sinks：打破重复坍缩的必要条件（三重 A/B 验证）
 use_mhc = False              # mHC 超连接：4 流并行残差
@@ -286,6 +288,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_muon=use_muon, muon_momentum=muon_momentum, muon_ns_steps=muon_ns_steps,
                   use_csa=use_csa, csa_compress=csa_compress, csa_topk=csa_topk,
                   csa_window=csa_window, use_hca=use_hca, use_csa_learnable=use_csa_learnable,
+                  use_csa_fused_qkv=use_csa_fused_qkv, use_csa_bmm=use_csa_bmm,
                   use_attn_sink=use_attn_sink, use_mhc=use_mhc, hc_mult=hc_mult,
                   use_lightning_indexer=use_lightning_indexer, num_hash_layers=num_hash_layers,
                   block_order=block_order, no_attn_layers=no_attn_layers,
@@ -310,7 +313,7 @@ def _build_model_from_checkpoint(checkpoint):
               'use_mtp', 'n_mtp', 'mtp_weight',
               'use_muon', 'muon_momentum', 'muon_ns_steps',
               'use_csa', 'csa_compress', 'csa_topk', 'csa_window',
-              'use_hca', 'use_csa_learnable',
+              'use_hca', 'use_csa_learnable', 'use_csa_fused_qkv', 'use_csa_bmm',
               'use_attn_sink', 'use_mhc', 'hc_mult',
               'use_lightning_indexer', 'num_hash_layers', 'block_order', 'no_attn_layers',
               'n_memory_tokens', 'use_lse_residual', 'use_lse_gate',

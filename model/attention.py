@@ -36,11 +36,15 @@ class CausalSelfAttention(nn.Module):
             self.qk_scale = nn.Parameter(torch.full((config.n_head,), self.head_dim ** 0.5))
         self.rope_head_dim = config.qk_rope_head_dim if (config.use_mla or config.use_csa) else (config.n_embd // config.n_head)
         if config.use_csa:
-            # CSA/HCA 的独立 Q/K/V 投影（与 MLA 的 KV 压缩路径分开，更直白）。
-            # 输入直接投影出 K/V，再在 forward 里做块级压缩。
-            self.q_proj_csa = nn.Linear(config.n_embd, config.n_embd, bias=False)
-            self.k_proj_csa = nn.Linear(config.n_embd, config.n_embd, bias=False)
-            self.v_proj_csa = nn.Linear(config.n_embd, config.n_embd, bias=False)
+            # CSA/HCA 的 Q/K/V 投影（与 MLA 的 KV 压缩路径分开，更直白）。
+            # 默认三个独立 Linear；use_csa_fused_qkv=True 时合三为一（省 kernel launch，
+            # 数学等价：拼一个 [Wq; Wk; Wv] 大矩阵一次 matmul 再 split）。
+            if config.use_csa_fused_qkv:
+                self.c_qkv_csa = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+            else:
+                self.q_proj_csa = nn.Linear(config.n_embd, config.n_embd, bias=False)
+                self.k_proj_csa = nn.Linear(config.n_embd, config.n_embd, bias=False)
+                self.v_proj_csa = nn.Linear(config.n_embd, config.n_embd, bias=False)
             if config.use_csa_learnable:
                 # V4 可学习门控池化：把块内 csa_compress 个 token 压成 1 个潜在。
                 # compress 线性压缩 + sigmoid gate；K/V 共享同一组权重（对应共享潜在）。
@@ -154,10 +158,27 @@ class CausalSelfAttention(nn.Module):
         attn_scale = 1.0 if self.use_qk_norm else 1.0 / math.sqrt(k.size(-1))
         if self.flash:
             # 使用 Flash Attention CUDA 内核的高效 attention。
-            y = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=None,
-                dropout_p=self.dropout if self.training else 0,
-                is_causal=True, scale=attn_scale)
+            # Attention Sink 与 is_causal 的 SDPA 不兼容（flash 内核不支持追加 softmax 列），
+            # 旧代码在 flash 可用时会走这里、把 sink 静默丢弃（与注释"回退手动"不符）。
+            # 这里用 attn_mask 注入 sink：k/v 各补一列零，掩码末尾列加 sink[h]——数学上与
+            # 手动补列完全等价（softmax 多一项 exp(sink)，value 为零 → 贡献 0）。
+            if self.use_attn_sink:
+                Bn, nh, Tq, d = q.shape
+                k_pad = torch.cat([k, k.new_zeros(Bn, nh, 1, d)], dim=2)   # (B,nh,T+1,d)
+                v_pad = torch.cat([v, v.new_zeros(Bn, nh, 1, d)], dim=2)
+                mask = torch.zeros(Bn, nh, Tq, Tq + 1, device=q.device, dtype=q.dtype)
+                causal = torch.triu(torch.ones(Tq, Tq, device=q.device, dtype=torch.bool), diagonal=1)
+                mask[:, :, :, :Tq].masked_fill_(causal.view(1, 1, Tq, Tq), float('-inf'))
+                mask[:, :, :, Tq] = self.attn_sink.view(1, nh, 1)
+                y = torch.nn.functional.scaled_dot_product_attention(
+                    q, k_pad, v_pad, attn_mask=mask,
+                    dropout_p=self.dropout if self.training else 0,
+                    is_causal=False, scale=attn_scale)
+            else:
+                y = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0,
+                    is_causal=True, scale=attn_scale)
         else:
             # 手动实现 attention
             att = q @ k.transpose(-2, -1)
@@ -170,7 +191,7 @@ class CausalSelfAttention(nn.Module):
                 # 等价于"把多余的注意力预算倒进垃圾桶"。
                 sink = self.attn_sink.view(1, self.n_head, 1, 1).expand(B, self.n_head, T, 1)
                 att = torch.cat([att, sink], dim=-1)                          # (B,nh,T,T+1)
-                v = torch.cat([v, v.new_zeros(B, self.n_head, T, 1, v.size(-1))], dim=-2)  # (B,nh,T+1,hs)
+                v = torch.cat([v, v.new_zeros(B, self.n_head, 1, v.size(-1))], dim=-2)  # (B,nh,T+1,hs)
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T+1) x (B, nh, T+1, hs) -> (B, nh, T, hs)
@@ -201,9 +222,15 @@ class CausalSelfAttention(nn.Module):
         # Lightning Indexer 的 KL 辅助损失（块路径跳过时兜底为 0）
         self.indexer_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
-        q = self.q_proj_csa(x).view(B, T, nh, d)
-        k = self.k_proj_csa(x).view(B, T, nh, d)
-        v = self.v_proj_csa(x).view(B, T, nh, d)
+        if getattr(self.config, 'use_csa_fused_qkv', False):
+            q, k, v = self.c_qkv_csa(x).split(self.n_embd, dim=2)
+            q = q.view(B, T, nh, d)
+            k = k.view(B, T, nh, d)
+            v = v.view(B, T, nh, d)
+        else:
+            q = self.q_proj_csa(x).view(B, T, nh, d)
+            k = self.k_proj_csa(x).view(B, T, nh, d)
+            v = self.v_proj_csa(x).view(B, T, nh, d)
         if self.use_qk_norm:
             q, k = self._apply_qk_norm(q, k)  # RoPE 是范数保持的旋转，前后顺序等价
 
@@ -237,7 +264,14 @@ class CausalSelfAttention(nn.Module):
             bq = torch.arange(T, device=x.device) // m                # 每个 query 属于哪个块
             causal_block = bq.unsqueeze(-1) > torch.arange(nb, device=x.device)  # (T, nb)
             has_prior = causal_block.any(dim=-1)                      # (T,) 该 query 有没有历史块
-            s_blk = torch.einsum('bthd,bnhd->bthn', q, k_blocks)
+            if getattr(self.config, 'use_csa_bmm', False):
+                # 块打分：显式批量 matmul（等价 einsum 'bthd,bnhd->bthn'，走 cuBLAS gemm）
+                s_blk = torch.bmm(
+                    q.permute(0, 2, 1, 3).reshape(B * nh, T, d),
+                    k_blocks.permute(0, 2, 3, 1).reshape(B * nh, d, nb),
+                ).view(B, nh, T, nb).permute(0, 2, 1, 3)  # (B,T,nh,nb)
+            else:
+                s_blk = torch.einsum('bthd,bnhd->bthn', q, k_blocks)
             if not self.use_qk_norm:
                 s_blk = s_blk / math.sqrt(d)  # (B,T,nh,nb)
             s_blk = s_blk.masked_fill(~causal_block.unsqueeze(0).unsqueeze(2), float('-inf'))
@@ -249,7 +283,11 @@ class CausalSelfAttention(nn.Module):
                 # 分数只决定「选哪几块」；s_blk 仍算真实注意力，选中的块才参与 softmax。
                 q_idx = self.idx_q(x)                                        # (B,T,nh)
                 k_idx = self.idx_k(k_blocks.reshape(-1, d)).view(B, nb, nh)  # (B,nb,nh)
-                idx_scores = torch.einsum('bth,bnh->btn', q_idx, k_idx)     # (B,T,nb) 外积
+                if getattr(self.config, 'use_csa_bmm', False):
+                    # 外积批量 matmul（等价 einsum 'bth,bnh->btn'）
+                    idx_scores = torch.bmm(q_idx, k_idx.permute(0, 2, 1))  # (B,T,nh)@(B,nh,nb)→(B,T,nb)
+                else:
+                    idx_scores = torch.einsum('bth,bnh->btn', q_idx, k_idx)     # (B,T,nb) 外积
                 idx_scores = idx_scores.masked_fill(
                     ~causal_block.unsqueeze(0), float('-inf'))
                 # 没有历史块的 query：整行置 0（否则 softmax 对全 -inf 产生 NaN）
@@ -287,26 +325,57 @@ class CausalSelfAttention(nn.Module):
                 sink = self.attn_sink.view(1, 1, self.n_head, 1).expand(B, T, self.n_head, 1)
                 s_blk = torch.cat([s_blk, sink], dim=-1)                       # (B,T,nh,nb+1)
                 v_blocks = torch.cat([v_blocks, v_blocks.new_zeros(B, 1, self.n_head, d)], dim=1)  # (B,nb+1,nh,d)
-            a_blk = F.softmax(s_blk, dim=-1)                          # (B,T,nh,nb+1)
-            y_comp = torch.einsum('bthn,bnhd->bthd', a_blk, v_blocks)  # (B,T,nh,d)
+            a_blk = F.softmax(s_blk, dim=-1)                          # (B,T,nh,nb')
+            if getattr(self.config, 'use_csa_bmm', False):
+                # 块聚合：显式批量 matmul（等价 einsum 'bthn,bnhd->bthd'）。
+                # 注意 v_blocks 是 (B,nb,nh,d)，要按 (B,nh,nb,d) 折叠 → permute(0,2,1,3)。
+                nb_p = v_blocks.shape[1]
+                y_comp = torch.bmm(
+                    a_blk.permute(0, 2, 1, 3).reshape(B * nh, T, nb_p),
+                    v_blocks.permute(0, 2, 1, 3).reshape(B * nh, nb_p, d),
+                ).view(B, nh, T, d).permute(0, 2, 1, 3)               # (B,T,nh,d)
+            else:
+                y_comp = torch.einsum('bthn,bnhd->bthd', a_blk, v_blocks)  # (B,T,nh,d)
             y_comp = y_comp * has_prior.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).float()
 
         # --- 3) 滑窗：最近 win 个原始 token 的局部因果注意力 ---
         # 滑窗允许看自己（j ≤ i），保证每个位置至少有一个合法键，避免全 -inf。
+        # 有 SDPA 时走 fused kernel；sink 经 attn_mask 注入（k/v 补零列），与手动补列
+        # 数学等价。无 SDPA 时退回手动 einsum（含 sink 补列）。
         win = min(win, T)
         i = torch.arange(T, device=x.device)
         win_causal = (i.unsqueeze(-1) <= i.unsqueeze(0)) & (i.unsqueeze(0) - i.unsqueeze(-1) <= win)
-        s_win = torch.einsum('bthd,bjhd->bthj', q, k)
-        if not self.use_qk_norm:
-            s_win = s_win / math.sqrt(d)  # (B,T,nh,T)
-        s_win = s_win.masked_fill(~win_causal.unsqueeze(0).unsqueeze(2), float('-inf'))
-        v_win = v
-        if self.use_attn_sink:
-            # Attention Sink：滑窗注意力同样追加一列（v 补零行占位）
-            sink = self.attn_sink.view(1, 1, self.n_head, 1).expand(B, T, self.n_head, 1)
-            s_win = torch.cat([s_win, sink], dim=-1)                        # (B,T,nh,T+1)
-            v_win = torch.cat([v, v.new_zeros(B, 1, self.n_head, d)], dim=1)  # (B,T+1,nh,d)
-        y_win = torch.einsum('bthj,bjhd->bthd', F.softmax(s_win, dim=-1), v_win)
+        scale = 1.0 if self.use_qk_norm else 1.0 / math.sqrt(d)
+        if self.flash:
+            qt, kt, vt = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (B,nh,T,d)
+            if self.use_attn_sink:
+                k_pad = torch.cat([kt, kt.new_zeros(B, nh, 1, d)], dim=2)   # (B,nh,T+1,d)
+                v_pad = torch.cat([vt, vt.new_zeros(B, nh, 1, d)], dim=2)
+                mask = torch.zeros(B, nh, T, T + 1, device=x.device, dtype=x.dtype)
+                mask[:, :, :, :T].masked_fill_(~win_causal.unsqueeze(0).unsqueeze(1), float('-inf'))
+                mask[:, :, :, T] = self.attn_sink.view(1, nh, 1)
+                y_win = torch.nn.functional.scaled_dot_product_attention(
+                    qt, k_pad, v_pad, attn_mask=mask,
+                    dropout_p=0.0, is_causal=False, scale=scale)
+            else:
+                mask = torch.zeros(B, nh, T, T, device=x.device, dtype=x.dtype)
+                mask.masked_fill_(~win_causal.unsqueeze(0).unsqueeze(1), float('-inf'))
+                y_win = torch.nn.functional.scaled_dot_product_attention(
+                    qt, kt, vt, attn_mask=mask,
+                    dropout_p=0.0, is_causal=False, scale=scale)
+            y_win = y_win.transpose(1, 2)                                    # (B,T,nh,d)
+        else:
+            s_win = torch.einsum('bthd,bjhd->bthj', q, k)
+            if not self.use_qk_norm:
+                s_win = s_win / math.sqrt(d)  # (B,T,nh,T)
+            s_win = s_win.masked_fill(~win_causal.unsqueeze(0).unsqueeze(2), float('-inf'))
+            v_win = v
+            if self.use_attn_sink:
+                # Attention Sink：滑窗注意力同样追加一列（v 补零行占位）
+                sink = self.attn_sink.view(1, 1, self.n_head, 1).expand(B, T, self.n_head, 1)
+                s_win = torch.cat([s_win, sink], dim=-1)                        # (B,T,nh,T+1)
+                v_win = torch.cat([v, v.new_zeros(B, 1, self.n_head, d)], dim=1)  # (B,T+1,nh,d)
+            y_win = torch.einsum('bthj,bjhd->bthd', F.softmax(s_win, dim=-1), v_win)
 
         y = y_comp + y_win
 
@@ -317,10 +386,18 @@ class CausalSelfAttention(nn.Module):
             # 只用真实块：sink 模式下 v_blocks 末尾多了一个占位零块，切掉它
             v_blocks_real = v_blocks[:, :nb] if self.use_attn_sink else v_blocks
             n_allowed = causal_block.float().sum(dim=-1).clamp(min=1)  # (T,)
-            k_glob = torch.einsum('tn,bnhd->bthd', causal_block.float(), k_blocks) / \
-                     n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            v_glob = torch.einsum('tn,bnhd->bthd', causal_block.float(), v_blocks_real) / \
-                     n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            if getattr(self.config, 'use_csa_bmm', False):
+                # HCA 全局聚合：显式批量 matmul（等价 einsum 'tn,bnhd->bthd'）
+                cb = causal_block.float().unsqueeze(0).expand(B, -1, -1)      # (B,T,nb)
+                k_glob = torch.bmm(cb, k_blocks.reshape(B, nb, nh * d)).view(B, T, nh, d) / \
+                         n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                v_glob = torch.bmm(cb, v_blocks_real.reshape(B, nb, nh * d)).view(B, T, nh, d) / \
+                         n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            else:
+                k_glob = torch.einsum('tn,bnhd->bthd', causal_block.float(), k_blocks) / \
+                         n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                v_glob = torch.einsum('tn,bnhd->bthd', causal_block.float(), v_blocks_real) / \
+                         n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
             # 单个全局 key 的 softmax 恒为 1，等价于直接加上这份全局摘要
             y = y + v_glob
 
