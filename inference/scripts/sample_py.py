@@ -61,16 +61,23 @@ def _truncate_at_turn(gen_ids, tok):
 
 @torch.no_grad()
 def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_penalty,
-                 stop_on_turn=False, stop_on_eos=False, clip_at_sentence=False):
+                 stop_on_turn=False, stop_on_eos=False, clip_at_sentence=False,
+                 context_ids=None):
     """生成并返回 (完整 token 列表, eos_pos)。
 
     与 generate() 逻辑完全一致，但返回 token 级结果：
     - 完整 token 列表（prompt + 生成，EOS 之前的所有 token）
     - eos_pos：模型自然吐出 <eos> 的生成区位置（-1 = 没吐）
     <eos> 解码为空串，字符串层检测不到，必须在 token 级看。
+
+    context_ids：可选。多轮对话时直接传入 token 级上下文（跨轮累积，含历史
+    回复与 <eos>，训练格式），prompt 参数此时可传 None。
     """
-    idx = tok.encode(prompt).ids
-    idx = torch.tensor([idx], dtype=torch.long)
+    if context_ids is not None:
+        idx = torch.tensor([context_ids], dtype=torch.long)
+    else:
+        idx = tok.encode(prompt).ids
+        idx = torch.tensor([idx], dtype=torch.long)
     new_start = idx.shape[1]
     seen = list(idx[0].tolist())
     eos_id = tok.token_to_id("<eos>")

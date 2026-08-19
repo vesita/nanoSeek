@@ -191,7 +191,18 @@ fn main() -> Result<()> {
         print!("模型: ");
         let new_tokens = stream_print(&gpt, &tok, &context, max_new_tokens, temperature, top_k, repeat_penalty, &mut rng)?;
         println!();
+        // 连续对话框架（2026-08-19）：训练格式是「回复\n<eos>\n用户：」——模型自吐的
+        // <eos> 被 stream_print 消费掉（生成在此停止、不进 new_tokens），必须补回上下文，
+        // 否则下一轮拼成「回复用户：」这种训练里从没出现过的转移，模型就会停止吐 EOS。
+        // 判定：生成了 < max_new_tokens = 提前在 <eos> 处停下；跑满 = 没吐 EOS，不补。
+        let hit_eos = new_tokens.len() < max_new_tokens;
         context.extend(new_tokens);
+        if hit_eos {
+            if let Some(eos) = tok.eos_id() {
+                context.push(eos);
+                context.extend(tok.encode("\n")?);
+            }
+        }
     }
     Ok(())
 }
