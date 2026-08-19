@@ -163,6 +163,9 @@ def main():
                     help='顺带下载四大名著补充语料（默认只用手头已有的 txt）')
     ap.add_argument('--task-ratio', type=float, default=1.0,
                     help='非对话(任务/指令)样本保留比例：1.0=全保留(默认,所有数据)，0=剔除，0.1=留10%')
+    ap.add_argument('--source-ratio', action='append', default=[], metavar='NAME=RATIO',
+                    help='按文件名前缀降采样某源（仅 train 侧，val 不变保持可比）。'
+                         '可重复：--source-ratio multi_turn=0.15 --source-ratio zhuangxialie=0.2')
     ap.add_argument('--insert-eos', action='store_true', default=True,
                     help='每条 模型： 回复后插入 <eos>（turn-level 终止符，治喋喋不休，默认开启）')
     ap.add_argument('--no-insert-eos', action='store_true',
@@ -199,12 +202,30 @@ def main():
         with open(os.path.join(DATA_DIR, fn), 'r', encoding='utf-8', errors='replace') as f:
             text = f.read()
         blocks = [b.strip() for b in text.split('\n\n') if b.strip()]
+        # --source-ratio NAME=RATIO：按文件名降采样该源（只作用于 train 侧，
+        # val 保持 90/10 全量 → val.bin 不变，跨实验 val 可比）。NAME 是文件名前缀，
+        # 如 multi_turn=0.15 / zhuangxialie=0.2。优先级高于 task_ratio。
+        src_ratio = None
+        for spec in args.source_ratio:
+            name, ratio = spec.split('=', 1)
+            if fn.startswith(name):
+                src_ratio = float(ratio)
         if fn in DIALOGUE_FILES:
             random.seed(1337)  # 固定 seed：重复运行切分一致，实验结果可复现
             random.shuffle(blocks)
             n = int(len(blocks) * 0.9)
+            train_blocks, val_blocks = blocks[:n], blocks[n:]
+            if src_ratio is not None and src_ratio < 1.0:
+                random.seed(1337 + sum(ord(c) for c in fn) + 1)
+                random.shuffle(train_blocks)
+                train_blocks = train_blocks[:max(1, int(len(train_blocks) * src_ratio))]
+            train_samples += train_blocks
+            val_samples += val_blocks
+        elif src_ratio is not None:
+            random.seed(1337 + sum(ord(c) for c in fn) + 1)
+            random.shuffle(blocks)
+            n = max(1, int(len(blocks) * src_ratio))
             train_samples += blocks[:n]
-            val_samples += blocks[n:]
         elif args.task_ratio >= 1.0:
             train_samples += blocks  # 默认：非对话(任务/指令)全部进训练，让模型学全面
         elif args.task_ratio > 0:
