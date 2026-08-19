@@ -152,22 +152,13 @@ def main():
     a = ap.parse_args()
 
     default_dirs = [
-        # 新增实验臂
-        "out/chinese-data2-lin",
-        "out/chinese-data2-lse",
-        "out/chinese-data2-gate",
+        # 当前在册模型（2026-08-19：A/B 三连后的全部臂；缺失的自动跳过）
+        "out/chinese-data2-lm",      # 基线：loss masking，旧代码（手动滑窗）
+        "out/chinese-data2-ab1-sdpa",  # A/B 1：滑窗 SDPA（+修复 sink 丢弃 bug）
+        "out/chinese-data2-ab2-qkv",   # A/B 2：+融合 QKV（默认指针）
+        "out/chinese-data2-ab3-bmm",   # A/B 3：+einsum→bmm（保留开关，默认关）
     ]
-    # 已有的历史实验（含不同架构的失败/对比臂）
-    historical = [
-        "out/chinese-data2-af",
-        "out/chinese-data2-clean-af5k",
-        "out/chinese-data2-mem",
-        "out/chinese-data2-muon",
-        "out/chinese-data2-s76",
-        "out/chinese-data2-sparse",
-        "out/chinese-data2-sparse2",
-        "out/chinese-data2-fa",
-    ]
+    historical = []
     dirs = a.dirs if a.dirs else (default_dirs + historical)
 
     tok = None

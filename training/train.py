@@ -115,8 +115,8 @@ csa_topk = 4           # 每个 query 稀疏选几个压缩块
 csa_window = 64        # 滑窗：保留最近多少个原始 token
 use_hca = False        # HCA 重度压缩全局信号
 use_csa_learnable = True   # V4：可学习门控池化替代平均池化
-use_csa_fused_qkv = False  # CSA 计算优化：Q/K/V 三合一（权重布局变，仅新训练）
-use_csa_bmm = False        # CSA 计算优化：einsum → 显式批量 matmul（逐位等价）
+use_csa_fused_qkv = True   # CSA 计算优化：Q/K/V 三合一（权重布局变，仅新训练；A/B 2 胜出→默认）
+use_csa_bmm = False        # CSA 计算优化：einsum → 显式批量 matmul（逐位等价；A/B 3 更慢→保持关）
 # --- V4 结构设计升级（实验性，默认全关）---
 use_attn_sink = True         # Attention Sinks：打破重复坍缩的必要条件（三重 A/B 验证）
 use_mhc = False              # mHC 超连接：4 流并行残差

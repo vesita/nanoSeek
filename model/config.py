@@ -54,9 +54,11 @@ class GPTConfig:
     # use_csa_fused_qkv：Q/K/V 三个独立投影合并成一个 3×n_embd 大线性（省 2/3 kernel launch）。
     #   注意：权重布局改变（c_qkv_csa.weight 替代 q/k/v_proj_csa.weight），旧 checkpoint 不兼容，
     #   仅新训练可用；训练时数学等价于三个独立 Linear（拼接权重）。
-    use_csa_fused_qkv: bool = False
+    #   2026-08-19 A/B 2 胜出（等效 + 更快）→ 翻为默认 True；加载旧模型需 --use_csa_fused_qkv=false。
+    use_csa_fused_qkv: bool = True
     # use_csa_bmm：CSA 路径的分数/聚合 einsum 换成显式批量 matmul（bmm 走 cuBLAS gemm，
     #   省 einsum 内部 permute/reshape 调度开销）。逐位数学等价，权重布局不变。
+    #   A/B 3 结论：每步更慢（MFU 61% vs 64%），val 增益在等效数学下属随机性 → 保持默认关。
     use_csa_bmm: bool = False
     # --- V4 结构设计升级（实验性，默认全关）---
     # Attention Sinks：每头一个可学习标量偏置，作为 softmax 的"垃圾桶"吸收无关注意力。
