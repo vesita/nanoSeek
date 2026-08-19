@@ -117,12 +117,30 @@ def extract_multi_turn(ex):
     return '\n'.join(turns) if turns else None
 
 
+def extract_zhihu_kol(ex):
+    """OmniData/Zhihu-KOL：知乎问答（INSTRUCTION/RESPONSE，单轮闲聊/生活问答）。
+
+    2026-08-19 新增（数据扩充）：真实知乎口语语料，打破话术性格（情感支持类占
+    主导的现状）。过滤超长问答（论文级）与 AI 腔开头。
+    """
+    q = str(ex.get('INSTRUCTION', '')).strip()
+    a = str(ex.get('RESPONSE', '')).strip()
+    if not q or not a:
+        return None
+    if len(q) > 300 or len(a) > 600:
+        return None
+    if a.startswith(('作为', '作为一个', '我是', '首先，')):
+        return None
+    return f'用户：{q}\n模型：{a}'
+
+
 EXTRACTORS = {
     'shareai': ('shareAI/shareAI-Llama3-DPO-zh-en-emoji', extract_shareai),
     'zhuangxialie': ('zhuangxialie/Llama3-Chinese-Dataset', extract_zhuangxialie),
     'muice': ('Moemuu/Muice-Dataset', extract_muice),
     'dailychat': ('yyy6778/dailychat', extract_dailychat),
     'multi_turn': ('justgo10000/Multi-turn-dialogue', extract_multi_turn),
+    'zhihu_kol': ('OmniData/Zhihu-KOL', extract_zhihu_kol),
 }
 
 
@@ -168,7 +186,7 @@ def download_one(dataset_id, extractor, out_path, max_samples, force):
 def main():
     ap = argparse.ArgumentParser(description='下载魔搭中文对话语料')
     ap.add_argument('--datasets', default='shareai,zhuangxialie',
-                    help='逗号分隔的数据集名，可选 shareai / zhuangxialie')
+                    help='逗号分隔的数据集名，可选 shareai / zhuangxialie / muice / dailychat / multi_turn / zhihu_kol')
     ap.add_argument('--max-samples', type=int, default=200_000,
                     help='每个数据集最多取多少条样本（默认 20 万）')
     ap.add_argument('--force', action='store_true', help='强制重新下载（覆盖现有文件）')

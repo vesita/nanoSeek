@@ -194,7 +194,7 @@ def main():
     #    对话类文件（闲聊/多轮）单独 90/10 切：对话 90% 进 train、10% 进 val；
     #    非对话类文件（单轮指令/逻辑/古风）全部进 train，不参与 val。
     DIALOGUE_FILES = {'dailychat_dialogue.txt', 'muice_dialogue.txt', 'multi_turn_dialogue.txt',
-                       'agent_dialogue.txt'}
+                       'agent_dialogue.txt', 'zhihu_kol_dialogue.txt'}
     train_samples, val_samples = [], []
     for fn in sorted(os.listdir(DATA_DIR)):
         if not fn.endswith('.txt'):
