@@ -41,7 +41,10 @@ POLICIES = [
 
 def run_policy(model, tok, kwargs):
     """在 6 个标准 prompt 上按该策略采样，返回 (metrics, samples)。"""
-    probe = kwargs.pop("probe", False)
+    # 必须复制 kwargs 再弹 probe：POLICIES 是全局共享的 dict，直接 pop 会污染
+    # 下一个模型（第二个模型的探测策略会拿到 probe=False → EOS 永远 0/6）。
+    kw = dict(kwargs)
+    probe = kw.pop("probe", False)
     metrics = {"len": 0.0, "rep2": 0.0, "rep3": 0.0, "rep4": 0.0,
                "ws": 0.0, "d1": 0.0, "d2": 0.0, "turns": 0.0,
                "stopped_early": 0, "eos_hits": 0, "avg_eos_pos": 0.0}
@@ -52,13 +55,13 @@ def run_policy(model, tok, kwargs):
         torch.manual_seed(SEED)
         torch.cuda.manual_seed(SEED)
         if probe:
-            ids, eos_pos = generate_ids(model, tok, p, **kwargs)
+            ids, eos_pos = generate_ids(model, tok, p, **kw)
             text = tok.decode(ids[plen:])
             if eos_pos >= 0:
                 metrics["eos_hits"] += 1
                 metrics["avg_eos_pos"] += eos_pos
         else:
-            gen = generate(model, tok, p, **kwargs)
+            gen = generate(model, tok, p, **kw)
             text = gen[len(tok.decode(tok.encode(p).ids)):] if gen.startswith(
                 tok.decode(tok.encode(p).ids)) else gen
         samples.append(text)
