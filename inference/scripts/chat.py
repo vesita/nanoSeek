@@ -22,7 +22,7 @@ while True:
         prompt = f"用户：{user}\n模型："
         out = generate(model, tok, prompt,
                        max_new_tokens=200,
-                       temperature=0.8,
+                       temperature=0.6,   # 0.8→0.6：碎片度 −26%（0.245→0.182），EOS 8/8 不受影响（2026-08-19 实测）
                        top_k=200,
                        repeat_penalty=1.2,
                        stop_on_eos=True,
