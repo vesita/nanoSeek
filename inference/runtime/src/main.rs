@@ -22,9 +22,9 @@ fn main() -> Result<()> {
     let mut tokenizer_path = "tokenizer.json".to_string();
     let mut prompt: Option<String> = None;
     let mut max_new_tokens = 300usize;
-    let mut temperature = 0.8f64;
+    let mut temperature = 0.6f64; // 0.8→0.6：碎片度 −26%（0.245→0.182），EOS 8/8 不受影响（2026-08-19 实测）
     let mut top_k: Option<usize> = Some(200);
-    let mut repeat_penalty = 1.0f64; // 重复惩罚：>1 生效（常用 1.1~1.3），1.0 关闭
+    let mut repeat_penalty = 1.2f64; // 重复惩罚：>1 生效（Python chat.py 同用 1.2，治循环复读）
     let mut seed = 1337u64;
     let mut print_logits = false;
     let mut dump_logits: Option<String> = None;

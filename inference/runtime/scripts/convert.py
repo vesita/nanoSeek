@@ -38,6 +38,20 @@ def main():
     sd = {k.removeprefix('_orig_mod.'): v for k, v in sd.items()}
     # 跳过 RoPE 的 cos/sin 预计算表（Rust 端按 rope_theta 自己算）
     sd = {k: v for k, v in sd.items() if not (k.endswith('.cos') or k.endswith('.sin'))}
+    # 融合 QKV → 拆分回三个独立投影（Rust 端 attention.rs 按 q/k/v_proj_csa 加载；
+    # c_qkv_csa.weight 形状 (3*n_embd, n_embd) = [Wq; Wk; Wv] 行拼接，split 顺序与
+    # model/attention.py 的 c_qkv_csa(x).split(n_embd, dim=2) 一致）
+    fused = [k for k in sd if '.c_qkv_csa.weight' in k]
+    for k in fused:
+        prefix = k.replace('.c_qkv_csa.weight', '')
+        w = sd.pop(k)  # (3*n_embd, n_embd)
+        ne = w.shape[0] // 3
+        q, kv = w[:ne], w[ne:]
+        kk, vv = kv[:ne], kv[ne:]
+        sd[f'{prefix}.q_proj_csa.weight'] = q
+        sd[f'{prefix}.k_proj_csa.weight'] = kk
+        sd[f'{prefix}.v_proj_csa.weight'] = vv
+        print(f"  融合 QKV 拆分：{prefix}.c_qkv_csa.weight ({w.shape}) → q/k/v_proj_csa")
     # 跳过 MTP 模块权重：MTP 是训练时的辅助预测头，推理时主模型输出已含最终 logits，
     # Rust 端不实现 MTP，载入多余的 ~100 万参数纯属浪费（上次转换把 mtp_modules.* 全带进去了）
     sd = {k: v for k, v in sd.items() if 'mtp_modules' not in k}

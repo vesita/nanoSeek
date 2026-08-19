@@ -35,6 +35,10 @@ pub struct CausalSelfAttention {
     // V4 Attention Sinks：每头一个可学习标量偏置，softmax 末尾追加一列（value 为零）
     use_attn_sink: bool,
     attn_sink: Option<Tensor>, // (n_head,)
+    // V4 QK-Norm：L2 归一化 q/k，q 乘每头可学习 scale（初始 sqrt(head_dim)）。
+    // 开启后三处注意力 scale（块/滑窗/标准）都不再除 sqrt(d)——q 已自带 scale。
+    use_qk_norm: bool,
+    qk_scale: Option<Tensor>, // (n_head,)
     // V4 可学习门控池化：压缩 Linear + sigmoid gate 替代平均池化（K/V 共享权重）
     use_csa_learnable: bool,
     compress_w: Option<Tensor>, // (d, m*d)
@@ -95,6 +99,12 @@ impl CausalSelfAttention {
         } else {
             None
         };
+        // V4 QK-Norm：每头一个可学习 scale（q = normalize(q) * scale，k = normalize(k)）
+        let qk_scale = if config.use_qk_norm {
+            Some(vb.get_unchecked(&format!("{prefix}.qk_scale"))?)
+        } else {
+            None
+        };
         // V4 可学习门控池化：压缩块内 m 个 token 的 K/V（K/V 共享权重）
         let (compress_w, gate_w) = if config.use_csa && config.use_csa_learnable {
             (
@@ -135,6 +145,8 @@ impl CausalSelfAttention {
             use_hca: config.use_hca,
             use_attn_sink: config.use_attn_sink,
             attn_sink,
+            use_qk_norm: config.use_qk_norm,
+            qk_scale,
             use_csa_learnable: config.use_csa_learnable,
             compress_w,
             gate_w,
@@ -142,6 +154,21 @@ impl CausalSelfAttention {
             idx_q_w,
             idx_k_w,
         })
+    }
+
+    /// QK-Norm（对应 model.py 的 _apply_qk_norm）：
+    /// q = normalize(q, dim=-1) * qk_scale[head]，k = normalize(k, dim=-1)。
+    /// q/k 形状 (B,T,nh,d)；qk_scale (nh,) 按 head 广播。RoPE 是范数保持的旋转，
+    /// 前后顺序等价（Python 在 RoPE 前应用，这里同样在 RoPE 前应用）。
+    fn apply_qk_norm(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
+        let scale = self
+            .qk_scale
+            .as_ref()
+            .expect("use_qk_norm 缺 qk_scale")
+            .reshape((1, 1, self.n_head, 1))?; // (1,1,nh,1)
+        let q_norm = normalize_last(q)?.broadcast_mul(&scale)?;
+        let k_norm = normalize_last(k)?;
+        Ok((q_norm, k_norm))
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -169,6 +196,13 @@ impl CausalSelfAttention {
         let k = k.reshape((b, t, self.n_head, self.head_dim))?;
         let v = v.reshape((b, t, self.n_head, self.head_dim))?;
 
+        // QK-Norm：L2 归一化 q/k，q 乘每头 scale（RoPE 范数保持，前后顺序等价）
+        let (q, k) = if self.use_qk_norm {
+            self.apply_qk_norm(&q, &k)?
+        } else {
+            (q, k)
+        };
+
         // RoPE（全头旋转）：只对 q 和 k 旋转（v 不参与）
         let (q, k) = if let (Some(cos), Some(sin)) = (&self.cos, &self.sin) {
             let cos = cos.narrow(0, 0, t)?.unsqueeze(0)?.unsqueeze(2)?; // (1, T, 1, hd)
@@ -185,8 +219,12 @@ impl CausalSelfAttention {
         let k = k.permute((0, 2, 1, 3))?;
         let v = v.permute((0, 2, 1, 3))?;
 
-        // 注意力分数 = q @ k^T / sqrt(head_dim)
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        // 注意力分数 = q @ k^T / sqrt(head_dim)；QK-Norm 时 q 已自带 scale，不再除
+        let scale = if self.use_qk_norm {
+            1.0
+        } else {
+            1.0 / (self.head_dim as f64).sqrt()
+        };
         let mut att = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?; // (B, nh, T, T)
 
         // 因果掩码：上三角（j > i）置 -inf
@@ -233,6 +271,13 @@ impl CausalSelfAttention {
         let v = linear(x, self.v_proj_csa_w.as_ref().expect("use_csa 缺 v_proj_csa"), None)?
             .reshape((b, t, nh, d))?;
 
+        // QK-Norm：L2 归一化 q/k，q 乘每头 scale（在部分 RoPE 前，范数保持顺序等价）
+        let (q, k) = if self.use_qk_norm {
+            self.apply_qk_norm(&q, &k)?
+        } else {
+            (q, k)
+        };
+
         // 部分 RoPE：只旋转前 rope_head_dim 维（与 MLA 一致），其余是"无位置"内容维
         let (q, k) = if let (Some(cos), Some(sin)) = (&self.cos, &self.sin) {
             let rope = self.rope_head_dim;
@@ -256,7 +301,12 @@ impl CausalSelfAttention {
         // nb = 0（不足一个块）时块路径整个跳过，只靠滑窗。
         let t_ok = (t / m) * m;
         let nb = t_ok / m;
-        let scale = 1.0 / (d as f64).sqrt();
+        // QK-Norm 时 q 已自带 qk_scale，不再除 sqrt(d)（对应 model.py 块/滑窗路径）
+        let scale = if self.use_qk_norm {
+            1.0
+        } else {
+            1.0 / (d as f64).sqrt()
+        };
         let q_p = q.permute((0, 2, 1, 3))?; // (B,nh,T,d)，滑窗也要用
 
         let mut y_comp = Tensor::zeros((b, t, nh, d), DType::F32, device)?;
@@ -472,6 +522,15 @@ fn rotate_half(x: &Tensor) -> Result<Tensor> {
     let x1 = x.narrow(3, 0, d / 2)?;
     let x2 = x.narrow(3, d / 2, d - d / 2)?;
     Ok(Tensor::cat(&[&x2.neg()?, &x1], 3)?)
+}
+
+/// 沿最后一维做 L2 归一化（对应 torch.nn.functional.normalize 的默认 eps=1e-12）：
+/// x / max(||x||₂, eps)。candle 无原生 normalize，手动算（张量都很小）。
+fn normalize_last(x: &Tensor) -> Result<Tensor> {
+    let eps = 1e-12f32;
+    let norm = x.sqr()?.sum_keepdim(x.shape().rank() - 1)?.sqrt()?;
+    let denom = norm.clamp(eps, f32::INFINITY)?;
+    Ok(x.broadcast_div(&denom)?)
 }
 
 /// 预计算 RoPE 的 cos/sin 表：(block_size, rope_dim)。

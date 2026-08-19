@@ -62,6 +62,8 @@ pub struct Config {
     #[serde(default)]
     pub use_attn_sink: bool,         // Attention Sinks：每头可学习标量偏置
     #[serde(default)]
+    pub use_qk_norm: bool,           // QK-Norm：L2 归一化 q/k + 每头可学习 scale（V4，dev-notes/25）
+    #[serde(default)]
     pub use_lightning_indexer: bool, // 学习型块选择替代 CSA raw top-k
     #[serde(default)]
     pub num_hash_layers: usize,      // 前 N 层用 hash 路由（0=禁用）
