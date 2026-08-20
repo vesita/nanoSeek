@@ -32,6 +32,14 @@ nanoSeek 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 | **3 Muon 正确化** | 矩阵参数 lr×`muon_lr_scale`(0.2)——DeepSeek/Kimi 惯例，修复上次 A/B 缺缩放的嫌疑 | ✅ |
 | **4 GRPO 骨架** | `training/rl/grpo.py`：采样 G 回复 → 规则奖励（EOS/rep3/长度/中文占比）→ 组内优势 → 策略梯度 + KL 惩罚回基座 | ✅ |
 | **5 量化骨架** | `convert.py --q8`（12.1MB→3.1MB）+ Rust U8 反量化，量化/非量化共用加载路径 | ✅ |
+| **6 默认栈** | `train_chinese.yaml` 重构为 **V4 全兼容栈**（MoE aux-free+√softplus、Muon+lr_scale、WSD、swiglu_clamp、stage）；Rust 补 **LSE gate + block_order**（对拍 0.00000）；已知负面特性保持开关可用但默认关并注明 | ✅ |
+
+**默认训练栈（train_chinese.yaml 现在开着的）**：
+CSA/HCA + 可学习池化 + Sink + QK-Norm + Z-Loss + MoE(shared+aux-free+√softplus) + MTP + mHC + Muon(lr_scale 0.2) + swiglu_clamp + WSD。
+
+**保持关但双端就绪**（dev-notes 有负面结论）：lightning indexer、hash 路由、ffn_attn、no_attn_layers、memory tokens、LSE gate（与 mHC 互斥）、einsum→bmm、MLA（默认用 CSA）。
+
+**框架验收标准**（本次全部满足）：代码能构造（V4 组合）、能切换（stage/schedule/q8）、能对拍（Python↔Rust 逐位一致）——效果一律不看，留给后续按此框架跑真实训练。
 
 **框架验收标准**（本次全部满足）：代码能构造（V4 组合）、能切换（stage/schedule/q8）、能对拍（Python↔Rust 逐位一致）——效果一律不看，留给后续按此框架跑真实训练。
 
