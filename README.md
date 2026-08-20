@@ -21,6 +21,22 @@ nanoSeek 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 
 ---
 
+## 🏗️ 框架升级（2026-08-20，向 DeepSeek-V3/V4 工程栈靠齐）
+
+纯框架工作（不训模型、不评效果），5 个 Phase 全部完成并提交：
+
+| Phase | 内容 | 状态 |
+|---|---|---|
+| **1 架构开关** | Python/Rust 双端 **MLA**、√softplus+route_scale 路由、aux-free MoE 平衡、lightning indexer 一等公民；全部路径 Python↔Rust **逐位对拍通过（max err=0.00000）** | ✅ |
+| **2 两阶段训练** | `prepare.py --pretrain`（原始文本 → pretrain.bin）+ `train.py --stage=pretrain\|sft\|full`（无掩码全 token vs 对话掩码）+ **WSD 调度**（warmup-stable-decay）；阶段衔接 init_from 验证跑通 | ✅ |
+| **3 Muon 正确化** | 矩阵参数 lr×`muon_lr_scale`(0.2)——DeepSeek/Kimi 惯例，修复上次 A/B 缺缩放的嫌疑 | ✅ |
+| **4 GRPO 骨架** | `training/rl/grpo.py`：采样 G 回复 → 规则奖励（EOS/rep3/长度/中文占比）→ 组内优势 → 策略梯度 + KL 惩罚回基座 | ✅ |
+| **5 量化骨架** | `convert.py --q8`（12.1MB→3.1MB）+ Rust U8 反量化，量化/非量化共用加载路径 | ✅ |
+
+**框架验收标准**（本次全部满足）：代码能构造（V4 组合）、能切换（stage/schedule/q8）、能对拍（Python↔Rust 逐位一致）——效果一律不看，留给后续按此框架跑真实训练。
+
+---
+
 ## 当前功能
 
 **固定架构**（`model.py` 硬编码，不可配置）：RMSNorm + SwiGLU。
