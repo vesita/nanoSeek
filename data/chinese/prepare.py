@@ -120,6 +120,7 @@ def write_manifest(args, tokenizer, train_samples, val_samples,
             "with_books": args.with_books,
             "task_ratio": args.task_ratio,
             "insert_eos": args.insert_eos,
+            "pretrain": getattr(args, 'pretrain', False),
         },
         "tokenizer": meta,
         "counts": {
@@ -170,6 +171,10 @@ def main():
                     help='每条 模型： 回复后插入 <eos>（turn-level 终止符，治喋喋不休，默认开启）')
     ap.add_argument('--no-insert-eos', action='store_true',
                     help='关闭 --insert-eos（不插 <eos>，旧数据行为）')
+    ap.add_argument('--pretrain', action='store_true',
+                    help='预训练模式：所有 txt 按原始文本编码（不解析 用户：/模型： 结构、'
+                         '不插 <eos>、无 loss mask 概念），输出 pretrain.bin/val.bin——'
+                         '对应 train.py --stage=pretrain 的无掩码全 token 训练')
     args = ap.parse_args()
     if args.no_insert_eos:
         args.insert_eos = False
@@ -185,6 +190,33 @@ def main():
     tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
     vocab_size = tokenizer.get_vocab_size()
     print(f'BPE 分词器：{vocab_size} token')
+
+    # 0) 预训练模式：全部 txt 按原始文本 90/10 字符切分，不解析对话结构、不插 <eos>。
+    #    输出 pretrain.bin（train.py --stage=pretrain 读它做无掩码全 token 训练）。
+    if args.pretrain:
+        train_parts, val_parts = [], []
+        for fn in sorted(os.listdir(DATA_DIR)):
+            if not fn.endswith('.txt'):
+                continue
+            with open(os.path.join(DATA_DIR, fn), 'r', encoding='utf-8', errors='replace') as f:
+                text = f.read()
+            n = int(len(text) * 0.9)
+            train_parts.append(text[:n])
+            val_parts.append(text[n:])
+        train_data = ''.join(train_parts)
+        val_data = ''.join(val_parts)
+        encode_to_bin(train_data, tokenizer, os.path.join(DATA_DIR, 'pretrain.bin'))
+        encode_to_bin(val_data, tokenizer, os.path.join(DATA_DIR, 'val.bin'))
+        meta = {'vocab_size': vocab_size, 'tokenizer_path': os.path.basename(TOKENIZER_PATH)}
+        print(f'预训练数据：{len(train_data):,} 训练字符 / {len(val_data):,} 验证字符')
+        print(f'pretrain token 数：{os.path.getsize(os.path.join(DATA_DIR, "pretrain.bin")) // 2:,}')
+        print(f'val token 数：{os.path.getsize(os.path.join(DATA_DIR, "val.bin")) // 2:,}')
+        with open(os.path.join(DATA_DIR, 'meta.pkl'), 'wb') as f:
+            pickle.dump(meta, f)
+        write_manifest(args, tokenizer, train_parts, val_parts,
+                       train_data, val_data, meta)
+        print('完成 ✅ pretrain.bin / val.bin / meta.pkl / manifest.json 已生成（预训练模式）')
+        return
 
     # 3) 读取所有 .txt，按"空行分隔的样本"（每条对话）拆开。
     #    旧实现是按文件拼接后整段硬切 90/10，会让 val 恰好落在最后一个文件

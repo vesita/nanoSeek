@@ -142,6 +142,15 @@ decay_lr = True # 是否衰减学习率
 warmup_iters = 100 # 预热多少步
 lr_decay_iters = 5000 # 根据 Chinchilla 论文，应约等于 max_iters
 min_lr = 1e-4 # 最小学习率，根据 Chinchilla 论文应约等于 learning_rate/10
+# 两阶段训练框架（DeepSeek 路线，2026-08-19）：
+#   stage=pretrain：无掩码全 token 语言建模（读 pretrain.bin），学语言+对话结构；
+#   stage=sft：对话微调（读 train.bin，build_assistant_mask 只对 assistant 回复算 loss）；
+#   stage=full：单阶段对话训练（旧行为，等价 sft）。
+# 阶段衔接：pretrain 产物 resume 进 sft（--init_from=out/xxx/best.pt 或续训）。
+stage = 'full'                 # pretrain | sft | full
+schedule = 'cosine'            # cosine | wsd（WSD=warmup-stable-decay，DeepSeek-V3）
+# WSD 参数：stable_frac 之后的 lr_decay_iters 步从 learning_rate 线性/指数衰减到 min_lr
+stable_frac = 0.8              # 稳定段占比（前 80% 步保持 learning_rate）
 # DDP 设置
 backend = 'nccl' # 'nccl'、'gloo' 等
 # 系统
@@ -200,7 +209,8 @@ if os.path.exists(data_manifest_path):
 
 # 每个 epoch 的步数（YOLO 式进度条显示轮次用）
 try:
-    _train_tokens = os.path.getsize(os.path.join(data_dir, 'train.bin')) // 2  # uint16
+    _train_bin = 'pretrain.bin' if stage == 'pretrain' else 'train.bin'
+    _train_tokens = os.path.getsize(os.path.join(data_dir, _train_bin)) // 2  # uint16
     steps_per_epoch = max(1, _train_tokens // tokens_per_iter)
 except OSError:
     steps_per_epoch = None
@@ -249,22 +259,25 @@ def get_batch(split):
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
         # 预算中性混合：以概率 p_distill 从蒸馏数据切块；distill.bin 太短（< 2*block_size
-        # 个字节，即不足一个窗口）时退回 train.bin，避免 randint 越界。
+        # 个字节，即不足一个窗口）时退回主数据，避免 randint 越界。
+        main_bin = 'pretrain.bin' if stage == 'pretrain' else 'train.bin'
         use_distill = (distill_bin and p_distill > 0 and random.random() < p_distill
                        and os.path.exists(distill_bin)
                        and os.path.getsize(distill_bin) > 2 * block_size)
-        path = distill_bin if use_distill else os.path.join(data_dir, 'train.bin')
+        path = distill_bin if use_distill else os.path.join(data_dir, main_bin)
     else:
         path = os.path.join(data_dir, 'val.bin')
     data = np.memmap(path, dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    # loss masking：只对 assistant 回复 token 算 loss（chat 微调惯例），
+    # loss masking：两阶段框架——pretrain 无掩码全 token 语言建模（DeepSeek 路线）；
+    # sft/full 只对 assistant 回复 token 算 loss（chat 微调惯例），
     # 用户轮次和分隔符设 ignore_index=-1，不参与梯度计算。
-    for i in range(batch_size):
-        mask = build_assistant_mask(y[i])
-        y[i, ~mask] = -100
+    if stage != 'pretrain':
+        for i in range(batch_size):
+            mask = build_assistant_mask(y[i])
+            y[i, ~mask] = -100
     if device_type == 'cuda':
         # 固定 x、y 的内存，这样我们可以异步（non_blocking=True）把它们搬到 GPU
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -437,10 +450,18 @@ def get_lr(it):
     # 1) 线性预热 warmup_iters 步
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
-    # 2) 如果 it > lr_decay_iters，返回最小学习率
+    # 2) WSD（warmup-stable-decay，DeepSeek-V3）：稳定段保持 learning_rate，
+    #    最后 (1-stable_frac) 段线性衰减到 min_lr——训完 decay 出最优 checkpoint。
+    if schedule == 'wsd':
+        decay_start = int(lr_decay_iters * stable_frac)
+        if it <= decay_start:
+            return learning_rate
+        decay_ratio = (it - decay_start) / max(lr_decay_iters - decay_start, 1)
+        decay_ratio = min(decay_ratio, 1.0)
+        return learning_rate + (min_lr - learning_rate) * decay_ratio
+    # 3) 余弦调度（旧行为）：中间部分用余弦衰减下降到最小学习率
     if it > lr_decay_iters:
         return min_lr
-    # 3) 中间部分，用余弦衰减下降到最小学习率
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff 取值范围 0..1
