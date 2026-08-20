@@ -41,6 +41,7 @@ class GPTConfig:
     use_muon: bool = False      # True：矩阵参数用 Muon，embedding/lm_head/norm 用 AdamW
     muon_momentum: float = 0.95 # Muon 动量系数
     muon_ns_steps: int = 10     # Newton-Schulz 迭代次数（默认 8 激进 + 2 经典）
+    muon_lr_scale: float = 0.2 # Muon 矩阵参数 lr 缩放（DeepSeek/Kimi 惯例：AdamW lr × 0.2）
     # --- V4 核心：CSA/HCA 混合注意力（简化教育版）---
     # 块级 KV 压缩 + top-k 稀疏块选择 + 滑窗局部注意力 + HCA 重度压缩全局信号。
     # 核心收益：注意力开销从 O(T²) 降到 O(T·(nb + win))，这是 1M 上下文能跑起来的关键。

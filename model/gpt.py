@@ -192,7 +192,8 @@ class GPT(nn.Module):
                 else:
                     muon_params.append(p)   # 其余矩阵参数（attention/FFN/router）
             muon = Muon([{'params': muon_params, 'weight_decay': weight_decay}],
-                        lr=learning_rate, momentum=self.config.muon_momentum,
+                        lr=learning_rate * self.config.muon_lr_scale,
+                        momentum=self.config.muon_momentum,
                         ns_steps=self.config.muon_ns_steps)
             fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
             extra_args = dict(fused=True) if fused_available and device_type == 'cuda' else {}

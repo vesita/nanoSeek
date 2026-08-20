@@ -108,6 +108,7 @@ mtp_weight = 0.3       # MTP 损失权重（DeepSeek-V3 建议 0.3）
 use_muon = False       # 矩阵参数用 Muon，embedding/lm_head/norm 用 AdamW
 muon_momentum = 0.95   # Muon 动量系数
 muon_ns_steps = 10     # Newton-Schulz 迭代次数（默认 8 激进 + 2 经典）
+muon_lr_scale = 0.2   # Muon 矩阵参数 lr 缩放（DeepSeek/Kimi 惯例：AdamW lr × 0.2）
 # --- V4 核心：CSA/HCA 压缩稀疏注意力 ---
 use_csa = False        # CSA 压缩稀疏注意力（块级 KV 压缩 + top-k 稀疏选择 + 滑窗）
 csa_compress = 16      # 块大小：每几个 token 压成一个潜在 KV
@@ -307,6 +308,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_mla=use_mla, kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim,
                   use_mtp=use_mtp, n_mtp=n_mtp, mtp_weight=mtp_weight,
                   use_muon=use_muon, muon_momentum=muon_momentum, muon_ns_steps=muon_ns_steps,
+                  muon_lr_scale=muon_lr_scale,
                   use_csa=use_csa, csa_compress=csa_compress, csa_topk=csa_topk,
                   csa_window=csa_window, use_hca=use_hca, use_csa_learnable=use_csa_learnable,
                   use_csa_fused_qkv=use_csa_fused_qkv, use_csa_bmm=use_csa_bmm,
@@ -332,7 +334,7 @@ def _build_model_from_checkpoint(checkpoint):
               'use_sqrtsoftplus', 'route_scale',
               'use_mla', 'kv_lora_rank', 'qk_rope_head_dim',
               'use_mtp', 'n_mtp', 'mtp_weight',
-              'use_muon', 'muon_momentum', 'muon_ns_steps',
+              'use_muon', 'muon_momentum', 'muon_ns_steps', 'muon_lr_scale',
               'use_csa', 'csa_compress', 'csa_topk', 'csa_window',
               'use_hca', 'use_csa_learnable', 'use_csa_fused_qkv', 'use_csa_bmm',
               'use_attn_sink', 'use_mhc', 'hc_mult',
