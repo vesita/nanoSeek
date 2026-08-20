@@ -22,6 +22,9 @@ def main():
     ap.add_argument('--ckpt', default='out/chinese-data2/best.pt', help='训练好的 checkpoint 路径（默认当前最佳模型）')
     ap.add_argument('--dataset', default='chinese', help='数据集名，用来找 data/<dataset>/tokenizer.json')
     ap.add_argument('--out', default='inference/runtime', help='输出目录（Rust 项目根）')
+    ap.add_argument('--q8', action='store_true',
+                    help='Q8 量化：权重按张量对称 int8 量化（scale=max|w|/127），'
+                         '体积 ~1/4；Rust 端加载时按 scale 反量化。骨架版，未做精度校准')
     args = ap.parse_args()
 
     ck = torch.load(args.ckpt, map_location='cpu', weights_only=False)
@@ -60,6 +63,26 @@ def main():
     sd = {k: v for k, v in sd.items() if k != 'lm_head.weight'}
     # 统一转 float32（Rust 端按 F32 处理）
     sd = {k: v.float().contiguous() for k, v in sd.items()}
+
+    # Q8 量化（骨架）：每张量对称 int8——scale = max|w|/127，q = round(w/scale)。
+    # candle safetensors 不支持 I8，存 U8（int8+128 偏移）；权重名保持不变（存 uint8），
+    # 另存 {name}_scale (f32 标量)；Rust 加载时反量化：(u8-128)*scale。
+    if args.q8:
+        qsd = {}
+        n_q = 0
+        for k, v in sd.items():
+            if v.dim() >= 2 and v.numel() > 1:   # 矩阵权重量化，bias/标量不动
+                scale = v.abs().max().item() / 127.0
+                if scale > 0:
+                    q = torch.clamp(torch.round(v / scale), -128, 127).to(torch.int8)
+                    qsd[k] = (q.to(torch.uint8) + 128).contiguous()   # int8 → uint8 偏移
+                    qsd[f'{k}_scale'] = torch.tensor([scale], dtype=torch.float32)
+                    n_q += 1
+                    continue
+            qsd[k] = v
+        sd = qsd
+        model_args['quantized'] = 'q8'
+        print(f"  Q8 量化：{n_q} 个权重张量 → uint8（含 scale）")
 
     os.makedirs(args.out, exist_ok=True)
     save_file(sd, os.path.join(args.out, 'model.safetensors'))

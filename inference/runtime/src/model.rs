@@ -135,7 +135,24 @@ pub struct GPT {
 impl GPT {
     /// 从 safetensors + config 加载权重。
     pub fn load(model_path: &str, config: &Config, device: &Device) -> Result<Self> {
-        let tensors = candle_core::safetensors::load(model_path, device)?;
+        let mut tensors = candle_core::safetensors::load(model_path, device)?;
+        // Q8 反量化（骨架）：convert.py --q8 把权重存成 uint8（int8+128 偏移）+ {name}_scale。
+        // 加载时先扫描 scale 张量，把对应的 uint8 权重反量化为 F32：(u8-128)*scale，
+        // 再交给 VarBuilder——上层模型代码零改动，量化/非量化共用同一加载路径。
+        let scale_names: Vec<String> = tensors
+            .keys()
+            .filter(|k| k.ends_with("_scale"))
+            .cloned()
+            .collect();
+        for sn in &scale_names {
+            let base = sn.trim_end_matches("_scale").to_string();
+            if let (Some(q), Some(sc)) = (tensors.get(&base), tensors.get(sn)) {
+                let scale = sc.to_vec1::<f32>()?[0] as f64;   // scale 形状 [1]，to_scalar 要求 0 秩
+                let deq = q.to_dtype(DType::F32)?.affine(1.0, -128.0)?.affine(scale, 0.0)?; // (u8-128)*scale
+                tensors.insert(base, deq);
+                tensors.remove(sn);
+            }
+        }
         let vb = candle_nn::VarBuilder::from_tensors(tensors, DType::F32, device);
 
         let wte = vb.get_unchecked("transformer.wte.weight")?;
