@@ -33,9 +33,10 @@ nanoSeek 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 | **4 GRPO 骨架** | `training/rl/grpo.py`：采样 G 回复 → 规则奖励（EOS/rep3/长度/中文占比）→ 组内优势 → 策略梯度 + KL 惩罚回基座 | ✅ |
 | **5 量化骨架** | `convert.py --q8`（12.1MB→3.1MB）+ Rust U8 反量化，量化/非量化共用加载路径 | ✅ |
 | **6 默认栈** | `train_chinese.yaml` 重构为 **V4 全兼容栈**（MoE aux-free+√softplus、Muon+lr_scale、WSD、swiglu_clamp、stage）；Rust 补 **LSE gate + block_order**（对拍 0.00000）；已知负面特性保持开关可用但默认关并注明 | ✅ |
+| **7 GLM-5 Muon Split** | 注意力投影按「头」分块做 NS 正交化（替代整块）——A/B 实测 1500 步 **val 0.7776**（整块 1.6522 / AdamW 1.2700）→ **翻默认**；`indexer_warmup_steps`（GLM-5 DSA 冻结预热配方）加入框架，小模型 1500 步下仍净负保持关 | ✅ |
 
 **默认训练栈（train_chinese.yaml 现在开着的）**：
-CSA/HCA + 可学习池化 + Sink + QK-Norm + Z-Loss + MoE(shared+aux-free+√softplus) + MTP + mHC + Muon(lr_scale 0.2) + swiglu_clamp + WSD。
+CSA/HCA + 可学习池化 + Sink + QK-Norm + Z-Loss + MoE(shared+aux-free+√softplus) + MTP + mHC + Muon(lr_scale 0.2) + **Muon Split(GL-5)** + swiglu_clamp + WSD。
 
 **保持关但双端就绪**（dev-notes 有负面结论）：lightning indexer、hash 路由、ffn_attn、no_attn_layers、memory tokens、LSE gate（与 mHC 互斥）、einsum→bmm、MLA（默认用 CSA）。
 

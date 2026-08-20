@@ -59,6 +59,10 @@ use_csa_fused_qkv: true   # 计算优化：Q/K/V 三合一（权重布局变，�
 use_csa_bmm: false        # einsum→bmm（A/B 3 每步更慢 → 保持关）
 # use_lightning_indexer: false  # DSA 学习型块选择——dev-notes/13 归因 1500 步拖慢，保持关；
 #                               # 代码 Python/Rust 双端就绪，预算更大时可 A/B 再开
+# indexer_warmup_steps: 0       # GLM-5 DSA 配方（2026-02）：先冻结主模型、只训索引器 N 步，
+#                               # 再放开联合训练——GLM-5 用 20B token（含 1000 步索引器预热）
+#                               # 追平 DeepSeek 943.7B token 的 DSA 效果。配合
+#                               # use_lightning_indexer=true 使用（默认关）
 
 # --- MTP 多 token 预测（DeepSeek-V3 核心，训练信号增强，推理零开销）---
 use_mtp: true
@@ -87,6 +91,10 @@ use_muon: true
 muon_momentum: 0.95
 muon_ns_steps: 10
 muon_lr_scale: 0.2        # 矩阵参数 lr = learning_rate × 0.2（DeepSeek/Kimi 惯例）
+muon_split: true          # GLM-5 Muon Split（2026-02 技术报告）：注意力投影按「头」分块做 NS
+                          # 正交化，替代整块正交化。A/B 实测（dev-notes/34）：1500 步 val
+                          # 0.7776 vs 整块 1.6522 vs AdamW 1.2700——修好 Muon 短预算收敛差并
+                          # 大幅超越 AdamW 冠军 → 翻默认。纯优化器改动（零参数、零前向影响）。
 learning_rate: 0.001
 max_iters: 5000
 lr_decay_iters: 5000

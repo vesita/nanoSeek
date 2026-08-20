@@ -11,6 +11,26 @@ from .block import Block, MTPModule
 from .optimizer import Muon, MuonAdamW
 
 
+def _attn_head_spec(name, p, nh):
+    """GLM-5 Muon Split：判断参数是不是「按头拼接」的注意力投影，返回 (n_heads, head_first)。
+
+    head_first=True  : 权重行方向按头拼接（q/k/v 投影，形状 (H·d, n)）
+    head_first=False : 权重列方向按头拼接（输出投影，形状 (n, H·d)）
+    返回 None 表示不是注意力投影（整块正交化即可）。
+
+    注意 c_proj 名字冲突：SwiGLU 的下投影也叫 c_proj（(n_embd, hidden)，非方形）。
+    注意力输出投影恒为 (n_embd, n_embd) 方形且在 attn 子模块下，两个条件联合判定。
+    """
+    if name.endswith('c_qkv_csa.weight') or name.endswith('c_attn.weight'):
+        return (3 * nh, True)          # 融合 QKV / 标准 c_attn：行 = [q; k; v]，各 H·d 行
+    if name.endswith('c_proj.weight') and '.attn.' in name and p.shape[0] == p.shape[1]:
+        return (nh, False)             # 注意力输出投影（方形）；SwiGLU 下投影非方形 → 跳过
+    if name.endswith(('q_proj.weight', 'k_up.weight', 'v_up.weight',
+                      'q_proj_csa.weight', 'k_proj_csa.weight', 'v_proj_csa.weight')):
+        return (nh, True)              # MLA q/k_up/v_up、非融合 CSA q/k/v：行 = 头
+    return None
+
+
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -184,6 +204,7 @@ class GPT(nn.Module):
             # V4：矩阵参数（除 embedding/lm_head）走 Muon；嵌入/输出头/1D 参数用 AdamW 保护。
             # 注意 Muon 不依赖 beta2（没有二阶矩），所以 betas 参数被忽略。
             muon_params, adamw_decay, adamw_nodecay = [], [], []
+            split_heads = {}   # GLM-5 Muon Split：id(p) → (n_heads, head_first)
             for n, p in param_dict.items():
                 if n.startswith('transformer.wte') or n.startswith('lm_head'):
                     adamw_decay.append(p)   # 嵌入/输出头无矩阵结构，正交化无意义
@@ -191,10 +212,15 @@ class GPT(nn.Module):
                     adamw_nodecay.append(p) # norm/bias
                 else:
                     muon_params.append(p)   # 其余矩阵参数（attention/FFN/router）
+                    if self.config.muon_split:
+                        spec = _attn_head_spec(n, p, self.config.n_head)
+                        if spec is not None:
+                            split_heads[id(p)] = spec
             muon = Muon([{'params': muon_params, 'weight_decay': weight_decay}],
                         lr=learning_rate * self.config.muon_lr_scale,
                         momentum=self.config.muon_momentum,
-                        ns_steps=self.config.muon_ns_steps)
+                        ns_steps=self.config.muon_ns_steps,
+                        split_heads=split_heads)
             fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
             extra_args = dict(fused=True) if fused_available and device_type == 'cuda' else {}
             adamw = torch.optim.AdamW(

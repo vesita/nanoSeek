@@ -109,6 +109,7 @@ use_muon = False       # 矩阵参数用 Muon，embedding/lm_head/norm 用 AdamW
 muon_momentum = 0.95   # Muon 动量系数
 muon_ns_steps = 10     # Newton-Schulz 迭代次数（默认 8 激进 + 2 经典）
 muon_lr_scale = 0.2   # Muon 矩阵参数 lr 缩放（DeepSeek/Kimi 惯例：AdamW lr × 0.2）
+muon_split = False     # GLM-5 Muon Split：注意力投影按「头」分块做 NS 正交化（修 Muon 短预算收敛差）
 # --- V4 核心：CSA/HCA 压缩稀疏注意力 ---
 use_csa = False        # CSA 压缩稀疏注意力（块级 KV 压缩 + top-k 稀疏选择 + 滑窗）
 csa_compress = 16      # 块大小：每几个 token 压成一个潜在 KV
@@ -152,6 +153,10 @@ stage = 'full'                 # pretrain | sft | full
 schedule = 'cosine'            # cosine | wsd（WSD=warmup-stable-decay，DeepSeek-V3）
 # WSD 参数：stable_frac 之后的 lr_decay_iters 步从 learning_rate 线性/指数衰减到 min_lr
 stable_frac = 0.8              # 稳定段占比（前 80% 步保持 learning_rate）
+# GLM-5 DSA 配方（2026-02 技术报告）：稀疏注意力适配时先冻结主模型、只训练索引器
+# N 步，再放开联合训练——GLM-5 用 20B token（含 1000 步索引器预热）追平 DeepSeek
+# 943.7B token 的 DSA 训练效果。只对 lightning indexer 生效，默认关。
+indexer_warmup_steps = 0       # >0：前 N 步只训练 idx_q/idx_k（主模型冻结）
 # DDP 设置
 backend = 'nccl' # 'nccl'、'gloo' 等
 # 系统
@@ -308,7 +313,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_mla=use_mla, kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim,
                   use_mtp=use_mtp, n_mtp=n_mtp, mtp_weight=mtp_weight,
                   use_muon=use_muon, muon_momentum=muon_momentum, muon_ns_steps=muon_ns_steps,
-                  muon_lr_scale=muon_lr_scale,
+                  muon_lr_scale=muon_lr_scale, muon_split=muon_split,
                   use_csa=use_csa, csa_compress=csa_compress, csa_topk=csa_topk,
                   csa_window=csa_window, use_hca=use_hca, use_csa_learnable=use_csa_learnable,
                   use_csa_fused_qkv=use_csa_fused_qkv, use_csa_bmm=use_csa_bmm,
@@ -334,7 +339,7 @@ def _build_model_from_checkpoint(checkpoint):
               'use_sqrtsoftplus', 'route_scale',
               'use_mla', 'kv_lora_rank', 'qk_rope_head_dim',
               'use_mtp', 'n_mtp', 'mtp_weight',
-              'use_muon', 'muon_momentum', 'muon_ns_steps', 'muon_lr_scale',
+              'use_muon', 'muon_momentum', 'muon_ns_steps', 'muon_lr_scale', 'muon_split',
               'use_csa', 'csa_compress', 'csa_topk', 'csa_window',
               'use_hca', 'use_csa_learnable', 'use_csa_fused_qkv', 'use_csa_bmm',
               'use_attn_sink', 'use_mhc', 'hc_mult',
@@ -474,6 +479,19 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+def _set_indexer_freeze(model, frozen):
+    """GLM-5 索引器预热：frozen=True 时只有 idx_q/idx_k（lightning indexer）可训练。
+
+    其余参数 requires_grad=False → 前向仍计算、反向不再产生梯度，优化器自动跳过
+    （grad=None），主模型等效冻结。注意：aux-free 路由偏置在 MoE.forward 里原地
+    更新（balance_factor，不经过优化器），预热期仍会微调——幅度 0.001 且自校正，
+    可接受（相当于路由偏置顺带预热）。解冻后 requires_grad 恢复 True。
+    """
+    for n, p in model.named_parameters():
+        is_indexer = 'idx_q' in n or 'idx_k' in n
+        p.requires_grad = (not frozen) or is_indexer
+
+
 def _backup_old_run(out_dir):
     """重复训练到同一 out_dir 前，把已有旧实验产物归档到 out_dir/old/，仅保留最近一份。
 
@@ -608,6 +626,22 @@ pbar = tqdm(total=max_iters, initial=iter_num, desc="训练中", dynamic_ncols=T
 loss_history = []  # 每个评估点记 (iter, train_loss, val_loss)，训练结束画曲线图用
 early_stopped = False  # 早停是否触发（收尾打印用）
 no_improve_count = 0   # val 连续无实质改善的评估次数（早停计数）
+
+# --- GLM-5 索引器预热（可选）：冻结主模型，前 N 步只训练 lightning indexer ---
+# 配方出处（2026-02 GLM-5 技术报告）：DSA 适配先 1000 步只训索引器、主模型冻结，
+# 再 20B token 稀疏适配，追平 DeepSeek 943.7B token 的 DSA 训练效果。
+_idx_warmup_active = False
+if indexer_warmup_steps > 0:
+    assert use_lightning_indexer, \
+        "indexer_warmup_steps>0 需要 use_lightning_indexer=True（没有索引器就没东西可预热）"
+    idx_names = [n for n, p in raw_model.named_parameters() if 'idx_q' in n or 'idx_k' in n]
+    assert idx_names, f"未找到 lightning indexer 参数（idx_q/idx_k），当前模型没有索引器"
+    _set_indexer_freeze(raw_model, True)
+    _idx_warmup_active = True
+    if master_process:
+        print(f"GLM-5 索引器预热：前 {indexer_warmup_steps} 步只训练 {len(idx_names)} 个"
+              f"索引器参数（主模型冻结），随后解冻联合训练")
+
 while True:
 
     # 确定并设置本次迭代的学习率
@@ -676,6 +710,13 @@ while True:
                         break
     if iter_num == 0 and eval_only:
         break
+
+    # GLM-5 索引器预热：warmup 结束的当步解冻主模型（只切换一次，避免每步开销）
+    if _idx_warmup_active and iter_num >= indexer_warmup_steps:
+        _set_indexer_freeze(raw_model, False)
+        _idx_warmup_active = False
+        if master_process:
+            pbar.write(f"✓ 索引器预热结束 @{iter_num}：解冻主模型，联合训练")
 
     # 前向反向更新，带可选的梯度累积以模拟更大的 batch size
     # 如果数据类型是 float16，则使用 GradScaler
