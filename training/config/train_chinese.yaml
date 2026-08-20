@@ -1,13 +1,9 @@
-# 唯一默认配置：中文对话模型，CSA/HCA 压缩稀疏注意力 + MoE。
+# 唯一默认配置：中文对话模型——V4 全技术栈（向 DeepSeek-V3/V4 工程栈靠齐，2026-08-20 重构）。
+# 原则：兼容且无已知负面结果的 V4 技术全开；已知负面结果（dev-notes 标注）保持开关
+# 可用但默认关，下方逐条注明。
 # 固定架构（硬编码）：RMSNorm + SwiGLU；RoPE 由 use_rope 开关控制。
-# 四项 V4 升级：CSA 可学习门控池化 / MoE 共享专家 + aux-free + √softplus / Muon / MTP
-# csa_compress 越小越接近全量注意力，topk 越大全局信息越全但越贵。
 # 规模：6×80 深度换宽度（+MTP ~2.85M 参数），适配 8000 BPE 词表。
-# 快速验证代码是否跑得通用 test.yaml（步数少、模型更小）。
 # out_dir 指向默认模型（reb：重平衡数据 + 轮次标签 loss，val 1.2700 @1500；A1/B1/C1 胜者）。
-# 2026-08-19 迁移：ab2-qkv → reb（--task-ratio 0.25 重平衡 + mask 纳入轮次边界标签）；
-# 命名清理：chinese-data2-reb → chinese-reb（v0.2 定版）。
-# 旧模型（lm/eos/ab1/ab2/ab3）加载需显式 --use_csa_fused_qkv=false。
 # 重训会用 out_dir/old 保护机制归档旧实验。
 out_dir: out/chinese-reb
 eval_interval: 250
@@ -22,6 +18,14 @@ gradient_accumulation_steps: 1
 batch_size: 64
 block_size: 256
 
+# --- 两阶段训练框架（2026-08-20 Phase2）---
+# stage: pretrain（无掩码全 token，读 pretrain.bin）| sft（对话掩码，读 train.bin）| full（单阶段对话，默认）。
+# 推荐工作流：prepare.py --pretrain → --stage=pretrain 训练 → prepare.py（对话）→ --stage=sft --init_from=预训练产物。
+stage: full
+# schedule: wsd（warmup-stable-decay，DeepSeek-V3）| cosine（旧行为）。WSD 训完 decay 出最优 checkpoint。
+schedule: wsd
+stable_frac: 0.8
+
 # small 模型（~2.85M 参数含 MTP；6×80 深度换宽度，规模与旧 4×96 持平）
 vocab_size: 8000   # 显式指定，防止 GPTConfig 默认 50304（GPT-2 词表）
 n_layer: 6         # 4→6：加深，重复坍缩部分原因是太浅学不到长期依赖
@@ -33,22 +37,30 @@ dropout: 0.2
 use_rope: true
 rope_theta: 1000000.0   # 10000→1e6：更低的旋转频率，能表达更远的相对距离（DeepSeek 做法）
 
-# --- MoE 混合专家 ---
+# --- MoE 混合专家（V4 全开）---
 use_moe: true
 n_experts: 4
 n_top_k: 2
-moe_aux_weight: 0.01
-use_shared_expert: true   # A/B 验证有效（val loss 5.01→4.91）：共享专家捕获共性特征
+use_shared_expert: true      # A/B 验证有效：共享专家捕获共性特征
+use_aux_free_balance: true   # V4 aux-free：无辅助损失，偏置修正均衡（DeepSeek-V3）替代 Switch aux loss
+balance_factor: 0.001
+use_sqrtsoftplus: true       # V4 路由打分：√softplus(logits)×route_scale（DeepSeek-V3）替代 softmax
+route_scale: 2.5
+moe_aux_weight: 0.01         # aux-free 时不用，保留为 Switch 模式回退值
 
-# --- CSA/HCA 混合注意力（默认；也可换 MLA）---
+# --- CSA/HCA 混合注意力（默认注意力；MLA 可换：use_mla=true + use_csa=false）---
 use_csa: true
 csa_compress: 16    # 每 16 个 token 压成一个潜在 KV
 csa_topk: 4         # 每个 query 稀疏选 4 个压缩块
 csa_window: 64      # 滑窗保留最近 64 个原始 token
 use_hca: true       # 加 HCA 重度压缩全局信号
 use_csa_learnable: true   # 可学习门控池化替代平均池化
+use_csa_fused_qkv: true   # 计算优化：Q/K/V 三合一（权重布局变，仅新训练；A/B 2 胜出→默认）
+use_csa_bmm: false        # einsum→bmm（A/B 3 每步更慢 → 保持关）
+# use_lightning_indexer: false  # DSA 学习型块选择——dev-notes/13 归因 1500 步拖慢，保持关；
+#                               # 代码 Python/Rust 双端就绪，预算更大时可 A/B 再开
 
-# --- MTP 多 token 预测（V3/V4 验证过，训练信号增强，推理零开销）---
+# --- MTP 多 token 预测（DeepSeek-V3 核心，训练信号增强，推理零开销）---
 use_mtp: true
 n_mtp: 1
 mtp_weight: 0.3
@@ -59,14 +71,22 @@ use_mhc: true                 # mHC：4 流并行残差——1500 步归因收�
 hc_mult: 4
 use_qk_norm: true             # QK-Norm：L2 归一化 q/k + 每头可学习 scale（+24 参数），val −0.052（dev-notes/25）
 z_loss_weight: 0.0001         # Router Z-Loss：z=logsumexp(router)² 正则（0 参数），与 QK 合开 −0.189 超线性（dev-notes/25）
-# use_lightning_indexer: true  # 学习型块选择替代 CSA raw top-k
-# num_hash_layers: 2           # 前 2 层用 hash 路由
-# 计算图重排（拓扑实验 A）：块内子层顺序。attn_ffn（默认）| ffn_attn。
-# 零参数、零权重名变更，只换执行顺序。ffn_attn 的对照配置见 train_chinese_fa.yaml。
-block_order: attn_ffn
-no_attn_layers: []       # 稀疏注意力布线（拓扑实验 B）：空=所有层都有注意力
-n_memory_tokens: 0       # 显式记忆 token（拓扑实验 C）：0=关闭；对照配置见 train_chinese_mem.yaml
+swiglu_clamp: 0.5             # SwiGLU 门控钳制半宽（V4 稳定性，0=关）
+# use_lse_gate: false         # 对数放缩门控混合（dev-notes/24 甜点）——与 use_mhc 行为互斥
+#                             # （mHC 前向短路，lse_gate 只在非 mHC 路径生效）；Python/Rust 已就绪，
+#                             # 想要 LSE 时关 mHC 再开。
+# num_hash_layers: 0          # 前 N 层 hash 路由——dev-notes/13 拖慢，保持 0
 
+# --- 拓扑实验开关（已知负面结果，保持默认；代码双端就绪）---
+block_order: attn_ffn    # ffn_attn 负结果（dev-notes/17），保持默认
+no_attn_layers: []       # 删注意力有害（dev-notes/18-19），保持空；Python-only，Rust 未实现
+n_memory_tokens: 0       # 静态先验采样崩坏（dev-notes/20），保持 0；Python-only，Rust 未实现
+
+# --- 优化器：Muon（V4，DeepSeek-V3/Kimi 核心；lr_scale=0.2 已修正 2026-08-20 Phase3）---
+use_muon: true
+muon_momentum: 0.95
+muon_ns_steps: 10
+muon_lr_scale: 0.2        # 矩阵参数 lr = learning_rate × 0.2（DeepSeek/Kimi 惯例）
 learning_rate: 0.001
 max_iters: 5000
 lr_decay_iters: 5000

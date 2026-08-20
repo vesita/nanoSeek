@@ -83,6 +83,12 @@ pub struct Config {
     pub route_scale: f64,            // √softplus 打分缩放（DeepSeek-V3 默认 2.5）
     #[serde(default)]
     pub use_aux_free_balance: bool,  // aux-free：router_bias 偏置修正替代 Switch aux loss
+    // --- V4 对数放缩门控混合（dev-notes/24 甜点；与 use_mhc 行为互斥）---
+    #[serde(default)]
+    pub use_lse_gate: bool,          // α·x + (1-α)·LSE(x, F(x))，α=sigmoid(raw_gate) 可学习
+    // --- 计算图重排（dev-notes/17）---
+    #[serde(default = "default_block_order")]
+    pub block_order: String,         // attn_ffn（默认）| ffn_attn
 }
 
 fn default_rope_theta() -> f64 {
@@ -108,6 +114,9 @@ fn default_kv_lora_rank() -> usize {
 }
 fn default_route_scale() -> f64 {
     2.5
+}
+fn default_block_order() -> String {
+    "attn_ffn".to_string()
 }
 fn default_qk_rope_head_dim() -> usize {
     16
@@ -194,6 +203,12 @@ impl GPT {
             } else {
                 (None, None, None)
             };
+            // V4 对数放缩门控混合：每层一个可学习标量 raw_gate（非 mHC 路径）
+            let raw_gate = if config.use_lse_gate {
+                Some(vb.get_unchecked(&format!("{prefix}.raw_gate"))?)
+            } else {
+                None
+            };
             blocks.push(Block {
                 ln1,
                 attn,
@@ -207,6 +222,9 @@ impl GPT {
                 raw_A_ffn: raw_a_ffn,
                 raw_B_ffn: raw_b_ffn,
                 raw_C_ffn: raw_c_ffn,
+                use_lse_gate: config.use_lse_gate,
+                raw_gate,
+                block_order: config.block_order.clone(),
             });
         }
         let ln_f = Norm::new(&vb, "transformer.ln_f", config.use_rmsnorm)?;
@@ -322,6 +340,11 @@ struct Block {
     raw_A_ffn: Option<Tensor>,
     raw_B_ffn: Option<Tensor>,
     raw_C_ffn: Option<Tensor>,
+    // V4 对数放缩门控混合（非 mHC 路径）：α·x + (1-α)·LSE(x, F)
+    use_lse_gate: bool,
+    raw_gate: Option<Tensor>, // (1,) → sigmoid → α
+    // 计算图重排：attn_ffn（默认）| ffn_attn
+    block_order: String,
 }
 
 /// 前馈网络：MoE（V3）或单一 MLP/SwiGLU。
@@ -344,10 +367,27 @@ impl Block {
         if self.use_mhc {
             return self.forward_mhc(x);
         }
-        let h = self.attn.forward(&self.ln1.forward(x)?)?;
-        let x = x.add(&h)?;
-        let h = self.mlp.forward(&self.ln2.forward(&x)?)?;
-        Ok(x.add(&h)?)
+        // 残差合并：默认线性 x+F；use_lse_gate 时 α·x + (1-α)·LSE(x, F)，α=sigmoid(raw_gate)
+        let res = |a: &Tensor, b: &Tensor| -> Result<Tensor> {
+            if self.use_lse_gate {
+                let alpha = candle_nn::ops::sigmoid(
+                    self.raw_gate.as_ref().expect("use_lse_gate 缺 raw_gate"),
+                )?
+                .to_vec1::<f32>()?[0] as f64; // (1,) → 标量
+                let lse = logsumexp_residual(a, b)?;
+                Ok(a.affine(alpha, 0.0)?.add(&lse.affine(1.0 - alpha, 0.0)?)?)
+            } else {
+                Ok(a.add(b)?)
+            }
+        };
+        // 计算图重排：默认 attn→ffn；block_order="ffn_attn" 时对调
+        if self.block_order == "ffn_attn" {
+            let x = res(x, &self.mlp.forward(&self.ln2.forward(x)?)?)?;
+            res(&x, &self.attn.forward(&self.ln1.forward(&x)?)?)
+        } else {
+            let x = res(x, &self.attn.forward(&self.ln1.forward(x)?)?)?;
+            res(&x, &self.mlp.forward(&self.ln2.forward(&x)?)?)
+        }
     }
 
     /// mHC 4-copy 前向：X' = B·X + C·F(A·X)，逐位对齐 model.py 的 Block._mhc_forward。
@@ -701,6 +741,16 @@ fn softplus_last(x: &Tensor) -> Result<Tensor> {
     let log_term = x.abs()?.neg()?.exp()?.affine(1.0, 1.0)?.log()?;
     let relu = x.clamp(0.0, f32::INFINITY)?;
     Ok(relu.add(&log_term)?)
+}
+
+/// 对数域残差合并（对应 model/utils.py 的 logsumexp_residual）：
+/// LSE(x, y) = max(x,y) + log(exp(x-m) + exp(y-m))，有界于 [max, max+log2]。
+/// 逐元素运算，max-平移保证负值数值稳定。
+fn logsumexp_residual(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let m = a.maximum(b)?;
+    let ea = a.sub(&m)?.exp()?;
+    let eb = b.sub(&m)?.exp()?;
+    Ok(m.add(&ea.add(&eb)?.log()?)?)
 }
 
 /// 沿最后一维取 top-k，返回 (值, 下标)。candle 没有 topk，自己实现（张量都很小）。
