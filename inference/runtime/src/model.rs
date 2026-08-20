@@ -50,6 +50,11 @@ pub struct Config {
     pub csa_window: usize,
     #[serde(default)]
     pub use_hca: bool,
+    // --- MLA（DeepSeek-V2/V3 低秩 KV 压缩注意力）---
+    #[serde(default)]
+    pub use_mla: bool,
+    #[serde(default = "default_kv_lora_rank")]
+    pub kv_lora_rank: usize,
     // --- 部分 RoPE（CSA/MLA 共用）---
     #[serde(default = "default_qk_rope_head_dim")]
     pub qk_rope_head_dim: usize,
@@ -71,6 +76,13 @@ pub struct Config {
     pub use_shared_expert: bool,     // MoE 始终激活的共享专家
     #[serde(default)]
     pub use_csa_learnable: bool,     // 门控池化替代平均池化（旧配置缺字段按 false=平均池化最安全）
+    // --- MoE 路由 V4（DeepSeek-V3：√softplus 打分 + aux-free 偏置修正）---
+    #[serde(default)]
+    pub use_sqrtsoftplus: bool,      // 路由打分 √softplus(logits)×route_scale 替代 softmax
+    #[serde(default = "default_route_scale")]
+    pub route_scale: f64,            // √softplus 打分缩放（DeepSeek-V3 默认 2.5）
+    #[serde(default)]
+    pub use_aux_free_balance: bool,  // aux-free：router_bias 偏置修正替代 Switch aux loss
 }
 
 fn default_rope_theta() -> f64 {
@@ -90,6 +102,12 @@ fn default_csa_topk() -> usize {
 }
 fn default_csa_window() -> usize {
     64
+}
+fn default_kv_lora_rank() -> usize {
+    64
+}
+fn default_route_scale() -> f64 {
+    2.5
 }
 fn default_qk_rope_head_dim() -> usize {
     16
@@ -468,10 +486,13 @@ impl Mlp {
 struct MoE {
     gate: Tensor,              // (n_experts, n_embd) 路由打分权重
     gate_slow: Option<Tensor>, // (n_experts, n_embd) 预判路由的 EMA 副本（buffer）
+    router_bias: Option<Tensor>, // (n_experts,) aux-free 负载均衡偏置（buffer，推理时固定）
     experts: Vec<Mlp>,         // n_experts 个完整 FFN（SwiGLU 或 GELU）
     shared_expert: Option<Mlp>, // V4：始终激活的共享专家（捕获共性特征）
     n_top_k: usize,
     use_anticipatory_routing: bool,
+    use_sqrtsoftplus: bool, // V4：√softplus(logits)×route_scale 打分替代 softmax
+    route_scale: f64,
     use_hash: bool, // V4：浅层用 hash(token 第一维) 确定性分配，不学习
 }
 
@@ -494,13 +515,23 @@ impl MoE {
         } else {
             None
         };
+        // V4 aux-free 负载均衡偏置（buffer）：加到路由 logits 影响 top-k 选择。
+        // 训练时按负载偏差更新（requires_grad=False），推理时是固定权重。
+        let router_bias = if config.use_aux_free_balance {
+            Some(vb.get_unchecked(&format!("{prefix}.router_bias"))?)
+        } else {
+            None
+        };
         Ok(Self {
             gate,
             gate_slow,
+            router_bias,
             experts,
             shared_expert,
             n_top_k: config.n_top_k,
             use_anticipatory_routing: config.use_anticipatory_routing,
+            use_sqrtsoftplus: config.use_sqrtsoftplus,
+            route_scale: config.route_scale,
             use_hash,
         })
     }
@@ -534,7 +565,11 @@ impl MoE {
             (probs_t, indices_t)
         } else {
             // 路由打分：softmax 得到每个 token 在每个专家上的概率
-            let gate_logits = linear(&x_flat, &self.gate, None)?; // (N, n_experts)
+            let mut gate_logits = linear(&x_flat, &self.gate, None)?; // (N, n_experts)
+            // V4 aux-free 偏置修正：bias 加到 logits 影响 top-k 选择（对应 model.py:102-103）
+            if let Some(bias) = &self.router_bias {
+                gate_logits = gate_logits.broadcast_add(&bias.unsqueeze(0)?)?;
+            }
             if self.use_anticipatory_routing {
                 // 预判路由（V4）：离散选择用慢路由（旧参数），门控用当前路由
                 let slow_logits =
@@ -544,6 +579,12 @@ impl MoE {
                 let probs = gather_last(&router_probs, &indices)?; // (N, k)
                 let denom = probs.sum_keepdim(1)?.affine(1.0, 1e-6)?; // +1e-6 防除零
                 (probs.broadcast_div(&denom)?, indices)
+            } else if self.use_sqrtsoftplus {
+                // V4 打分：√softplus(logits)×route_scale，topk + 归一化（对应 model.py:113-117）
+                let scores = softplus_last(&gate_logits)?.sqrt()?.affine(self.route_scale, 0.0)?;
+                let (vals, indices) = topk_last(&scores, self.n_top_k)?;
+                let denom = vals.sum_keepdim(1)?.affine(1.0, 1e-6)?; // +1e-6 防除零
+                (vals.broadcast_div(&denom)?, indices)
             } else {
                 let router_probs = softmax_last(&gate_logits)?;
                 let (vals, indices) = topk_last(&router_probs, self.n_top_k)?;
@@ -634,6 +675,15 @@ pub(crate) fn linear(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tenso
 /// 沿最后一维做 softmax。
 fn softmax_last(x: &Tensor) -> Result<Tensor> {
     Ok(candle_nn::ops::softmax(x, x.shape().rank() - 1)?)
+}
+
+/// 沿最后一维做 softplus（对应 torch.nn.functional.softplus，β=1）。
+/// 稳定式：softplus(x) = max(x,0) + log(1 + exp(-|x|))（candle 无 log1p，手动拆）。
+fn softplus_last(x: &Tensor) -> Result<Tensor> {
+    // affine(1.0, 1.0) = x*1 + 1（candle 标量加法要 Tensor，affine 更省事）
+    let log_term = x.abs()?.neg()?.exp()?.affine(1.0, 1.0)?.log()?;
+    let relu = x.clamp(0.0, f32::INFINITY)?;
+    Ok(relu.add(&log_term)?)
 }
 
 /// 沿最后一维取 top-k，返回 (值, 下标)。candle 没有 topk，自己实现（张量都很小）。
