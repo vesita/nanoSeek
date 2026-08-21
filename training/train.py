@@ -25,6 +25,8 @@ import pickle
 import random
 import threading
 import hashlib
+import re
+from collections import Counter
 from contextlib import nullcontext
 
 # 脚本在 training/ 子目录，Python 默认不会把项目根目录加进模块搜索路径。
@@ -48,6 +50,11 @@ out_dir = 'out'
 eval_interval = 250
 log_interval = 10
 eval_iters = 200
+# 评估开销优化（2026-08-20 框架提速三件套）：
+# eval_train_split=false 时评估点不再重算 train loss（训练 loss 每 log_interval 步已有记录），
+# results.csv 的 train/loss 列改用训练侧 EMA 代替——评估开销减半（原 eval 占训练总计算
+# ~25-30%，train split 占其中一半）。
+eval_train_split = True
 eval_only = False # 如果为 True，脚本在第一次评估后立即退出
 always_save_checkpoint = False # 如果为 True，每次评估后总是保存 checkpoint；否则只在 val 变优时保存
 # 早停：val loss 连续 patience 次评估无实质改善就提前终止（不用手动估算步数）
@@ -157,6 +164,22 @@ stable_frac = 0.8              # 稳定段占比（前 80% 步保持 learning_ra
 # N 步，再放开联合训练——GLM-5 用 20B token（含 1000 步索引器预热）追平 DeepSeek
 # 943.7B token 的 DSA 训练效果。只对 lightning indexer 生效，默认关。
 indexer_warmup_steps = 0       # >0：前 N 步只训练 idx_q/idx_k（主模型冻结）
+# --- 训练中健康体检（你好体检精简版，2026-08-20 框架提速三件套）---
+# 背景：dev-notes/14 实证「val 继续降但采样崩」——best.pt 只看 val 会把坍缩模型当冠军。
+# health_enabled=true 时每个评估点用固定 prompt 采样体检（EOS 自吐率 / rep3），
+# 只有「val 创新低 且 体检合格」才更新 best.pt：体检不合格时不覆盖旧 best（防坍缩保护）。
+# 体检口径与 training/health_check_hello.py 一致（temp 0.8 / topk 200 / rep 1.2，
+# 原始生成不截断），结果写 out/health.csv。纯框架改动，零模型参数。
+health_enabled = False       # True = 计算体检分并门控 best.pt 选点（train_chinese.yaml 开）
+health_eval_interval = 0     # 体检步频；0 = 跟随 eval_interval（推荐，避免体检结果过期）
+health_prompts = "用户：你好\n模型：|用户：你是谁\n模型：|用户：你在哪\n模型："  # '|' 分隔多条
+health_seeds = 5             # 每 prompt 采样 seed 数（预算 = prompts×seeds×max_new 次前向）
+health_max_new = 120         # 单条生成上限（原始生成，不截断）
+health_temp = 0.8            # 采样温度（与你好体检同口径）
+health_top_k = 200
+health_rep_penalty = 1.2
+health_min_eos_rate = 0.6    # EOS 自吐率下限（低于 = 体检不合格）
+health_max_rep3 = 0.1        # rep3 上限（>0.1 即坍缩线，dev-notes 口径）
 # DDP 设置
 backend = 'nccl' # 'nccl'、'gloo' 等
 # 系统
@@ -294,6 +317,7 @@ def get_batch(split):
 # 在这里初始化，如果 init_from='resume'（即从 checkpoint）可以覆盖
 iter_num = 0
 best_val_loss = 1e9
+raw_best_val = 1e9      # 原始 val 最优（不受体检门控，早停/日志用）
 
 # 尝试从数据集推导 vocab_size
 meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -409,7 +433,11 @@ def print_summary():
     epoch_note = f" · ≈{max_iters/steps_per_epoch:.1f} epoch" if steps_per_epoch else ""
     print(f"  训练      {max_iters} 步 · {tokens_per_iter:,} tokens/步{epoch_note}")
     print(f"  设备      {device} · {dtype} · compile {'开' if compile else '关'}")
-    print(f"  检查点    best.pt（val 最优）+ last.pt（最新）· 续训自动从 best.pt 恢复")
+    eval_note = f"eval_iters {eval_iters} · {'仅 val（train loss 用 EMA）' if not eval_train_split else 'train+val'}"
+    if health_enabled:
+        eval_note += " · 体检门控 best.pt（防坍缩）"
+    print(f"  评估      {eval_note}")
+    print(f"  检查点    best.pt（val 最优" + (" + 体检合格" if health_enabled else "") + "）+ last.pt（最新）· 续训自动从 best.pt 恢复")
     print(border)
     print()
 
@@ -438,10 +466,10 @@ if ddp:
 
 # 通过许多 batch 帮助估算任一划分上任意精度的损失
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss(splits=('train', 'val')):
     out = {}
     model.eval()
-    for split in ['train', 'val']:
+    for split in splits:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
@@ -451,6 +479,88 @@ def estimate_loss():
         out[split] = losses.mean()
     model.train()
     return out
+
+
+def ngram_rep(s, n):
+    """字符级 n-gram 重复率（与 training/health_check_hello.py 同口径）。"""
+    seq = re.sub(r"\s+", "", s)
+    if len(seq) < 2 * n:
+        return 0.0
+    g = [seq[i:i + n] for i in range(len(seq) - n + 1)]
+    c = Counter(g)
+    return sum(1 for x in g if c[x] > 1) / len(g)
+
+
+def _health_generate(model, tok, prompt, seed):
+    """GPU 版原始生成（镜像 inference/scripts/sample_py.generate_ids 的生成语义：
+    温度 → 重复惩罚 → top-k → softmax → multinomial；原始生成不截断，EOS 只记录不停止）。
+
+    与 generate_ids 的差异：tensor 显式放模型设备（generate_ids 的
+    torch.tensor([context_ids]) 只接受 list，无法传 CUDA 张量）；用独立
+    Generator 采样，不污染训练 RNG。EOS 不进入输出，eos_pos = 生成区内位置。
+    """
+    g = torch.Generator(device=device).manual_seed(seed)
+    idx = torch.tensor([tok.encode(prompt).ids], dtype=torch.long, device=device)
+    new_start = idx.shape[1]
+    seen = idx[0].tolist()
+    eos_id = tok.token_to_id("<eos>")
+    eos_pos = -1
+    for _ in range(health_max_new):
+        idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
+        logits, _ = model(idx_cond)
+        v = logits[0, -1, :].clone() / health_temp
+        if health_rep_penalty > 1.0:
+            for t in seen:
+                l = v[t]
+                v[t] = l / health_rep_penalty if l >= 0 else l * health_rep_penalty
+        k = min(health_top_k, v.size(-1))
+        topv, _ = torch.topk(v, k)
+        v[v < topv[-1]] = float('-inf')
+        nxt = int(torch.multinomial(torch.softmax(v, dim=-1), 1, generator=g).item())
+        if nxt == eos_id:
+            eos_pos = len(seen) - new_start
+            break
+        seen.append(nxt)
+        idx = torch.cat((idx, torch.tensor([[nxt]], dtype=torch.long, device=device)), dim=1)
+    return seen, eos_pos
+
+
+def run_health_check(model, tok):
+    """固定 prompt 采样体检（你好体检精简版）：EOS 自吐率 / 平均长度 / rep3 / 续轮率。
+
+    口径与 training/health_check_hello.py 一致（temp 0.8 / topk 200 / rep 1.2，
+    原始生成不截断）。用未编译模型跑（调用方传 unoptimized_model），避免评估态
+    变长序列触发 inductor 逐长度重编译。返回 dict。
+    """
+    prompts = [p for p in health_prompts.split('|') if p]
+    rows = []
+    was_training = model.training
+    model.eval()
+    try:
+        for prompt in prompts:
+            plen = len(tok.encode(prompt).ids)
+            for s in range(health_seeds):
+                ids, eos_pos = _health_generate(model, tok, prompt, s)
+                text = tok.decode(ids[plen:])
+                rows.append(dict(
+                    eos=eos_pos >= 0,
+                    length=len(ids) - plen,
+                    rep3=ngram_rep(text, 3),
+                    turns=max(len(re.findall(r'用户[:：]', text)),
+                              len(re.findall(r'模型[:：]', text))),
+                ))
+    finally:
+        model.train(was_training)
+    n = max(len(rows), 1)
+    eos_rate = sum(1 for r in rows if r['eos']) / n
+    rep3 = sum(r['rep3'] for r in rows) / n
+    return dict(
+        eos_rate=eos_rate,
+        avg_len=sum(r['length'] for r in rows) / n,
+        rep3=rep3,
+        turns_rate=sum(1 for r in rows if r['turns'] >= 2) / n,
+        health_ok=eos_rate >= health_min_eos_rate and rep3 <= health_max_rep3,
+    )
 
 # 学习率衰减调度器（带预热的余弦）
 def get_lr(it):
@@ -534,6 +644,24 @@ if master_process:
     results_csv = open(os.path.join(out_dir, 'results.csv'), 'w', newline='', encoding='utf-8')
     csv_writer = csv.writer(results_csv)
     csv_writer.writerow(['step', 'train/loss', 'val/loss', 'lr', 'mfu', 'time'])
+
+# 健康体检初始化（health_enabled 时加载分词器 + 打开 health.csv；失败则本次跳过体检）
+health_tok = None
+health_csv = None
+health_csv_writer = None
+if master_process and health_enabled:
+    try:
+        from tokenizers import Tokenizer
+        health_tok = Tokenizer.from_file(os.path.join(data_dir, 'tokenizer.json'))
+        health_csv = open(os.path.join(out_dir, 'health.csv'), 'w', newline='', encoding='utf-8')
+        health_csv_writer = csv.writer(health_csv)
+        health_csv_writer.writerow(['step', 'val/loss', 'eos_rate', 'avg_len', 'rep3', 'turns_rate', 'health_ok'])
+    except Exception as e:
+        print(f"warning: 健康体检初始化失败，本次训练跳过体检（{e}）")
+        health_enabled = False
+        health_tok = None
+        health_csv = None
+        health_csv_writer = None
 
 # -----------------------------------------------------------------------------
 # 异步 checkpoint 保存
@@ -621,6 +749,7 @@ train_start = time.time()  # 训练总起点，results.csv 里的 time 列用这
 local_iter_num = 0 # 本进程生命周期内的迭代次数
 raw_model = model.module if ddp else model # 如果需要，解开 DDP 容器
 running_mfu = -1.0
+running_train_loss = None   # 训练侧 loss EMA（eval_train_split=false 时 results.csv 用它）
 # tqdm 进度条：DDP 下只有主进程显示
 pbar = tqdm(total=max_iters, initial=iter_num, desc="训练中", dynamic_ncols=True) if master_process else None
 loss_history = []  # 每个评估点记 (iter, train_loss, val_loss)，训练结束画曲线图用
@@ -651,7 +780,11 @@ while True:
 
     # 在 train/val 集合上评估损失并保存 checkpoint
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
+        # 评估开销优化：eval_train_split=false 时只评 val，train/loss 用训练侧 EMA 代替
+        eval_splits = ('val',) if not eval_train_split else ('train', 'val')
+        losses = estimate_loss(eval_splits)
+        if 'train' not in losses:
+            losses['train'] = running_train_loss if running_train_loss is not None else 0.0
         # 用 pbar.write 打印到进度条上方，不打断进度条
         pbar.write(f"step {iter_num}: train 损失 {losses['train']:.4f}, val 损失 {losses['val']:.4f}")
         if wandb_log:
@@ -675,10 +808,36 @@ while True:
                 f"{lr:.6g}", f"{max(running_mfu, 0.0)*100:.2f}", f"{time.time()-train_start:.1f}",
             ])
             results_csv.flush()  # 及时落盘：训练中断也能读到已写出的部分
+        # 健康体检（可选）：固定 prompt 采样，门控 best.pt 选点（防「val 骗低、采样坍缩」）
+        # 用未编译模型跑（compile 后 raw_model 是 torch.compile 包装，变长生成会触发
+        # inductor 逐长度重编译风暴——见冒烟实测 recompile_limit 告警）。
+        health = None
+        if health_enabled:
+            h_interval = health_eval_interval or eval_interval
+            if iter_num % h_interval == 0:
+                health_model = unoptimized_model if compile else raw_model
+                health = run_health_check(health_model, health_tok)
+                pbar.write(
+                    f"  体检: EOS 自吐 {health['eos_rate']:.0%} | 平均 len {health['avg_len']:.1f} | "
+                    f"rep3 {health['rep3']:.4f} | 续轮 {health['turns_rate']:.0%} | "
+                    f"{'✅ 合格' if health['health_ok'] else '⚠ 不合格'}")
+                if health_csv_writer is not None:
+                    health_csv_writer.writerow([iter_num, f"{losses['val']:.4f}",
+                                                f"{health['eos_rate']:.3f}", f"{health['avg_len']:.1f}",
+                                                f"{health['rep3']:.4f}", f"{health['turns_rate']:.3f}",
+                                                int(health['health_ok'])])
+                    health_csv.flush()
         if iter_num > 0:
-            # YOLO 式：last.pt 每次评估都存（最新状态），best.pt 只在 val 变优时存
-            prev_best = best_val_loss                 # 保存本次评估前的 best，早停判断用（修复，见下）
+            # YOLO 式：last.pt 每次评估都存（最新状态），best.pt 只在「val 创新低 且 体检合格」时存。
+            # best_val_loss = 门控后的 best（checkpoint 实际选点）；raw_best_val = 原始 val 最优
+            # （早停判断用，不受体检门控影响——坍缩模型 val 仍可能降，但 best.pt 不再跟）。
+            prev_best = best_val_loss                 # 保存本次评估前的 best（门控后）
+            prev_raw = raw_best_val                   # 本次评估前的原始 val 最优
+            if losses['val'] < prev_raw:
+                raw_best_val = losses['val']
             is_best = losses['val'] < prev_best
+            if health is not None:
+                is_best = is_best and health['health_ok']
             if is_best:
                 best_val_loss = losses['val']
             checkpoint = {
@@ -694,13 +853,16 @@ while True:
             if is_best:
                 save_checkpoint_async(checkpoint, os.path.join(out_dir, 'best.pt'))
                 pbar.write(f"✓ 新最佳 val {best_val_loss:.4f} → best.pt（并已更新 last.pt）")
+            elif health is not None and losses['val'] < prev_raw:
+                # val 创新低但体检不合格：不覆盖 best.pt（防坍缩保护）
+                pbar.write(f"⚠ val 创新低 {losses['val']:.4f} 但体检不合格 → 保持 best.pt（防坍缩保护）")
             # 早停：val 连续 patience 次评估无实质改善 → 提前终止。
             # 改善判定用 min_val_improve 阈值（严格低于才重置计数），避免微小抖动干扰。
-            # 注意 is_best 是"比历史 best 低"即算，这里要"比 best 低出 min_val_improve"才算实质改善。
-            # 修复（2026-08-12，dev-notes/22）：必须用 prev_best（本次评估前的 best）判断，
-            # 用更新后的 best_val_loss 时每次创新低两者相等，永远判"无改善"，patience 次即误停。
+            # 用 prev_raw（原始 val 最优）判断，与体检门控解耦。
+            # 修复（2026-08-12，dev-notes/22）：必须用本次评估前的值判断，
+            # 用更新后的 best/raw 时两者相等，永远判"无改善"，patience 次即误停。
             if enable_early_stop and iter_num >= min_iters:
-                if losses['val'] < prev_best - min_val_improve:
+                if losses['val'] < prev_raw - min_val_improve:
                     no_improve_count = 0  # 有实质改善，重置计数
                 else:
                     no_improve_count += 1
@@ -752,6 +914,9 @@ while True:
         # 把损失转成 float。注意：这是一个 CPU-GPU 同步点
         # 放大以抵消上面的除法，近似真实的总体损失（精确做法应是求和）
         lossf = loss.item() * gradient_accumulation_steps
+        # 训练侧 loss EMA（eval_train_split=false 时 results.csv 的 train/loss 用它）
+        running_train_loss = lossf if running_train_loss is None \
+            else 0.9 * running_train_loss + 0.1 * lossf
         if local_iter_num >= 5: # 让训练循环先稳定一下
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
@@ -775,6 +940,8 @@ if master_process:
 join_save_threads()
 if results_csv is not None:
     results_csv.close()
+if health_csv is not None:
+    health_csv.close()
 if master_process and loss_history:
     _plot_loss_curve(loss_history, out_dir, best_val_loss)
 if writer is not None:

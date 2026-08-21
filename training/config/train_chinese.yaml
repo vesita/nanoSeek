@@ -7,7 +7,8 @@
 # 重训会用 out_dir/old 保护机制归档旧实验。
 out_dir: out/chinese-reb
 eval_interval: 250
-eval_iters: 100
+eval_iters: 50          # 100→50：评估开销减半（框架提速三件套；原 eval 占训练总计算 ~25-30%）
+eval_train_split: false # 不再重复评估 train loss（训练 loss 每 10 步已有记录，results.csv 用 EMA 代替）
 log_interval: 10
 always_save_checkpoint: false
 wandb_log: false
@@ -80,6 +81,14 @@ swiglu_clamp: 0.5             # SwiGLU 门控钳制半宽（V4 稳定性，0=关
 #                             # （mHC 前向短路，lse_gate 只在非 mHC 路径生效）；Python/Rust 已就绪，
 #                             # 想要 LSE 时关 mHC 再开。
 # num_hash_layers: 0          # 前 N 层 hash 路由——dev-notes/13 拖慢，保持 0
+
+# --- 训练中健康体检（框架提速三件套，2026-08-20）---
+# 背景：dev-notes/14 实证「val 继续降但采样崩」——best.pt 只看 val 会把坍缩模型当冠军。
+# 开此开关后，每个评估点用固定 prompt 采样体检（EOS 自吐率 / rep3，口径与
+# training/health_check_hello.py 一致），只有「val 创新低 且 体检合格」才更新 best.pt；
+# 体检不合格时保持旧 best（防坍缩保护）。结果写 out/health.csv。纯框架改动，零参数。
+health_enabled: true
+health_eval_interval: 250    # 体检步频 = 评估频率（避免体检结果过期）
 
 # --- 拓扑实验开关（已知负面结果，保持默认；代码双端就绪）---
 block_order: attn_ffn    # ffn_attn 负结果（dev-notes/17），保持默认

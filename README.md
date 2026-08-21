@@ -87,6 +87,18 @@ CSA/HCA + 可学习池化 + Sink + QK-Norm + Z-Loss + MoE(shared+aux-free+√sof
 | `use_muon` | `false` | **V4** Muon 优化器（矩阵参数正交化，embedding/lm_head/norm 用 AdamW 保护） |
 | `muon_ns_steps` | `10` | Newton-Schulz 迭代次数（系数 (2,-1.5,0.5)） |
 
+**训练循环**（2026-08-20 框架提速三件套，全部零模型参数）：
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `eval_train_split` | `true` | 评估是否重算 train loss；`false` 时用训练侧 EMA 代替（评估开销减半） |
+| `health_enabled` | `false` | 体检门控 best.pt：只有「val 创新低 且 体检合格」才更新 best.pt（防「val 骗低、采样坍缩」） |
+| `health_eval_interval` | `0` | 体检步频；0 = 跟随 `eval_interval` |
+| `health_prompts` | 你好/你是谁/你在哪 | 体检固定 prompt，`\|` 分隔多条 |
+| `health_seeds` / `health_max_new` | `5` / `120` | 每 prompt 采样数 / 单条生成上限 |
+| `health_temp` / `health_top_k` / `health_rep_penalty` | `0.8` / `200` / `1.2` | 体检采样参数（与你好体检同口径） |
+| `health_min_eos_rate` / `health_max_rep3` | `0.6` / `0.1` | 体检合格阈值（EOS 自吐率下限 / rep3 坍缩线） |
+
 **V4 结构设计升级**（连接方式，不增加规模；实验性，默认全关）：
 
 | 配置项 | 默认 | 说明 |
@@ -405,6 +417,9 @@ Rust 端验证方法：用 `--print-logits` / `--dump-logits` 配合 `inference/
 
 **训练体验**（实验目录只留可读文件：`best.pt` / `results.csv` / `loss_curve.png`）：
 - **`results.csv`**（YOLO 式）：每个评估点一行 `step, train/loss, val/loss, lr, mfu, time`，纯文本、Excel 可直接打开、训练中断也能读到已落盘部分
+- **`health.csv`**（开启 `health_enabled: true` 时生成）：每个评估点的采样体检记录 `step, val/loss, eos_rate, avg_len, rep3, turns_rate, health_ok`——固定 prompt 采样（你好/你是谁/你在哪），口径与 `training/health_check_hello.py` 一致
+- **best.pt 防坍缩选点**（2026-08-20 框架提速三件套）：dev-notes/14 实证「val 继续降但采样崩」——`health_enabled: true` 后，best.pt 只在「val 创新低 **且** 体检合格」时更新；体检不合格时保持旧 best（防坍缩保护），原始 val 最优仍用于早停判断
+- **评估开销减半**：`eval_train_split: false` 时评估点不再重算 train loss（训练 loss 每 10 步已有记录），results.csv 的 train/loss 列改用训练侧 EMA 代替
 - **`loss_curve.png`**：训练结束自动生成 train/val 双曲线，不用开任何工具直接看图
 - **checkpoint 异步保存**（后台线程 + 原子改名），保存时训练不再卡顿
 - **TensorBoard 可选**：默认关闭（避免二进制事件文件）；需要多实验曲线叠加时用 `--tensorboard_log=True` 开启，事件写到 `out/<实验>/tensorboard/` 子目录，然后用 `uv run tensorboard --logdir out/` 查看
