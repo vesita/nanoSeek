@@ -61,6 +61,20 @@ class CausalSelfAttention(nn.Module):
                 self.idx_q = nn.Linear(config.n_embd, config.n_head, bias=False)  # (n_embd→nh)
                 self.idx_k = nn.Linear(self.head_dim, 1, bias=False)              # 块→标量分
                 nn.init.zeros_(self.idx_k.weight)  # 起步打分≈0，中性选块
+        if config.use_kv_memory:
+            assert config.use_csa, "KV 记忆注意力（P1）要求 use_csa=True（替换 HCA 槽位）"
+            l = config.kv_memory_latent
+            # 每头 latent 投影：q/k/v 各 nh·l 维（拼一个 Linear 一次算完）
+            self.mem_qkv = nn.Linear(config.n_embd, 3 * config.n_head * l, bias=False)
+            # 遗忘门 logits（逐通道 nh·l）+ 写入门 logits（每头 1 个）——网络自行决定淘汰
+            self.mem_forget = nn.Linear(config.n_embd, config.n_head * l, bias=True)
+            self.mem_write = nn.Linear(config.n_embd, config.n_head, bias=True)
+            # 持久记忆：学习到的静态"工作台"（不递推、不衰减）；联想部分从零开始被写入
+            self.mem_persist = nn.Parameter(torch.zeros(config.n_head, l, l))
+            self.mem_up = nn.Linear(config.n_head * l, config.n_embd, bias=False)
+            # 初始门控保守：遗忘率≈0.1（保留 0.9）、写入≈0.1（先少写，不扰动基线行为）
+            nn.init.constant_(self.mem_forget.bias, math.log(0.1 / 0.9))
+            nn.init.constant_(self.mem_write.bias, math.log(0.1 / 0.9))
         if config.use_mla:
             assert config.qk_rope_head_dim % 2 == 0 and config.qk_rope_head_dim <= self.head_dim, \
                 "qk_rope_head_dim 需为偶数且不超过 head_dim"
@@ -93,6 +107,10 @@ class CausalSelfAttention(nn.Module):
             cos, sin = precompute_rope_freqs(self.rope_head_dim, max_len, config.rope_theta)
             self.register_buffer("cos", cos)  # (max_len, rope_head_dim)
             self.register_buffer("sin", sin)  # (max_len, rope_head_dim)
+
+        # 观测台开关（probe --stats）：开启时前向额外记录 q/k/v、注意力权重等中间量。
+        # 仅供离线分析；训练时保持 False，零开销。
+        self.capture = False
 
         # QK-Norm：q/k 分别是 (B, T, nh, d)；返回归一化后的 q/k（保留 head 维）。
         # 只对参与点积的 q/k 做，v 不做。
@@ -146,6 +164,12 @@ class CausalSelfAttention(nn.Module):
                 # 旋转位置编码：只对 q 和 k 做（v 不旋转），这样 q·k 携带相对位置
                 q, k = apply_rotary_pos_emb(q, k, self.cos[:T], self.sin[:T])
 
+        if self.capture:
+            # 观测台：记录 q/k/v（RoPE/QK-Norm 之后、合并 head 之前）供 KV 统计
+            self._cap_q = q.detach()  # (B, T, nh, d)
+            self._cap_k = k.detach()
+            self._cap_v = v.detach()
+
         # 把 head 维移到第 2 维：(B, nh, T, hs)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -156,7 +180,7 @@ class CausalSelfAttention(nn.Module):
         # 若传 None/省略，SDPA 会按默认 1/sqrt(head_dim) 再除一次，与下方手动路径
         # （use_qk_norm 时不再除 sqrt(d)）不一致——flash 开/关会得到不同 logits。
         attn_scale = 1.0 if self.use_qk_norm else 1.0 / math.sqrt(k.size(-1))
-        if self.flash:
+        if self.flash and not self.capture:
             # 使用 Flash Attention CUDA 内核的高效 attention。
             # Attention Sink 与 is_causal 的 SDPA 不兼容（flash 内核不支持追加 softmax 列），
             # 旧代码在 flash 可用时会走这里、把 sink 静默丢弃（与注释"回退手动"不符）。
@@ -184,7 +208,13 @@ class CausalSelfAttention(nn.Module):
             att = q @ k.transpose(-2, -1)
             if not self.use_qk_norm:
                 att = att * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            if hasattr(self, 'bias'):
+                causal_mask = self.bias[:, :, :T, :T] == 0
+            else:
+                # 观测台强制走手动路径时没有 bias buffer（flash 模式才不注册），就地构造
+                tril = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+                causal_mask = ~tril.unsqueeze(0).unsqueeze(0)
+            att = att.masked_fill(causal_mask, float('-inf'))
             if self.use_attn_sink:
                 # Attention Sink：追加一列 sink[h]（value 用零向量占位）。
                 # 这列 softmax 后有 exp(sink) 的概率质量，但乘零向量 → 贡献为 0，
@@ -193,9 +223,15 @@ class CausalSelfAttention(nn.Module):
                 att = torch.cat([att, sink], dim=-1)                          # (B,nh,T,T+1)
                 v = torch.cat([v, v.new_zeros(B, self.n_head, 1, v.size(-1))], dim=-2)  # (B,nh,T+1,hs)
             att = F.softmax(att, dim=-1)
+            if self.capture:
+                # 观测台：记录标准注意力的 softmax 权重（末列为 sink，若启用）
+                self._cap_att = att.detach()  # (B, nh, T, T')，T'=T 或 T+1
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T+1) x (B, nh, T+1, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # 把所有 head 的输出并排重新组装
+        if self.capture:
+            # 观测台：记录合并前的多头输出（B,T,nh,d），用于头间相似度分析
+            self._cap_y_heads = y.view(B, T, self.n_head, self.head_dim).detach()
 
         # 输出投影
         y = self.resid_dropout(self.c_proj(y))
@@ -241,6 +277,12 @@ class CausalSelfAttention(nn.Module):
             q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, self.cos[:T], self.sin[:T])
             q = torch.cat([q_rope, q_nope], dim=-1)
             k = torch.cat([k_rope, k_nope], dim=-1)
+
+        if self.capture:
+            # 观测台：记录 CSA 的 q/k/v（RoPE/QK-Norm 之后）
+            self._cap_q = q.detach()  # (B, T, nh, d)
+            self._cap_k = k.detach()
+            self._cap_v = v.detach()
 
         # --- 1) 块级压缩：每 m 个连续 token 的 K/V 平均池化成 1 个潜在 ---
         # 短序列（块数 nb < topk）时 topk 会越界，用 k_eff = min(topk, nb) 兜底；
@@ -326,6 +368,11 @@ class CausalSelfAttention(nn.Module):
                 s_blk = torch.cat([s_blk, sink], dim=-1)                       # (B,T,nh,nb+1)
                 v_blocks = torch.cat([v_blocks, v_blocks.new_zeros(B, 1, self.n_head, d)], dim=1)  # (B,nb+1,nh,d)
             a_blk = F.softmax(s_blk, dim=-1)                          # (B,T,nh,nb')
+            if self.capture:
+                # 观测台：记录块路径注意力权重（末列为 sink，若启用）与块数
+                self._cap_blk = a_blk.detach()      # (B,T,nh,nb')，nb'=nb 或 nb+1
+                self._cap_blk_nb = nb
+                self._cap_blk_has_prior = has_prior.bool()
             if getattr(self.config, 'use_csa_bmm', False):
                 # 块聚合：显式批量 matmul（等价 einsum 'bthn,bnhd->bthd'）。
                 # 注意 v_blocks 是 (B,nb,nh,d)，要按 (B,nh,nb,d) 折叠 → permute(0,2,1,3)。
@@ -344,9 +391,12 @@ class CausalSelfAttention(nn.Module):
         # 数学等价。无 SDPA 时退回手动 einsum（含 sink 补列）。
         win = min(win, T)
         i = torch.arange(T, device=x.device)
-        win_causal = (i.unsqueeze(-1) <= i.unsqueeze(0)) & (i.unsqueeze(0) - i.unsqueeze(-1) <= win)
+        # 因果滑窗掩码（[query, key] 取向）：query q 允许 key k ∈ [q-win, q]。
+        # 注意方向：r 行允许 c 列当且仅当 c ≤ r 且 r-c ≤ win。
+        # （历史上此处曾写反，导致滑窗偷看 +win 个未来 token——观测台抓到并修复）
+        win_causal = (i.unsqueeze(0) <= i.unsqueeze(-1)) & (i.unsqueeze(-1) - i.unsqueeze(0) <= win)
         scale = 1.0 if self.use_qk_norm else 1.0 / math.sqrt(d)
-        if self.flash:
+        if self.flash and not self.capture:
             qt, kt, vt = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (B,nh,T,d)
             if self.use_attn_sink:
                 k_pad = torch.cat([kt, kt.new_zeros(B, nh, 1, d)], dim=2)   # (B,nh,T+1,d)
@@ -375,14 +425,27 @@ class CausalSelfAttention(nn.Module):
                 sink = self.attn_sink.view(1, 1, self.n_head, 1).expand(B, T, self.n_head, 1)
                 s_win = torch.cat([s_win, sink], dim=-1)                        # (B,T,nh,T+1)
                 v_win = torch.cat([v, v.new_zeros(B, 1, self.n_head, d)], dim=1)  # (B,T+1,nh,d)
-            y_win = torch.einsum('bthj,bjhd->bthd', F.softmax(s_win, dim=-1), v_win)
+            a_win = F.softmax(s_win, dim=-1)
+            if self.capture:
+                # 观测台：记录滑窗路径注意力权重（末列为 sink，若启用）
+                self._cap_win = a_win.detach()  # (B,T,nh,T+1)
+            y_win = torch.einsum('bthj,bjhd->bthd', a_win, v_win)
 
+        if self.capture:
+            # 观测台：记录三条路径各自的平均 token 范数（判断哪条路在真正贡献信息）
+            self._cap_mag = dict(
+                comp=y_comp.float().norm(dim=-1).mean().item(),
+                win=y_win.float().norm(dim=-1).mean().item(),
+                glob=0.0)
         y = y_comp + y_win
 
-        # --- 4) HCA：重度压缩的全局信号（可选）---
-        # 把所有允许的压缩块再平均成一个全局潜在（不做稀疏选择 = 重度压缩），
-        # 每个 query 加上它作为全局上下文。这是"全文一句话摘要"式的粗粒度信号。
-        if self.config.use_hca and nb > 0:
+        # --- 4) 全局通道：KV 记忆（P1）替换 HCA 的静态平均摘要 ---
+        # HCA = 把所有允许的压缩块平均成一个全局潜在（"全文一句话摘要"）。
+        # KV 记忆 = 每头一个可写状态矩阵，网络自行决定写入/遗忘，query 主动检索。
+        # 观测台（dev-notes/33）：HCA 是三条路径里贡献最弱的 → 记忆的天然槽位。
+        if self.config.use_kv_memory:
+            pass  # 记忆输出跨头，在合并 head 之后进残差（见函数尾部）
+        elif self.config.use_hca and nb > 0:
             # 只用真实块：sink 模式下 v_blocks 末尾多了一个占位零块，切掉它
             v_blocks_real = v_blocks[:, :nb] if self.use_attn_sink else v_blocks
             n_allowed = causal_block.float().sum(dim=-1).clamp(min=1)  # (T,)
@@ -400,9 +463,20 @@ class CausalSelfAttention(nn.Module):
                          n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
             # 单个全局 key 的 softmax 恒为 1，等价于直接加上这份全局摘要
             y = y + v_glob
+            if self.capture:
+                self._cap_mag["glob"] = v_glob.float().norm(dim=-1).mean().item()
 
-        # 合并 head： (B, T, nh, d) → (B, T, C)
-        return y.transpose(1, 2).contiguous().view(B, T, C)
+        if self.capture:
+            # 观测台：记录合并前的多头输出（B,T,nh,d）
+            self._cap_y_heads = y.detach()
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        if self.config.use_kv_memory:
+            # KV 记忆输出是跨头的（nh·l → C），在合并后加入残差
+            mem_out = self._kv_memory_forward(x)
+            y = y + mem_out
+            if self.capture:
+                self._cap_mag["mem"] = mem_out.float().norm(dim=-1).mean().item()
+        return y
 
     def get_indexer_loss(self):
         """取出本层 Lightning Indexer 的 KL 辅助损失（非 CSA 路径时无意义，返回 0）。"""
@@ -418,3 +492,63 @@ class CausalSelfAttention(nn.Module):
         h = self.csa_compress_linear(flat)                   # 线性压缩 (B*nb*nh, d)
         gate = torch.sigmoid(self.csa_gate_linear(flat))     # 门控 (0,1)
         return (h * gate).view(B, nb, nh, d)
+
+    def _kv_memory_forward(self, x):
+        """KV 记忆路径（P1，GLA 式 chunk 并行版）：每头一个可写状态矩阵。
+
+        递推（与顺序版数学等价，块内并行）：
+            r_t = 1 − σ(W_f·x_t)         逐通道保留率（遗忘门 → 学出来的淘汰策略）
+            β_t = σ(W_b·x_t)             写入门
+            A_t = r_t ⊙ A_{t−1} + β_t·k_t·v_tᵀ；读取 o_t = (A_t + persist)·q_t
+
+        chunk 并行（C=kv_memory_chunk，dev-notes/37-A）：块内 g=log r，G=cumsum(g)（≤0），
+            o_i = exp(G_i) ⊙ (A_in·q_i) + Σ_{j≤i} exp(G_i−G_j) ⊙ (β_j k_j)(v_j·q_i) + persist·q_i
+            A_out = exp(G_last) ⊙ A_in + Σ_j exp(G_last−G_j) ⊙ (β_j k_j) v_jᵀ
+        顺序步 256/层 → 4/层 → torch.compile 友好（2.2s/步 → ~0.7s/步）。
+        数值：全部指数 ≤ 0（无溢出）；j>i 先置 −inf 再 exp（得 0，避免先溢出后乘 0）；
+        绝不把 cumsum 直接 clamp（会破坏位置间相对衰减——v1 踩过的坑）；
+        状态累加保持 fp32（bf16 累积 256 步会丢精度）。
+        """
+        B, T, Cdim = x.shape
+        l = self.config.kv_memory_latent
+        nh = self.n_head
+        CHUNK = getattr(self.config, 'kv_memory_chunk', 64)
+        qkv = self.mem_qkv(x).float().view(B, T, nh, 3, l)
+        q_m, k_m, v_m = qkv.unbind(dim=3)                        # (B,T,nh,l)
+        r = 1.0 - torch.sigmoid(self.mem_forget(x).float().view(B, T, nh, l))
+        w = torch.sigmoid(self.mem_write(x).float().view(B, T, nh, 1))
+        persist = self.mem_persist.float().unsqueeze(0)          # (1,nh,l,l)
+        # 补齐 T 到 CHUNK 整数倍：空位保留率=1、写入门=0（不产生任何写入）
+        Tpad = ((T + CHUNK - 1) // CHUNK) * CHUNK
+        if Tpad > T:
+            pad = Tpad - T
+            q_m = torch.cat([q_m, q_m.new_zeros(B, pad, nh, l)], dim=1)
+            k_m = torch.cat([k_m, k_m.new_zeros(B, pad, nh, l)], dim=1)
+            v_m = torch.cat([v_m, v_m.new_zeros(B, pad, nh, l)], dim=1)
+            r = torch.cat([r, r.new_ones(B, pad, nh, l)], dim=1)
+            w = torch.cat([w, w.new_zeros(B, pad, nh, 1)], dim=1)
+        g = torch.log(r.clamp_min(1e-12))                        # (B,T,nh,l)，≤0
+        tril = torch.tril(torch.ones(CHUNK, CHUNK, device=x.device, dtype=torch.bool))
+        A_in = torch.zeros(B, nh, l, l, device=x.device, dtype=torch.float32)
+        outs = []
+        for s in range(0, Tpad, CHUNK):
+            qc = q_m[:, s:s + CHUNK]; kc = k_m[:, s:s + CHUNK]
+            vc = v_m[:, s:s + CHUNK]; wc = w[:, s:s + CHUNK]
+            G = torch.cumsum(g[:, s:s + CHUNK], dim=1)           # (B,C,nh,l) ≤ 0，不 clamp
+            # 相对衰减矩阵：D[i,j] = exp(G_i − G_j)，j>i 先置 −inf → exp=0（因果）
+            diff = G.unsqueeze(2) - G.unsqueeze(1)               # (B,C,C,nh,l)
+            diff = diff.masked_fill(~tril.unsqueeze(0).unsqueeze(-1).unsqueeze(-1), float('-inf'))
+            D = torch.exp(diff)                                  # ∈ (0,1]，因果外为 0
+            ck = wc * kc                                         # (B,C,nh,l)
+            # 块内检索：scores[i,j] = q_i·v_j；inner_i = Σ_j D[i,j] ⊙ scores[i,j] ⊙ ck_j
+            scores = torch.einsum('bihl,bjhl->bihj', qc, vc)     # (B,C,nh,C)
+            inner = torch.einsum('bijhl,bihj,bjhl->bihl', D, scores, ck)  # (B,C,nh,l)
+            # 读取：状态（含块内衰减 exp(G_i)）+ 块内累积 + 持久记忆
+            o = torch.exp(G) * torch.einsum('bhlm,bihm->bihl', A_in, qc)
+            o = o + inner + torch.einsum('bhlm,bihm->bihl', persist, qc)
+            outs.append(o)
+            # 状态更新：A_out = exp(G_last) ⊙ A_in + Σ_j D[last,j] ⊙ ck_j v_jᵀ
+            cum = torch.einsum('bjhl,bjhm->bhlm', D[:, -1] * ck, vc)   # (B,nh,l,l)
+            A_in = torch.exp(G[:, -1]).unsqueeze(-1) * A_in + cum
+        o = torch.cat(outs, dim=1)[:, :T]                           # (B,T,nh,l)
+        return self.mem_up(o.reshape(B, T, nh * l)).to(x.dtype)

@@ -60,6 +60,14 @@ class GPTConfig:
     #   省 einsum 内部 permute/reshape 调度开销）。逐位数学等价，权重布局不变。
     #   A/B 3 结论：每步更慢（MFU 61% vs 64%），val 增益在等效数学下属随机性 → 保持默认关。
     use_csa_bmm: bool = False
+    # --- KV 记忆注意力（P1：GLA 式可学习遗忘/写入状态，替换 HCA 槽位）---
+    # 每头一个可写状态矩阵 S（latent l），token 流经时由网络自行决定写入/遗忘；
+    # 读取 o = (S_assoc + persist)·q。开启时替换 HCA 的静态平均摘要。
+    # 依据（dev-notes/33 观测台实测）：K 有效秩 ~8/20、V ~5/20 → l=16 足够；
+    # HCA 是三条路径里贡献最弱的（0.09-0.14）→ 记忆的天然槽位。
+    use_kv_memory: bool = False     # 需 use_csa=True（P1 在 CSA 框架内替换 HCA）
+    kv_memory_latent: int = 16      # 记忆 latent 维 l（状态矩阵 l×l，每头）
+    kv_memory_chunk: int = 64       # chunk 并行块大小（显存：D 矩阵总量 = B·T·C·nh·l，C=64@batch64 会 OOM → 训大模型时降 32/16）
     # --- V4 结构设计升级（实验性，默认全关）---
     # Attention Sinks：每头一个可学习标量偏置，作为 softmax 的"垃圾桶"吸收无关注意力。
     use_attn_sink: bool = False

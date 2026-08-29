@@ -24,7 +24,7 @@ temperature = 0.8 # 1.0 = 不改变，< 1.0 = 更少随机，> 1.0 = 更多随�
 top_k = 200 # 只保留概率最高的 top_k 个 token，其它 token 的概率置为 0
 seed = 1337
 device = 'cuda' # 示例：'cpu'、'cuda'、'cuda:0'、'cuda:1' 等
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' 或 'bfloat16' 或 'float16'
+dtype = ('bfloat16' if torch.cuda.is_bf16_supported() else 'float16') if torch.cuda.is_available() else 'float32' # 'float32' 或 'bfloat16' 或 'float16'；纯 CPU 默认 float32
 compile = False # 使用 PyTorch 2.0 编译模型以加速
 dump_logits = '' # 非空时把 prompt 最后位置的 logits 落盘（每行一个），用于和 Rust --dump-logits 逐位对拍
 load_config(globals()) # 从命令行或配置文件覆盖

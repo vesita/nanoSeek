@@ -96,6 +96,35 @@ uv run python inference/scripts/smoke_test.py   # 验证环境 + 模型可用
 
 环境要求：Python ≥ 3.12，PyTorch ≥ 2.0（用于 flash attention 和 torch.compile），有 NVIDIA GPU 最佳。
 
+### AMD 显卡运行说明（本机：Radeon RX 6600）
+
+本机已配置好 **PyTorch 2.9.1 + ROCm 6.4**（`pyproject.toml` 的 `[tool.uv.sources]` 指向本地 wheel，
+`uv sync` / `uv run` 直接可用，无需再下载 4GB 的 torch 包）。
+
+- **必须设置环境变量**（ROCm 对 RX 6600 / gfx1032 非官方支持，用 gfx1030 内核兼容运行）：
+
+  ```sh
+  export HSA_OVERRIDE_GFX_VERSION=10.3.0
+  ```
+
+  建议写进 `~/.bashrc`。忘设会报 `no kernel image is available` 或找不到设备。
+- **GPU 冒烟验证**（用 `data/synth` 合成数据，含「模型：/用户：」标记 token，
+  与中文数据的 loss mask 逻辑兼容，几十秒跑完且 loss 正常下降）：
+
+  ```sh
+  uv run python cli.py train --preset smoke --dataset=synth
+  # 输出应显示「设备 cuda」且 loss 非 nan、逐步下降
+  ```
+
+- **正式中文训练**：先用 `data/chinese/download_dialogue.py` + `train_tokenizer.py` + `prepare.py`
+  准备数据，再 `uv run python cli.py train`（RX 6600 上 5000 步预计 20-40 分钟）。
+- **CPU 兜底**：`--device=cpu --compile=false`（dtype 已自动回退 float32，无需手动覆盖）。
+- **loss masking 配置**：对话数据只对 assistant 回复算 loss，标记 id 由 `use_loss_masking` /
+  `mask_model_ids` / `mask_user_ids` / `mask_sep_ids` 控制（默认中文 BPE 词表）。换数据集/词表
+  时同步修改，否则匹配不到标记 → loss 恒 nan（训练循环的 NaN 防护会警告并跳过该步，不静默训坏）。
+  向量化实现可用 `uv run python training/check_loss_mask.py` 校验（对拍旧实现 + 性能对比）。
+- 注意：**不要**把 torch 升级到 ROCm 7.x 的 wheel（RDNA2 已被移除）。
+
 ---
 
 ## 项目结构
@@ -205,6 +234,26 @@ uv run python cli.py package     # 打包独立部署目录
 uv run python cli.py distill     # 生成自蒸馏数据
 uv run python cli.py archive     # 模型归档/索引
 uv run python cli.py selftest    # 快速自检
+
+# 架构探索工具
+uv run python cli.py ab --base=training/config/test.yaml --variant=training/config/test.yaml --iters=300 --dataset=synth
+#   ↑ 架构 A/B 对比：同种子/同数据/同步数跑多配置，出对比表 + 叠加曲线
+#     （--base/--variant 可多个，其余 --key=value 透传给训练）
+uv run python cli.py probe --out_dir=out/test
+#   ↑ 模型探针：逐层激活/梯度统计，定位数值崩溃（nan/inf）或死层（零梯度）
+uv run python cli.py probe --out_dir=out/obs_kv --stats --num_batches=8
+#   ↑ KV/注意力观测台：KV 范数/有效秩、距离衰减曲线、头熵、sink、头间相似度、
+#     CSA 三路路径贡献 → out/<dir>/stats/ 下 stats.json + 6 张 PNG
+```
+
+**架构探索最小闭环**（新网络结构的标准流程）：
+
+```
+新想法 → model/ 加模块 + config 开关 → 加进 smoke_test.py（前向/反向回归）
+→ cli.py train --preset smoke --dataset=synth（几十秒验证能训）
+→ cli.py ab --base=基线 --variant=新结构（同条件对比）
+→ cli.py probe（数值/死层诊断）→ cli.py probe --stats（KV/注意力观测，先测量再设计）
+→ 写 dev-notes/<n>-xxx.md
 ```
 
 **模型归档**：`cli.py archive` 会扫描 `out/` 下所有实验目录，读取 `results.csv` / `best.pt`，生成每个实验的 `manifest.json` 和汇总 `out/index.json`，之后用 `cli.py archive` 即可按 val loss / 架构特征快速横向对比。

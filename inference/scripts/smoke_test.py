@@ -45,6 +45,9 @@ CASES = [
     ("CSA均池", dict(use_csa=True, csa_compress=16, csa_topk=2, csa_window=32, use_csa_learnable=False)),
     ("CSA可学习", dict(use_csa=True, csa_compress=16, csa_topk=2, csa_window=32)),
     ("CSA+HCA", dict(use_csa=True, csa_compress=16, csa_topk=2, csa_window=32, use_hca=True)),
+    # --- KV 记忆注意力（P1：GLA 式可学习遗忘/写入状态，替换 HCA）---
+    ("KV记忆", dict(use_csa=True, csa_compress=16, csa_topk=2, csa_window=32,
+                    use_kv_memory=True, kv_memory_latent=16)),
     # --- V4 结构设计升级 ---
     ("AttnSink", dict(use_csa=True, csa_compress=16, csa_topk=2, csa_window=32, use_attn_sink=True)),
     ("mHC", dict(use_mhc=True, hc_mult=4)),

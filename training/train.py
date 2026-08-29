@@ -39,6 +39,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 from model.config_loader import load_config
+from training.masking import build_assistant_mask as _build_assistant_mask
 
 # -----------------------------------------------------------------------------
 # 默认配置：small 模型在字符级莎士比亚上训练（与 config/train_shakespeare_char.yaml 一致）。
@@ -117,6 +118,9 @@ use_hca = False        # HCA 重度压缩全局信号
 use_csa_learnable = True   # V4：可学习门控池化替代平均池化
 use_csa_fused_qkv = True   # CSA 计算优化：Q/K/V 三合一（权重布局变，仅新训练；A/B 2 胜出→默认）
 use_csa_bmm = False        # CSA 计算优化：einsum → 显式批量 matmul（逐位等价；A/B 3 更慢→保持关）
+use_kv_memory = False      # KV 记忆注意力（P1：GLA 式可学习遗忘/写入状态，替换 HCA 槽位）
+kv_memory_latent = 16      # 记忆 latent 维 l（观测台：K 秩~8/V 秩~5 → 16 够用）
+kv_memory_chunk = 64       # chunk 并行块大小（显存：D 总量 = B·T·C·nh·l，C=64@batch64 OOM → 训中文大模型用 32）
 # --- V4 结构设计升级（实验性，默认全关）---
 use_attn_sink = True         # Attention Sinks：打破重复坍缩的必要条件（三重 A/B 验证）
 use_mhc = False              # mHC 超连接：4 流并行残差
@@ -130,6 +134,11 @@ use_lse_residual = False     # 对数放缩残差：对数域 soft-max 合并替
 use_lse_gate = False         # 对数放缩门控混合：α·x+(1-α)·LSE(x,F)，α 可学习（每层标量）
 use_qk_norm = False          # QK-Norm：q/k L2 归一化 + 每头可学习 scale（近零参数，压重复坍缩）
 z_loss_weight = 0.0          # Router Z-Loss 权重；0 = 关闭，建议 1e-4 起步
+# --- loss masking（chat 微调惯例：只对 assistant 回复算 loss）---
+use_loss_masking = True      # False = 全部 token 参与训练（非对话语料）
+mask_model_ids = [306, 228]  # 「模型：」BPE id 对。换数据集/词表时务必同步改这里——
+mask_user_ids = [308, 228]   # 「用户：」匹配不到标记会把全部 token mask 掉 → loss 恒为
+mask_sep_ids = [177, 177]    # 「\n\n」nan（训练循环有 NaN 防护，会警告并跳过该步）
 # adamw 优化器
 learning_rate = 1e-3 # 最大学习率
 max_iters = 5000 # 训练总迭代次数
@@ -146,7 +155,7 @@ min_lr = 1e-4 # 最小学习率，根据 Chinchilla 论文应约等于 learning_
 backend = 'nccl' # 'nccl'、'gloo' 等
 # 系统
 device = 'cuda' # 示例：'cpu'、'cuda'、'cuda:0'、'cuda:1' 等，或在 macbook 上试试 'mps'
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32'、'bfloat16' 或 'float16'，后者会自动实现 GradScaler
+dtype = ('bfloat16' if torch.cuda.is_bf16_supported() else 'float16') if torch.cuda.is_available() else 'float32' # 'float32'、'bfloat16' 或 'float16'，后者会自动实现 GradScaler；纯 CPU 默认 float32（避免 float16+GradScaler 报错）
 compile = True # 使用 PyTorch 2.0 编译模型以加速
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -205,43 +214,9 @@ try:
 except OSError:
     steps_per_epoch = None
 
-def build_assistant_mask(ids_1d):
-    """返回 bool mask：True = 计算 loss，False = 忽略。
-
-    扫描 token 序列，识别「模型：」[306,228] 到「用户：」[308,228] 或「\n\n」[177,177]
-    之间的区域（即模型回复），只在这些区域计算 loss（chat 微调惯例）。
-
-    2026-08-19（D 多轮诊断修复）：轮次边界标签「用户：」「模型：」也纳入 loss——
-    之前它们被跳过，模型从没学过「回复+<eos> → 下一轮 用户：」的转移（dev-notes/28：
-    turns=0/10，EOS 后只会继续吐话术）。现在模型学会对话骨架，原始生成会在
-    <eos> 后自然接「用户：」续轮。用户/模型的内容仍被 mask（保持 assistant 焦点，
-    且 chat 应用里用户输入由外部提供，无需模型学）。
-    """
-    mask = torch.zeros(len(ids_1d), dtype=torch.bool, device=ids_1d.device)
-    i = 0
-    in_reply = False
-    while i < len(ids_1d):
-        tok = ids_1d[i].item()
-        if i + 1 < len(ids_1d):
-            nxt = ids_1d[i + 1].item()
-            if tok == 306 and nxt == 228:   # 模型：
-                mask[i] = True; mask[i + 1] = True   # 轮次边界标签也学（对话骨架）
-                in_reply = True
-                i += 2
-                continue
-            if tok == 308 and nxt == 228:   # 用户：
-                mask[i] = True; mask[i + 1] = True   # 学「EOS → 下一轮 用户：」转移
-                in_reply = False
-                i += 2
-                continue
-            if tok == 177 and nxt == 177:   # \n\n 块分隔符
-                in_reply = False
-                i += 2
-                continue
-        if in_reply:
-            mask[i] = True
-        i += 1
-    return mask
+def build_assistant_mask(y):
+    """(B, T) bool mask 的薄包装：标记 id 来自配置，实现见 training/masking.py。"""
+    return _build_assistant_mask(y, mask_model_ids, mask_user_ids, mask_sep_ids)
 
 
 def get_batch(split):
@@ -262,9 +237,9 @@ def get_batch(split):
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     # loss masking：只对 assistant 回复 token 算 loss（chat 微调惯例），
     # 用户轮次和分隔符设 ignore_index=-1，不参与梯度计算。
-    for i in range(batch_size):
-        mask = build_assistant_mask(y[i])
-        y[i, ~mask] = -100
+    # use_loss_masking=False 时全部 token 参与训练（非对话语料 / 纯预训练）。
+    if use_loss_masking:
+        y[~build_assistant_mask(y)] = -100
     if device_type == 'cuda':
         # 固定 x、y 的内存，这样我们可以异步（non_blocking=True）把它们搬到 GPU
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -296,6 +271,8 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_muon=use_muon, muon_momentum=muon_momentum, muon_ns_steps=muon_ns_steps,
                   use_csa=use_csa, csa_compress=csa_compress, csa_topk=csa_topk,
                   csa_window=csa_window, use_hca=use_hca, use_csa_learnable=use_csa_learnable,
+                  use_kv_memory=use_kv_memory, kv_memory_latent=kv_memory_latent,
+                  kv_memory_chunk=kv_memory_chunk,
                   use_csa_fused_qkv=use_csa_fused_qkv, use_csa_bmm=use_csa_bmm,
                   use_attn_sink=use_attn_sink, use_mhc=use_mhc, hc_mult=hc_mult,
                   use_lightning_indexer=use_lightning_indexer, num_hash_layers=num_hash_layers,
@@ -322,6 +299,7 @@ def _build_model_from_checkpoint(checkpoint):
               'use_muon', 'muon_momentum', 'muon_ns_steps',
               'use_csa', 'csa_compress', 'csa_topk', 'csa_window',
               'use_hca', 'use_csa_learnable', 'use_csa_fused_qkv', 'use_csa_bmm',
+              'use_kv_memory', 'kv_memory_latent', 'kv_memory_chunk',
               'use_attn_sink', 'use_mhc', 'hc_mult',
               'use_lightning_indexer', 'num_hash_layers', 'block_order', 'no_attn_layers',
               'n_memory_tokens', 'use_lse_residual', 'use_lse_gate',
@@ -656,6 +634,7 @@ while True:
 
     # 前向反向更新，带可选的梯度累积以模拟更大的 batch size
     # 如果数据类型是 float16，则使用 GradScaler
+    step_nan = False
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # 在 DDP 训练中，我们只需要在最后一个微步同步梯度。
@@ -668,17 +647,31 @@ while True:
             loss = loss / gradient_accumulation_steps # 缩放损失以计入梯度累积
         # 在模型于 GPU 上进行前向传播时，立即异步预取下一个 batch
         X, Y = get_batch('train')
+        # NaN 防护：loss 非有限值（nan/inf）时跳过该微步的反向，
+        # 避免 NaN 梯度污染参数（一旦参数变 NaN 就永远救不回来）。
+        # 常见原因：loss mask 标记与数据不匹配、lr 过大、新架构数值不稳。
+        if not torch.isfinite(loss):
+            step_nan = True
+            continue
         # 反向传播，如果以 fp16 训练则进行梯度缩放
         scaler.scale(loss).backward()
-    # 裁剪梯度
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # 如果以 fp16 训练，则更新优化器和 scaler
-    scaler.step(optimizer)
-    scaler.update()
-    # 尽快清空梯度，不再需要这块内存
-    optimizer.zero_grad(set_to_none=True)
+    if step_nan:
+        # 本步含 NaN 微步：丢弃整步梯度（含正常微步累积的部分），跳过优化器更新
+        if master_process:
+            pbar.write(f"⚠ step {iter_num}: loss 非有限值（nan/inf），已跳过该步优化。"
+                       f"检查 use_loss_masking 标记配置 / lr / 新架构数值稳定性")
+        optimizer.zero_grad(set_to_none=True)
+        scaler.update()
+    else:
+        # 裁剪梯度
+        if grad_clip != 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # 如果以 fp16 训练，则更新优化器和 scaler
+        scaler.step(optimizer)
+        scaler.update()
+        # 尽快清空梯度，不再需要这块内存
+        optimizer.zero_grad(set_to_none=True)
 
     # 计时与日志：更新 tqdm 进度条
     t1 = time.time()

@@ -20,6 +20,8 @@ nanoSeek 统一命令行入口。
     convert   把 checkpoint 转换成 Rust 推理权重
     package   打包成独立部署目录
     distill   生成自蒸馏数据（Expert Iteration）
+    ab        架构 A/B 对比（同种子/同步数跑多配置，输出对比表+曲线）
+    probe     模型探针（逐层激活/梯度诊断，定位数值崩溃/死层）
     compare   Rust/Python 逐位对拍
     archive   模型归档/索引（扫描 out/，生成 manifest + index.json）
     selftest  快速自检（命令/预设/配置继承/归档）
@@ -277,6 +279,23 @@ def cmd_distill(argv: list[str]) -> int:
     return _run(os.path.join("training", "self_distill.py"), *argv)
 
 
+def cmd_ab(argv: list[str]) -> int:
+    """架构 A/B 对比：同种子/同数据/同步数跑多个配置，输出对比表 + 叠加曲线。
+
+    探索新结构的标准流程：--base 基线 + 若干 --variant，其余参数透传给训练。
+    例：cli.py ab --base=training/config/test.yaml --variant=training/config/test.yaml --iters=300 --dataset=synth
+    """
+    return _run(os.path.join("training", "run_ab.py"), *argv)
+
+
+def cmd_probe(argv: list[str]) -> int:
+    """模型探针：逐层激活/梯度统计，定位数值崩溃或死层。
+
+    例：cli.py probe --out_dir=out/test --device=cuda --num_batches=4
+    """
+    return _run(os.path.join("model", "probe.py"), *argv)
+
+
 COMMANDS = {
     "data":     (cmd_data,     "准备数据（下载/分词/编码）"),
     "train":    (cmd_train,    "训练（默认 train_chinese 预设；--preset smoke 冒烟）"),
@@ -288,6 +307,8 @@ COMMANDS = {
     "convert":  (cmd_convert,  "转换 → Rust 推理权重"),
     "package":  (cmd_package,  "打包独立部署目录"),
     "distill":  (cmd_distill,  "生成自蒸馏数据"),
+    "ab":       (cmd_ab,       "架构 A/B 对比（同种子/同步数多配置对比）"),
+    "probe":    (cmd_probe,    "模型探针（逐层激活/梯度诊断）"),
     "compare":  (cmd_compare,  "Rust/Python 对拍"),
     "archive":  (cmd_archive,  "模型归档/索引（out/ → manifest + index.json）"),
     "selftest": (cmd_selftest, "快速自检（命令/预设/继承/归档）"),
