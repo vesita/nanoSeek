@@ -121,6 +121,7 @@ use_csa_bmm = False        # CSA 计算优化：einsum → 显式批量 matmul�
 use_kv_memory = False      # KV 记忆注意力（P1：GLA 式可学习遗忘/写入状态，替换 HCA 槽位）
 kv_memory_latent = 16      # 记忆 latent 维 l（观测台：K 秩~8/V 秩~5 → 16 够用）
 kv_memory_chunk = 64       # chunk 并行块大小（显存：D 总量 = B·T·C·nh·l，C=64@batch64 OOM → 训中文大模型用 32）
+kv_memory_checkpoint = False   # 梯度检查点：backward 重算块内 D，省内存数学等价（dev-notes/39-#4）
 # --- V4 结构设计升级（实验性，默认全关）---
 use_attn_sink = True         # Attention Sinks：打破重复坍缩的必要条件（三重 A/B 验证）
 use_mhc = False              # mHC 超连接：4 流并行残差
@@ -272,7 +273,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_csa=use_csa, csa_compress=csa_compress, csa_topk=csa_topk,
                   csa_window=csa_window, use_hca=use_hca, use_csa_learnable=use_csa_learnable,
                   use_kv_memory=use_kv_memory, kv_memory_latent=kv_memory_latent,
-                  kv_memory_chunk=kv_memory_chunk,
+                  kv_memory_chunk=kv_memory_chunk, kv_memory_checkpoint=kv_memory_checkpoint,
                   use_csa_fused_qkv=use_csa_fused_qkv, use_csa_bmm=use_csa_bmm,
                   use_attn_sink=use_attn_sink, use_mhc=use_mhc, hc_mult=hc_mult,
                   use_lightning_indexer=use_lightning_indexer, num_hash_layers=num_hash_layers,
@@ -299,7 +300,7 @@ def _build_model_from_checkpoint(checkpoint):
               'use_muon', 'muon_momentum', 'muon_ns_steps',
               'use_csa', 'csa_compress', 'csa_topk', 'csa_window',
               'use_hca', 'use_csa_learnable', 'use_csa_fused_qkv', 'use_csa_bmm',
-              'use_kv_memory', 'kv_memory_latent', 'kv_memory_chunk',
+              'use_kv_memory', 'kv_memory_latent', 'kv_memory_chunk', 'kv_memory_checkpoint',
               'use_attn_sink', 'use_mhc', 'hc_mult',
               'use_lightning_indexer', 'num_hash_layers', 'block_order', 'no_attn_layers',
               'n_memory_tokens', 'use_lse_residual', 'use_lse_gate',

@@ -530,25 +530,50 @@ class CausalSelfAttention(nn.Module):
         g = torch.log(r.clamp_min(1e-12))                        # (B,T,nh,l)，≤0
         tril = torch.tril(torch.ones(CHUNK, CHUNK, device=x.device, dtype=torch.bool))
         A_in = torch.zeros(B, nh, l, l, device=x.device, dtype=torch.float32)
+        A_hist = []
         outs = []
+        use_ckpt = getattr(self.config, 'kv_memory_checkpoint', False)
         for s in range(0, Tpad, CHUNK):
             qc = q_m[:, s:s + CHUNK]; kc = k_m[:, s:s + CHUNK]
             vc = v_m[:, s:s + CHUNK]; wc = w[:, s:s + CHUNK]
-            G = torch.cumsum(g[:, s:s + CHUNK], dim=1)           # (B,C,nh,l) ≤ 0，不 clamp
-            # 相对衰减矩阵：D[i,j] = exp(G_i − G_j)，j>i 先置 −inf → exp=0（因果）
-            diff = G.unsqueeze(2) - G.unsqueeze(1)               # (B,C,C,nh,l)
-            diff = diff.masked_fill(~tril.unsqueeze(0).unsqueeze(-1).unsqueeze(-1), float('-inf'))
-            D = torch.exp(diff)                                  # ∈ (0,1]，因果外为 0
-            ck = wc * kc                                         # (B,C,nh,l)
-            # 块内检索：scores[i,j] = q_i·v_j；inner_i = Σ_j D[i,j] ⊙ scores[i,j] ⊙ ck_j
-            scores = torch.einsum('bihl,bjhl->bihj', qc, vc)     # (B,C,nh,C)
-            inner = torch.einsum('bijhl,bihj,bjhl->bihl', D, scores, ck)  # (B,C,nh,l)
-            # 读取：状态（含块内衰减 exp(G_i)）+ 块内累积 + 持久记忆
-            o = torch.exp(G) * torch.einsum('bhlm,bihm->bihl', A_in, qc)
-            o = o + inner + torch.einsum('bhlm,bihm->bihl', persist, qc)
-            outs.append(o)
-            # 状态更新：A_out = exp(G_last) ⊙ A_in + Σ_j D[last,j] ⊙ ck_j v_jᵀ
-            cum = torch.einsum('bjhl,bjhm->bhlm', D[:, -1] * ck, vc)   # (B,nh,l,l)
-            A_in = torch.exp(G[:, -1]).unsqueeze(-1) * A_in + cum
+            G_c = torch.cumsum(g[:, s:s + CHUNK], dim=1)         # (B,C,nh,l) ≤ 0，不 clamp
+            if use_ckpt:
+                # 梯度检查点（dev-notes/39-#4）：backward 重算块内 D，
+                # 省去逐 chunk 保存——D 总量 = B·T·C·nh·l，C=64@batch64 时全模型 1.6GB
+                # 正是 OOM 元凶。数学完全等价（同一函数体），只多一次重算。
+                o_c, A_in = torch.utils.checkpoint.checkpoint(
+                    self._mem_chunk_step, qc, kc, vc, wc, G_c, A_in, persist, tril,
+                    use_reentrant=False)
+            else:
+                o_c, A_in = self._mem_chunk_step(qc, kc, vc, wc, G_c, A_in, persist, tril)
+            outs.append(o_c)
+            if self.capture:
+                A_hist.append(A_in.detach().cpu().clone())       # 观测台：每 chunk 后黑板快照
         o = torch.cat(outs, dim=1)[:, :T]                           # (B,T,nh,l)
+        if self.capture:
+            self._cap_mem_r = r[:, :T].detach().cpu()   # 保留率 (B,T,nh,l)
+            self._cap_mem_w = w[:, :T].detach().cpu()   # 写入门 (B,T,nh,1)
+            self._cap_mem_A = A_hist                   # 每 chunk 后的联想状态快照
         return self.mem_up(o.reshape(B, T, nh * l)).to(x.dtype)
+
+    @staticmethod
+    def _mem_chunk_step(qc, kc, vc, wc, G, A_in, persist, tril):
+        """单个 chunk：块内检索 + 状态更新（提出来供梯度检查点重算，数学与内联版完全一致）。
+
+        G: (B,C,nh,l) 块内累计衰减（≤0）；返回 (o_c, A_out)。
+        """
+        # 相对衰减矩阵：D[i,j] = exp(G_i − G_j)，j>i 先置 −inf → exp=0（因果）
+        diff = G.unsqueeze(2) - G.unsqueeze(1)               # (B,C,C,nh,l)
+        diff = diff.masked_fill(~tril.unsqueeze(0).unsqueeze(-1).unsqueeze(-1), float('-inf'))
+        D = torch.exp(diff)                                  # ∈ (0,1]，因果外为 0
+        ck = wc * kc                                         # (B,C,nh,l)
+        # 块内检索：scores[i,j] = q_i·v_j；inner_i = Σ_j D[i,j] ⊙ scores[i,j] ⊙ ck_j
+        scores = torch.einsum('bihl,bjhl->bihj', qc, vc)     # (B,C,nh,C)
+        inner = torch.einsum('bijhl,bihj,bjhl->bihl', D, scores, ck)  # (B,C,nh,l)
+        # 读取：状态（含块内衰减 exp(G_i)）+ 块内累积 + 持久记忆
+        o = torch.exp(G) * torch.einsum('bhlm,bihm->bihl', A_in, qc)
+        o = o + inner + torch.einsum('bhlm,bihm->bihl', persist, qc)
+        # 状态更新：A_out = exp(G_last) ⊙ A_in + Σ_j D[last,j] ⊙ ck_j v_jᵀ
+        cum = torch.einsum('bjhl,bjhm->bhlm', D[:, -1] * ck, vc)   # (B,nh,l,l)
+        A_out = torch.exp(G[:, -1]).unsqueeze(-1) * A_in + cum
+        return o, A_out
