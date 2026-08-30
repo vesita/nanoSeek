@@ -20,11 +20,20 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config, layer_idx=i) for i in range(config.n_layer)]),
             ln_f = RMSNorm(config.n_embd),
         ))
+        if config.byte_level:
+            # 字节直入 + 3:1 聚合（dev-notes/48，Mamba-Byte 思想）：无 BPE 分词。
+            # byte_emb：0-256 字节嵌入；byte_agg：3 字节 → 1 token（可学习软聚合，
+            # 等价于"可微 BPE"）；byte_unagg：1 token → 预测下一组的 3 字节。
+            self.byte_emb = nn.Embedding(config.vocab_size, config.n_embd)
+            self.byte_agg = nn.Linear(3 * config.n_embd, config.n_embd, bias=False)
+            self.byte_unagg = nn.Linear(config.n_embd, 3 * config.vocab_size, bias=False)
+        else:
+            self.transformer['wte'] = nn.Embedding(config.vocab_size, config.n_embd)
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # 显式记忆 token（拓扑实验）：K×n_embd 可学习嵌入，forward 里拼到序列前、
         # 参与每一层注意力+FFN、过完所有层后剥离。是模型可写入/检索的跨 token 长程工作区。
         # 用 nn.Parameter 直接挂在 GPT 上（不进 ModuleDict，避免干扰 wte/lm_head 的 key 结构）。
@@ -33,7 +42,7 @@ class GPT(nn.Module):
         # 用 RoPE 时，位置信息由 attention 内部注入，不需要可学习的位置编码表
         if not config.use_rope:
             self.transformer['wpe'] = nn.Embedding(config.block_size, config.n_embd)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) if not config.byte_level else None
         # MTP 模块（可选）：额外的"小 transformer 层"，训练时预测更远的 token
         if config.use_mtp:
             self.mtp_modules = nn.ModuleList([MTPModule(config) for _ in range(config.n_mtp)])
@@ -42,10 +51,12 @@ class GPT(nn.Module):
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # 不完全确定这是什么原因，目前看是无害的。TODO 调查一下
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        if not config.byte_level:
+            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         if config.use_mtp:
             # V4：MTP 输出头和主模型共享 lm_head 权重（节省参数，DeepSeek-V3/V4 都这么做）
-            self.mtp_head.weight = self.lm_head.weight
+            if self.lm_head is not None:
+                self.mtp_head.weight = self.lm_head.weight
 
         # 初始化所有权重
         self.apply(self._init_weights)
@@ -88,6 +99,9 @@ class GPT(nn.Module):
         窗口截断推理时传窗口起点的绝对位置，RoPE 保持绝对坐标（默认 0 = 训练/全序列）。"""
         device = idx.device
         b, t = idx.size()
+        if self.config.byte_level:
+            # 字节直入（dev-notes/48）：输入 UTF-8 字节流，3:1 聚合后进 transformer
+            return self._forward_byte(idx, targets, rope_offset)
         assert t <= self.config.block_size, f"无法前向传播长度为 {t} 的序列，block size 只有 {self.config.block_size}"
 
         # 前向传播 GPT 模型本身
@@ -146,6 +160,61 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # 注意：用列表 [-1] 来保留时间维度
             loss = None
 
+        return logits, loss
+
+    def _forward_byte(self, idx, targets, rope_offset=0):
+        """字节直入 + 3:1 可学习聚合（dev-notes/48，Mamba-Byte 思想）。
+
+        idx: (B, 3T) 字节 id（0-256，256=<eos>）；byte_agg 把 3 字节 → 1 token
+        （网络学"哪些字节组合成语义单位"，等价可微软 BPE，无话术固化）。
+        输出 logits (B, T, 3, V)：位置 t 预测**下一组**的 3 字节（错位对齐）。
+        目标 targets: (B, 3T) 字节（-100 已按回复区 mask）→ 组目标 (B, T, 3)，
+        组内任一字节被 mask → 整组忽略（跨 用户/模型 边界的组保守跳过）。
+        """
+        device = idx.device
+        b, tb = idx.size()
+        assert tb % 3 == 0, "字节直入要求输入长度为 3 的倍数（3 字节/组）"
+        T = tb // 3
+        emb = self.byte_emb(idx)                                   # (B, 3T, n_embd)
+        x = emb.view(b, T, 3 * self.config.n_embd)
+        x = self.byte_agg(x)                                       # (B, T, n_embd)
+        x = self.transformer.drop(x)
+        if self.config.use_mhc:
+            # mHC：4 个残差流（与主 forward 一致）
+            x = x.unsqueeze(2).expand(b, x.size(1), self.config.hc_mult, self.config.n_embd)
+        for block in self.transformer.h:
+            x = block(x, rope_offset=rope_offset)
+        if self.config.use_mhc:
+            x = x.mean(dim=2)
+        x = self.transformer.ln_f(x)
+        if targets is not None:
+            logits = self.byte_unagg(x).view(b, T, 3, self.config.vocab_size)
+            # 组 g 的目标 = 字节 3(g+1)..3(g+1)+2 = targets[3g+2:3g+5]
+            # （targets 是错位 1 的字节流）；组 0..254 有效，组 255（最后）无目标。
+            tgt = targets[:, 2:2 + 3 * (T - 1)].view(b, T - 1, 3)   # (B, T-1, 3)
+            tgt = torch.cat([tgt, torch.full(
+                (b, 1, 3), -100, dtype=tgt.dtype, device=device)], dim=1)
+            tgt = torch.where((tgt == -100).any(dim=2, keepdim=True),
+                              torch.full_like(tgt, -100), tgt)
+            loss = F.cross_entropy(logits.view(-1, self.config.vocab_size),
+                                   tgt.view(-1), ignore_index=-100)
+            if self.config.use_moe:
+                moe_loss = torch.zeros(1, device=x.device, dtype=x.dtype)
+                for block in self.transformer.h:
+                    aux = block.get_moe_aux_loss()
+                    if aux is not None:
+                        moe_loss = moe_loss + aux
+                loss = loss + moe_loss
+            if self.config.use_lightning_indexer:
+                idx_loss = torch.zeros(1, device=x.device, dtype=x.dtype)
+                for block in self.transformer.h:
+                    aux = block.get_indexer_loss()
+                    if aux is not None:
+                        idx_loss = idx_loss + aux
+                loss = loss + 0.01 * idx_loss
+        else:
+            logits = self.byte_unagg(x[:, [-1], :]).view(b, 1, 3, self.config.vocab_size)
+            loss = None
         return logits, loss
 
     def get_memory_state(self):
@@ -209,7 +278,8 @@ class GPT(nn.Module):
             # 注意 Muon 不依赖 beta2（没有二阶矩），所以 betas 参数被忽略。
             muon_params, adamw_decay, adamw_nodecay = [], [], []
             for n, p in param_dict.items():
-                if n.startswith('transformer.wte') or n.startswith('lm_head'):
+                if (n.startswith('transformer.wte') or n.startswith('lm_head')
+                        or n.startswith('byte_emb') or n.startswith('byte_unagg')):
                     adamw_decay.append(p)   # 嵌入/输出头无矩阵结构，正交化无意义
                 elif p.dim() < 2:
                     adamw_nodecay.append(p) # norm/bias

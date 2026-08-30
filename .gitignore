@@ -13,6 +13,14 @@ data/*/train.bin
 data/*/val.bin
 data/*/meta.pkl
 data/*/manifest.json
+# 字级/字节直入数据产物（dev-notes/48/50，train_tokenizer.py/prepare.py 可重建）
+data/*/train_byte.bin
+data/*/val_byte.bin
+data/*/train_char.bin
+data/*/val_char.bin
+data/*/meta_byte.pkl
+data/*/meta_char.pkl
+data/*/char_tokenizer.json
 # 数据备份/中间产物（如 train.bin.bak-*）
 data/*/*.bak*
 *.bak*

@@ -11,11 +11,30 @@ import torch
 __all__ = ['build_assistant_mask']
 
 
+def _find_seq_starts(y, seq):
+    """y: (B, T)；seq: 任意长度标记序列。返回 (B, T-1) bool：位置 i 是 seq 起点。
+
+    长度 2 时与原实现（y[:,:-1]==s0 & y[:,1:]==s1）逐位等价；字节直入模式
+    （dev-notes/48）的标记是 7 字节序列（如「模型：」的 UTF-8），需要通用匹配。
+    """
+    B, T = y.shape
+    n = len(seq)
+    starts = torch.zeros(B, T - 1, dtype=torch.bool, device=y.device)
+    if T < n:
+        return starts
+    yw = y.unfold(1, n, 1)                       # (B, T-n+1, n)
+    seq_t = torch.tensor(seq, dtype=y.dtype, device=y.device).view(1, 1, n)
+    match = (yw == seq_t).all(dim=2)             # (B, T-n+1)
+    starts[:, :T - n + 1] = match                # 起点 i ∈ [0, T-n]
+    return starts
+
+
 def build_assistant_mask(y, model_ids, user_ids, sep_ids):
     """返回 (B, T) bool mask：True = 计算 loss，False = 忽略。
 
     y: (B, T) int64 token id 张量。
-    model_ids / user_ids / sep_ids: 长度 2 的标记 id 序列（如 [306, 228]）。
+    model_ids / user_ids / sep_ids: 标记 id 序列（BPE 版长度 2 如 [306, 228]；
+    字节直入版长度 7 如 [0xe6, 0xa8, 0xa1, 0xe5, 0x9e, 0x8b, 0x3a]）。
     语义：从「模型：」对开始（含）到「用户：」对（含）或「\n\n」对（不含）
     之间的区域算 loss；模型/用户标记对本身也算（让模型学对话骨架）。
 
@@ -26,13 +45,10 @@ def build_assistant_mask(y, model_ids, user_ids, sep_ids):
     if T < 2:
         # 单 token 窗口不存在任何标记对，全部忽略
         return torch.zeros_like(y, dtype=torch.bool)
-    m0, m1 = model_ids
-    u0, u1 = user_ids
-    s0, s1 = sep_ids
-    is_model = (y[:, :-1] == m0) & (y[:, 1:] == m1)          # 对起点在 i
-    is_user  = (y[:, :-1] == u0) & (y[:, 1:] == u1)
-    is_sep   = (y[:, :-1] == s0) & (y[:, 1:] == s1)
-    starts = is_model | is_user | is_sep                     # (B, T-1) 所有 pair 起点
+    is_model = _find_seq_starts(y, model_ids)    # (B, T-1)：seq 起点在 i
+    is_user  = _find_seq_starts(y, user_ids)
+    is_sep   = _find_seq_starts(y, sep_ids)
+    starts = is_model | is_user | is_sep         # (B, T-1) 所有标记起点
     idx = torch.arange(T - 1, device=y.device)
     last = idx.unsqueeze(0).expand(B, -1).clone()
     last[~starts] = -1

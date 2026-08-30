@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import torch
-from inference.scripts.sample_py import build_model_from_checkpoint, generate_ids
+from inference.scripts.sample_py import build_model_from_checkpoint, generate_ids, load_tokenizer
 
 MAX_NEW_TOKENS = 120
 TEMPERATURE = 0.8
@@ -54,15 +54,18 @@ def ngram_rep(s: str, n: int = 3) -> float:
     return sum(1 for g in grams if c[g] > 1) / len(grams)
 
 
-def run_conversation(model, tok, scenario, window=None, no_resume=False):
+def run_conversation(model, tok, scenario, window=None, no_resume=False, byte_mode=False):
     """跑 4 轮对话，返回每轮指标。
 
     window（dev-notes/46 推理状态选择性续传）：非 None 时输入只保留最近 window
-    token，记忆状态跨轮续传（长对话不随轮次增长）；no_resume 禁用续传（对照）。
+    token（字节模型 = 字节），记忆状态跨轮续传（长对话不随轮次增长）；no_resume
+    禁用续传（对照）。byte_mode：长度指标归一为聚合组（字节 ÷ 3），与 BPE 的
+    token 数同量纲可比（中文 1 字 = 3 字节 = 1 组 ≈ 1 BPE token）。
     """
     opening, followups = scenario
     ctx = opening
     mem_state = None
+    norm = 3 if byte_mode else 1
     turns = []
     for t in range(N_TURNS):
         gen, eos_pos = generate_ids(model, tok, ctx, MAX_NEW_TOKENS, TEMPERATURE,
@@ -77,11 +80,12 @@ def run_conversation(model, tok, scenario, window=None, no_resume=False):
         new_tok = gen[len(prompt_ids):]
         text = tok.decode(new_tok)
         rep3 = ngram_rep(text)
+        len_norm = len(new_tok) // norm
         # 轮次截断：如果模型自己开了 用户：/模型： 轮次，generate_ids 会截断
-        turn_cut = len(new_tok) < MAX_NEW_TOKENS and eos_pos == -1 and any(
+        turn_cut = len_norm < MAX_NEW_TOKENS and eos_pos == -1 and any(
             s in text for s in ("用户：", "用户:", "模型：", "模型:"))
         turns.append(dict(
-            turn=t, len_tokens=len(new_tok), rep3=round(rep3, 3),
+            turn=t, len_tokens=len_norm, rep3=round(rep3, 3),
             eos_hit=eos_pos != -1, turn_cut=turn_cut,
             text=text.strip()[:100],
         ))
@@ -98,12 +102,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dirs", nargs="*", default=["out/obs_zh_base", "out/obs_zh_mem"])
     ap.add_argument("--window", type=int, default=None,
-                    help="窗口+状态续传（dev-notes/46）：输入只保留最近 N token，记忆状态跨轮续传")
+                    help="窗口+状态续传（dev-notes/46）：输入只保留最近 N token（字节模型 = N 字节，"
+                         "如 192 ≈ 64 字），记忆状态跨轮续传")
     ap.add_argument("--no-resume", action="store_true", help="窗口模式下禁用状态续传（对照）")
     a = ap.parse_args()
-
-    from tokenizers import Tokenizer
-    tok = Tokenizer.from_file("data/chinese/tokenizer.json")
 
     results = {}
     for d in a.dirs:
@@ -111,15 +113,18 @@ def main():
             print(f"⚠ 跳过（无 best.pt）: {d}")
             continue
         rope_len = 8192 if a.window is not None else None
-        model, _ = build_model_from_checkpoint(d, rope_len=rope_len)
+        model, ckpt = build_model_from_checkpoint(d, rope_len=rope_len)
+        tok = load_tokenizer(ckpt)      # 字节直入模型自动切 ByteTokenizer（按目录各自检测）
+        byte_flag = bool(ckpt["model_args"].get("byte_level"))
         model.eval()
-        print(f"\n===== {d} (window={a.window}, resume={not a.no_resume}) =====")
+        print(f"\n===== {d} (window={a.window}, resume={not a.no_resume}, byte_level={byte_flag}) =====")
         per_model = []
         for sname, opening, followups in SCENARIOS:
             torch.manual_seed(SEED)
             torch.cuda.manual_seed(SEED)
             turns = run_conversation(model, tok, (opening, followups),
-                                     window=a.window, no_resume=a.no_resume)
+                                     window=a.window, no_resume=a.no_resume,
+                                     byte_mode=byte_flag)
             per_model.extend(turns)
             print(f"  [{sname}] 开场: {opening.strip()[:20]}…")
             for tt in turns:
@@ -149,7 +154,7 @@ def main():
         print(f"{d:<22} | {eos_rate:>5.0%} | {cut_rate:>6.0%} | {avg_len:>7.1f} | "
               f"{avg_rep3:>6.3f} | {last_len:>7.1f} | {last_rep3:>8.3f} | {crash:>5}")
     print("\n指标：EOS率=自然吐<eos>的比例 | 自开轮次=回复里自己重开用户/模型轮次(碎片信号) | "
-          "崩溃=rep3>0.3 或长度≤2 或首轮顶满上限")
+          "崩溃=rep3>0.3 或长度≤2 或首轮顶满上限 | len 单位：BPE=token，字节模型=聚合组（字节÷3）")
 
 
 if __name__ == "__main__":

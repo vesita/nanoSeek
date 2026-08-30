@@ -22,6 +22,7 @@ import sys
 import time
 import math
 import pickle
+import json
 import random
 import threading
 import hashlib
@@ -163,10 +164,34 @@ backend = 'nccl' # 'nccl'、'gloo' 等
 device = 'cuda' # 示例：'cpu'、'cuda'、'cuda:0'、'cuda:1' 等，或在 macbook 上试试 'mps'
 dtype = ('bfloat16' if torch.cuda.is_bf16_supported() else 'float16') if torch.cuda.is_available() else 'float32' # 'float32'、'bfloat16' 或 'float16'，后者会自动实现 GradScaler；纯 CPU 默认 float32（避免 float16+GradScaler 报错）
 compile = True # 默认开（dev-notes/42-A 曾用 3 步短测误判"无收益"改为关；实测 20 步：开 1.29 it/s vs 关 ~1.0 it/s，快 ~25%——1.5 分钟编译开销在长训练摊薄后净赚）
+byte_level = False      # 字节直入模式（dev-notes/48，Mamba-Byte 思想）：无 BPE 分词，
+                        # 词表 0-255 字节+<eos>=256，读 train_byte.bin/val_byte.bin
+char_level = False      # 字级模式（dev-notes/50）：汉字=1 token，读 train_char.bin/val_char.bin
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 load_config(globals()) # 从 YAML 配置文件或命令行覆盖
 config = {k: globals()[k] for k in config_keys} # 对日志记录很有用
+# 字级模式联动（--char-level=true）：汉字=1 token → block 256（≈BPE 上下文）、
+# CSA 默认参数（16 字/块、64 字/窗）、MTP 可开；mask 标记按字级 id。
+if char_level:
+    block_size = 256
+    from tokenizers import Tokenizer as _Tok
+    _cv = _Tok.from_file(os.path.join('data', dataset, 'char_tokenizer.json')).get_vocab()
+    mask_model_ids = [_cv[c] for c in '模型：']   # 字级 id（长度 3，masking 通用版支持）
+    mask_user_ids = [_cv[c] for c in '用户：']
+    mask_sep_ids = [_cv['\n'], _cv['\n']]
+# 字节直入模式联动（--byte-level=true）：中文每字 3 字节 → block 放大保持有效上下文；
+# vocab_size 由 meta_byte.pkl（257）提供。CSA 参数作用于**聚合后**的 token（1 聚合=1 字），
+# 与 BPE 等价映射：compress 16 字/块、window 64 字/窗。
+elif byte_level:
+    block_size = 510      # 510 字节 = 170 聚合 token（3 的倍数，≈170 字）
+    csa_compress = 16     # 块 16 聚合 token ≈ 16 字（与 BPE 一致）
+    csa_window = 64       # 滑窗 64 聚合 token ≈ 64 字（与 BPE 一致）
+    use_mtp = False       # MTP 依赖 wte 嵌入，字节模式关
+    # loss masking 标记改字节序列（全角冒号 9 字节 = 3 组，组边界对齐）
+    mask_model_ids = [0xe6, 0xa8, 0xa1, 0xe5, 0x9e, 0x8b, 0xef, 0xbc, 0x9a]  # 模型：
+    mask_user_ids = [0xe7, 0x94, 0xa8, 0xe6, 0x88, 0xb7, 0xef, 0xbc, 0x9a]   # 用户：
+    mask_sep_ids = [0x0a, 0x0a]                                                # \n\n
 # -----------------------------------------------------------------------------
 
 # 各种初始化、派生属性和 I/O 设置
@@ -214,8 +239,9 @@ if os.path.exists(data_manifest_path):
         print(f'warning: 读取数据清单 {data_manifest_path} 失败：{_e}')
 
 # 每个 epoch 的步数（YOLO 式进度条显示轮次用）
+_bin_name = ('train_char.bin' if char_level else 'train_byte.bin' if byte_level else 'train.bin')
 try:
-    _train_tokens = os.path.getsize(os.path.join(data_dir, 'train.bin')) // 2  # uint16
+    _train_tokens = os.path.getsize(os.path.join(data_dir, _bin_name)) // 2  # uint16
     steps_per_epoch = max(1, _train_tokens // tokens_per_iter)
 except OSError:
     steps_per_epoch = None
@@ -234,9 +260,9 @@ def get_batch(split):
         use_distill = (distill_bin and p_distill > 0 and random.random() < p_distill
                        and os.path.exists(distill_bin)
                        and os.path.getsize(distill_bin) > 2 * block_size)
-        path = distill_bin if use_distill else os.path.join(data_dir, 'train.bin')
+        path = distill_bin if use_distill else os.path.join(data_dir, _bin_name)
     else:
-        path = os.path.join(data_dir, 'val.bin')
+        path = os.path.join(data_dir, 'val_char.bin' if char_level else 'val_byte.bin' if byte_level else 'val.bin')
     data = np.memmap(path, dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
@@ -257,8 +283,8 @@ def get_batch(split):
 iter_num = 0
 best_val_loss = 1e9
 
-# 尝试从数据集推导 vocab_size
-meta_path = os.path.join(data_dir, 'meta.pkl')
+# 尝试从数据集推导 vocab_size（字节直入模式用 meta_byte.pkl，vocab 257）
+meta_path = os.path.join(data_dir, 'meta_char.pkl' if char_level else 'meta_byte.pkl' if byte_level else 'meta.pkl')
 meta_vocab_size = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
@@ -289,7 +315,8 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_lse_residual=use_lse_residual,
                   use_lse_gate=use_lse_gate,
                     use_qk_norm=use_qk_norm,
-                    z_loss_weight=z_loss_weight)
+                    z_loss_weight=z_loss_weight,
+                  byte_level=byte_level, char_level=char_level)
 
 def _build_model_from_checkpoint(checkpoint):
     """按 checkpoint 里的 model_args 构建模型并加载权重（供 resume / 后训练复用）。"""

@@ -74,6 +74,8 @@ class GPTConfig:
     kv_memory_layers: Optional[int] = None  # B组：启用记忆的最后 n 层（None=全部层）。观测台：底层读写比 0.25 vs 高层 0.41 → 底层记忆利用率低，可省
     kv_memory_block: int = 1  # C组：块级记忆块大小（token 数）。1=逐 token（现行为）；>1 块内 k/v/r/w 均值池化、状态每块更新一次，粒度变粗（dev-notes/44）
     kv_memory_delta: bool = False  # P2：Delta 擦写律——S←r⊙S+w(v−S·k)kᵀ 先擦后写，消除键冲突混叠（dev-notes/45）
+    byte_level: bool = False  # 字节直入+3:1聚合（dev-notes/48）：输入 UTF-8 字节流，聚合层学"字节→语义单位"，无 BPE 分词
+    char_level: bool = False  # 字级（dev-notes/50）：汉字=1 token，标准 GPT + WordLevel 词表（对齐字符、无话术固化）
     # --- V4 结构设计升级（实验性，默认全关）---
     # Attention Sinks：每头一个可学习标量偏置，作为 softmax 的"垃圾桶"吸收无关注意力。
     use_attn_sink: bool = False

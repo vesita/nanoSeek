@@ -11,7 +11,7 @@
 """
 import os
 
-from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers, Regex
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -28,13 +28,55 @@ def collect_corpus_files():
     return paths
 
 
+def build_char_wordlevel(paths, out_json, n_chars=4500):
+    """字级词表（dev-notes/50，--char 模式）：WordLevel 每字一个词条。
+
+    词表：<eos>/<unk> + 换行 + ASCII（96，英文按字母级）+ 全角标点 + 常用汉字 top N。
+    未登录（生僻字）→ <unk>；对齐字符 + 无 BPE 话术固化。
+    """
+    import collections
+
+    special = {"<eos>": 0, "<unk>": 1}
+    fullwidth = "。！？，、；：\"\"''（）《》…—·～「」『』【】"
+    counter = collections.Counter()
+    for p in paths:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            counter.update(f.read())
+    vocab = dict(special)
+    vocab.setdefault("\n", len(vocab))
+    for c in map(chr, range(32, 127)):
+        vocab.setdefault(c, len(vocab))
+    for c in fullwidth:
+        vocab.setdefault(c, len(vocab))
+    for c, _ in counter.most_common():
+        if c in vocab or c.isspace() or ord(c) < 128:
+            continue
+        vocab[c] = len(vocab)
+        if len(vocab) >= 2 + 1 + 95 + len(fullwidth) + n_chars:
+            break
+    tok = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
+    tok.pre_tokenizer = pre_tokenizers.Split(Regex(r"[\s\S]"), behavior="isolated")
+    tok.decoder = decoders.ByteLevel(add_prefix_space=False)
+    tok.save(out_json)
+    print(f"\n字级词表 {len(vocab)} 项 → {out_json}（WordLevel，tokenizers 标准格式）")
+    return tok
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description='训练 BPE 分词器（全量语料）')
     ap.add_argument('--vocab-size', type=int, default=8000,
                     help='词表大小。默认 8000（日常中文）：嵌入表 8000×n_embd 很小，'
                          'transformer 参数占比高；词表越大压缩越好，但嵌入表越占参数。')
+    ap.add_argument('--char', action='store_true',
+                    help='构建字级 WordLevel 词表（dev-notes/50）替代 BPE：汉字=1 token，'
+                         '对齐字符 + 无话术固化（产出 char_tokenizer.json）')
     args = ap.parse_args()
+
+    if args.char:
+        paths = collect_corpus_files()
+        build_char_wordlevel(paths, os.path.join(DATA_DIR, 'char_tokenizer.json'))
+        return
 
     tokenizer = Tokenizer(models.BPE(unk_token='<unk>'))
     # ByteLevel 对所有 Unicode（含中文）都友好，和 GPT-2 系模型一致

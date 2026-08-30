@@ -83,6 +83,7 @@ def load_config(g):
             assert arg.startswith('--'), f"命令行覆盖必须以 '--' 开头: {arg}"
             key, val = arg.split('=', 1)
             key = key[2:]
+            key = key.replace('-', '_')  # argparse 风格连字符 → 下划线（--byte-level → byte_level）
             if key not in g:
                 raise ValueError(f"Unknown config key: {key}")
             if val.lower() in ('true', 'false'):

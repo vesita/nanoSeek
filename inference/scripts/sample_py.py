@@ -6,11 +6,17 @@ Python 采样器：为实验性（Rust 未支持）架构提供采样目测。
 在 Python 里生成，采样逻辑镜像 Rust 的 sample()（model.rs）：温度 → 重复惩罚
 （CTRL 做法，对已见 token 施加）→ top-k → softmax → 多项式采样。
 
+字节直入模型（dev-notes/48，byte_level=True）自动切换 ByteTokenizer，无需手动指定：
+词表 257（0-255 字节 + 256=<eos>），输入 = UTF-8 字节流，模型内部 3 字节聚合 1 个
+token，每步采样一组 3 字节（max_new_tokens 语义 = 聚合位置数，生成字节数 = 3×step）；
+--window 在字节模式下按字节数计（如 192 ≈ 64 字）。
+
 用法（从项目根目录）：
     uv run python inference/scripts/sample_py.py \
         --out_dir out/chinese-data2-sparse2 \
         --prompt "用户：最近好累怎么办？\n模型："
     # 可选：--max-new-tokens 300 --temperature 0.8 --top-k 200 --repeat-penalty 1.2 --seed 1337
+    # 字节模型：--out_dir out/byte_daily_300 --prompt $'用户：最近压力好大\n模型：'
 """
 import argparse
 import sys
@@ -62,12 +68,38 @@ def build_model_from_checkpoint(out_dir, device=None, rope_len=None):
     return model, ckpt
 
 
-def _truncate_at_turn(gen_ids, tok):
+def load_tokenizer(ckpt):
+    """按 checkpoint 的词表模式自动选 tokenizer（推理侧统一入口，chat/eval 复用）。
+
+    char_level=True（dev-notes/50 字级）→ CharTokenizer（汉字=1 token，char_tokenizer.json）；
+    byte_level=True（dev-notes/48 字节直入）→ ByteTokenizer（0-255 字节 + 256=<eos>）；
+    否则 BPE（data/chinese/tokenizer.json）。
+    """
+    args = ckpt["model_args"]
+    if args.get("char_level"):
+        return Tokenizer.from_file("data/chinese/char_tokenizer.json")  # WordLevel 字级
+    if args.get("byte_level"):
+        from model.byte_tokenizer import ByteTokenizer
+        return ByteTokenizer()
+    return Tokenizer.from_file("data/chinese/tokenizer.json")
+
+
+def _truncate_at_turn(gen_ids, tok, byte_mode=False):
     """生成内容里出现下一轮标签（\n用户：/\n模型：）→ 截断到标签之前（治喋喋不休）。
 
     模型学会对话骨架后常自己续写"用户：…"，这是天然轮次边界：话已说"完"才开下一轮。
     在字符层找标签位置，再回退到最近的 token 边界（BPE 标签可能跨 token）。
+    字节模式（byte_mode）：标签按 UTF-8 字节序列在字节流里精确匹配（无跨 token 问题，
+    decode 前缀长度匹配退化为字节索引直接截断）。
     """
+    if byte_mode:
+        for marker in ("\n用户：", "\n模型：", "\nUser:", "\nModel:"):
+            mb = list(marker.encode("utf-8"))
+            n = len(mb)
+            for j in range(len(gen_ids) - n + 1):
+                if gen_ids[j:j + n] == mb:
+                    return gen_ids[:j], True
+        return gen_ids, False
     text = tok.decode(gen_ids)
     for marker in ("\n用户：", "\n模型：", "\nUser:", "\nModel:"):
         pos = text.find(marker)
@@ -95,13 +127,28 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
     window（dev-notes/46 推理状态选择性续传）：非 None 时输入只保留最近 window
     个 token（RoPE 用全局绝对位置偏移），窗口外信息由缓存的记忆状态承接——
     上下文不随对话增长。window=None = 完整上下文（现行为）。
+    字节直入模型（model.config.byte_level，dev-notes/48）自动走字节分支：
+    - 输入 = UTF-8 字节流（0-255 + 256=<eos>），长度补足 3 的倍数（头部补 0 对齐聚合组）
+    - 每步前向 logits (B, 1, 3, V)，3 个字节位置独立采样 → 一组 3 字节；
+      max_new_tokens 语义 = 聚合位置数（生成字节数 = 3×step）
+    - token_callback 按聚合组回调（一次 3 字节；EOS 截断组只回调截断前缀）
+    - window 参数按字节数计（如 192 ≈ 64 字）；rope_offset = 字节偏移 // 3
+    - 返回的 token 列表不含头部对齐补齐字节（= 纯 prompt + 生成）
     no_resume：window 模式下禁用状态续传（每步记忆从 0 递推）——对照实验用，
     量化"续传"本身的价值。
     resume_state：跨轮续传的外部记忆状态（None = 本轮从零开始）——多轮评估
     时上一轮结束的状态注入本轮第一步。
     """
+    byte_mode = bool(getattr(model.config, "byte_level", False))
     idx = tok.encode(prompt).ids
     device = next(model.parameters()).device        # 与模型同设备（GPU 推理时 idx 也在 GPU）
+    pad = 0
+    if byte_mode:
+        # 字节直入要求输入长度是 3 的倍数（3 字节/聚合组，gpt.py 断言）。任意 prompt 的
+        # UTF-8 字节数不保证 %3==0 → 头部补 0 字节对齐（训练样本本身任意字节对齐切块，
+        # 模型对组内偏移不敏感）；返回前剥掉补齐字节，接口与 BPE 完全一致。
+        pad = (-len(idx)) % 3
+        idx = [0] * pad + idx
     idx = torch.tensor([idx], dtype=torch.long, device=device)
     new_start = idx.shape[1]
     seen = list(idx[0].tolist())
@@ -111,10 +158,19 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
     for step in range(max_new_tokens):
         if window is not None:
             win_len = min(idx.size(1), window)
-            idx_cond = idx[:, -win_len:]                       # 最近 window 个 token
-            rope_offset = idx.size(1) - win_len                # 窗口起点全局绝对位置
+            if byte_mode:
+                win_len -= win_len % 3          # 字节窗口对齐到聚合组边界
+                win_len = max(win_len, 3)
+            idx_cond = idx[:, -win_len:]                       # 最近 window 个 token/字节
+            rope_offset = ((idx.size(1) - win_len) // 3 if byte_mode
+                           else idx.size(1) - win_len)         # 窗口起点全局绝对位置
         else:
-            idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
+            if byte_mode:
+                # block_size 是聚合位置数 → 字节上限 = block_size×3（训练 block 为 3 的倍数）
+                limit = model.config.block_size * 3
+                idx_cond = idx if idx.size(1) <= limit else idx[:, -limit:]
+            else:
+                idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
             rope_offset = 0
         if mem_state is not None and not no_resume:
             model.set_memory_state(mem_state)                  # 续传：记忆从缓存状态继续
@@ -123,33 +179,61 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
         logits, _ = model(idx_cond, rope_offset=rope_offset)
         if not no_resume:
             mem_state = model.get_memory_state()               # 更新状态缓存（末态）
-        logits = logits[:, -1, :] / temperature
-        v = logits.squeeze(0).clone()
+        if byte_mode:
+            # 字节直入：logits (B, T, 3, V)，推理只取最后聚合位置 → (B, 3, V)，
+            # 3 个字节位置各自 temperature/top_k/repeat_penalty + softmax + 采样。
+            v = logits[:, -1, :, :].squeeze(0).clone() / temperature     # (3, V)
+        else:
+            v = logits[:, -1, :].squeeze(0).clone() / temperature        # (V,)
         if repeat_penalty > 1.0:
-            # 向量化（原 O(T²) python 循环：每步遍历全部已见 token）
+            # 向量化（原 O(T²) python 循环：每步遍历全部已见 token/字节）
             seen_t = torch.as_tensor(seen, dtype=torch.long, device=v.device)
-            vs = v[seen_t]
-            v[seen_t] = torch.where(vs >= 0, vs / repeat_penalty, vs * repeat_penalty)
+            if v.dim() == 1:
+                vs = v[seen_t]
+                v[seen_t] = torch.where(vs >= 0, vs / repeat_penalty, vs * repeat_penalty)
+            else:
+                # 字节模式 v 是 (3, V)：沿最后一维 gather（3 个字节位置各自惩罚）
+                vs = v[:, seen_t]
+                v[:, seen_t] = torch.where(vs >= 0, vs / repeat_penalty, vs * repeat_penalty)
         if top_k is not None:
             k = min(top_k, v.size(-1))
-            topv, _ = torch.topk(v, k)
-            v[v < topv[-1]] = -float("Inf")
+            topv, _ = torch.topk(v, k, dim=-1)
+            if v.dim() == 1:
+                v[v < topv[-1]] = -float("Inf")
+            else:
+                v[v < topv[:, -1].unsqueeze(-1)] = -float("Inf")   # 每行各自阈值
         probs = F.softmax(v, dim=-1)
         nxt = torch.multinomial(probs, 1)
-        nxt_id = int(nxt.item())
-        if token_callback is not None:
-            token_callback(nxt_id)                 # 流式输出：每步回调（chat.py 打字机）
-        if stop_on_eos and nxt_id == eos_id:
-            eos_pos = step            # 模型自己说"完了"：记录并停（EOS 不进输出）
-            break
-        seen.append(nxt_id)
-        idx = torch.cat((idx, nxt.unsqueeze(0)), dim=1)
+        if byte_mode:
+            nxt_ids = nxt.squeeze(-1).tolist()     # 一组 3 个字节 id
+            cut = nxt_ids.index(eos_id) if (stop_on_eos and eos_id in nxt_ids) else None
+            out_ids = nxt_ids if cut is None else nxt_ids[:cut]    # EOS 不进输出
+            if token_callback is not None and out_ids:
+                token_callback(out_ids)            # 流式输出：按聚合组回调（UTF-8 分片由 decode 增量自愈）
+            if cut is not None:
+                eos_pos = step * 3 + cut           # EOS 在生成区内的字节位置
+                break
+            seen.extend(out_ids)
+            idx = torch.cat((idx, torch.tensor([out_ids], dtype=torch.long, device=device)), dim=1)
+        else:
+            nxt_id = int(nxt.item())
+            if token_callback is not None:
+                token_callback(nxt_id)             # 流式输出：每步回调（chat.py 打字机）
+            if stop_on_eos and nxt_id == eos_id:
+                eos_pos = step                     # 模型自己说"完了"：记录并停（EOS 不进输出）
+                break
+            seen.append(nxt_id)
+            idx = torch.cat((idx, nxt.unsqueeze(0)), dim=1)
         if stop_on_turn:
             gen_ids = idx[0][new_start:].tolist()
-            # 每步全量 decode 是 O(T²)：只在末尾 16-token 窗口里找轮次标记（marker ≤4 字符≈2-4 token），
+            # 每步全量 decode 是 O(T²)：只在末尾小窗口里找轮次标记（marker ≤4 字符≈2-4 token），
             # 命中才全量截断。窗口内漏检最多晚几步截断，不影响截断语义。
-            if any(m in tok.decode(gen_ids[-16:]) for m in ("\n用户：", "\n模型：", "\nUser:", "\nModel:")):
-                truncated, hit = _truncate_at_turn(gen_ids, tok)
+            if byte_mode:
+                tail = tok.decode(gen_ids[-48:])   # 48 字节 ≈ 16 字（字节模式放宽窗口）
+            else:
+                tail = tok.decode(gen_ids[-16:])
+            if any(m in tail for m in ("\n用户：", "\n模型：", "\nUser:", "\nModel:")):
+                truncated, hit = _truncate_at_turn(gen_ids, tok, byte_mode=byte_mode)
                 if hit:
                     keep = torch.tensor([truncated], dtype=torch.long, device=idx.device)
                     idx = torch.cat([idx[:, :new_start], keep], dim=1)
@@ -165,6 +249,10 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
             if pos >= 0:
                 for k in range(len(gen_ids) + 1):
                     if len(tok.decode(gen_ids[:k])) > pos:
+                        if byte_mode:
+                            # 字节模式：回退到完整字符边界，截断处不留替换符（半截字符）
+                            while k > 0 and tok.decode(gen_ids[:k]).endswith("\ufffd"):
+                                k -= 1
                         gen = gen[:new_start] + gen_ids[:k]
                         break
     # 未开 stop_on_eos 时也找 EOS：模型吐了终止符 → 记录位置并截断
@@ -174,6 +262,8 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
                 eos_pos = i
                 gen = gen[:new_start + i]   # EOS 及其后不输出
                 break
+    if byte_mode and pad:
+        gen = gen[pad:]                     # 剥掉头部对齐补齐字节（返回=纯 prompt+生成）
     return gen, eos_pos
 
 
@@ -213,9 +303,10 @@ def main():
     torch.manual_seed(a.seed)
     rope_len = 8192 if a.window is not None else None   # 窗口续传需 RoPE 表覆盖绝对位置
     model, ckpt = build_model_from_checkpoint(a.out_dir, a.device, rope_len=rope_len)
-    tok = Tokenizer.from_file("data/chinese/tokenizer.json")
+    tok = load_tokenizer(ckpt)                          # 字节直入模型自动切 ByteTokenizer
     n = sum(p.numel() for p in model.parameters())
-    print(f"[{a.out_dir}] {n:,} 参数 | no_attn_layers={ckpt['model_args'].get('no_attn_layers')} | block_order={ckpt['model_args'].get('block_order')}")
+    byte_flag = bool(ckpt["model_args"].get("byte_level"))
+    print(f"[{a.out_dir}] {n:,} 参数 | byte_level={byte_flag} | no_attn_layers={ckpt['model_args'].get('no_attn_layers')} | block_order={ckpt['model_args'].get('block_order')}")
 
     out = generate(model, tok, a.prompt, a.max_new_tokens, a.temperature, a.top_k,
                    a.repeat_penalty, a.stop_on_turn, a.stop_on_eos, a.clip_sentence,

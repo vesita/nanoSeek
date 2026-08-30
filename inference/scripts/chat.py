@@ -20,9 +20,37 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import torch
-from tokenizers import Tokenizer
 
-from inference.scripts.sample_py import build_model_from_checkpoint, generate_ids
+from inference.scripts.sample_py import build_model_from_checkpoint, generate_ids, load_tokenizer
+
+
+def _trunc_need(b):
+    """若字节串 b 是截断的多字节 UTF-8 字符前缀，返回还缺的续字节数；否则 0。"""
+    if not b:
+        return 0
+    lead = b[0]
+    if 0xC2 <= lead <= 0xDF:
+        need = 1
+    elif 0xE0 <= lead <= 0xEF:
+        need = 2
+    elif 0xF0 <= lead <= 0xF4:
+        need = 3
+    else:
+        return 0
+    cont = b[1:]
+    if len(cont) >= need:
+        return 0                       # 完整字符（或字符+更多），不是截断
+    if all(0x80 <= c <= 0xBF for c in cont):
+        return need - len(cont)        # 截断：还差这么多字节
+    return 0                           # 续字节非法
+
+
+def _tail_pending(raw):
+    """返回字节流尾部滞留的跨组分片字节数（0 = 无）。截断字符等下一组补全。"""
+    for k in (1, 2, 3):
+        if _trunc_need(raw[-k:]) > 0:
+            return k
+    return 0
 
 
 def main():
@@ -36,7 +64,8 @@ def main():
     ap.add_argument("--seed", type=int, default=None,
                     help="固定随机种子（默认 None = 每次对话随机）")
     ap.add_argument("--window", type=int, default=None,
-                    help="推理状态选择性续传：只保留最近 N token，历史由记忆状态承接")
+                    help="推理状态选择性续传：只保留最近 N token（字节模型 = N 字节，"
+                         "如 192 ≈ 64 字），历史由记忆状态承接")
     ap.add_argument("--system", default=None, help="系统提示（身份/风格设定）")
     a = ap.parse_args()
 
@@ -45,10 +74,11 @@ def main():
         torch.cuda.manual_seed(a.seed)
     rope_len = 8192 if a.window is not None else None
     model, ckpt = build_model_from_checkpoint(a.out_dir, rope_len=rope_len)
-    tok = Tokenizer.from_file("data/chinese/tokenizer.json")
+    tok = load_tokenizer(ckpt)      # 字节直入模型自动切 ByteTokenizer
     model.eval()
     n = sum(p.numel() for p in model.parameters())
-    print(f"[{a.out_dir}] {n:,} 参数 | window={a.window} | 对话开始（Ctrl+C / 空行 / exit 退出）")
+    byte_flag = bool(ckpt["model_args"].get("byte_level"))
+    print(f"[{a.out_dir}] {n:,} 参数 | byte_level={byte_flag} | window={a.window} | 对话开始（Ctrl+C / 空行 / exit 退出）")
     print("─" * 60)
 
     ctx = (a.system + "\n") if a.system else ""
@@ -66,14 +96,25 @@ def main():
             break
         ctx += f"用户：{user}\n模型："
 
-        # 流式打字机：回调里全量 decode 求增量（BPE 分片自愈）
+        # 流式打字机：回调里全量 decode 求增量。回调载荷：BPE = 单个 token id；
+        # 字节直入 = 一组 3 字节（list），统一按列表处理。
+        # 字节模式：3 字节组可能切在 UTF-8 字符中间（如 [0xE4] 独字节）——若直接把
+        # 截断的 lead 字节输出成 �，下组补全时增量会丢字符。用 _tail_pending 识别
+        # 尾部"待补全"分片：截断字符滞留等下一组，真非法字节才 replace 消化。
         printed = ""
         gen_tokens = []
 
-        def cb(tid):
+        def cb(tids):
             nonlocal printed
-            gen_tokens.append(tid)
-            text = tok.decode(gen_tokens)
+            if isinstance(tids, int):
+                tids = [tids]
+            gen_tokens.extend(tids)
+            if byte_flag:
+                raw = bytes(t for t in gen_tokens if t < 256)
+                n = len(raw) - _tail_pending(raw)
+                text = raw[:n].decode("utf-8", errors="replace")
+            else:
+                text = tok.decode(gen_tokens)
             sys.stdout.write(text[len(printed):])
             sys.stdout.flush()
             printed = text

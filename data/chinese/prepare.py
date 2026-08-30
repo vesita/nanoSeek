@@ -20,6 +20,7 @@ import pickle
 import random
 import requests
 import numpy as np
+from split_sentences import split_text  # 数据分句器（dev-notes/49）
 from tokenizers import Tokenizer
 
 # 待补齐的书目：(本地文件名, URL 里的中文书名)，下载不到就跳过
@@ -34,6 +35,7 @@ MIRROR_URL = 'https://cdn.jsdelivr.net/gh/tennessine/corpus@master/{enc}.txt'
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKENIZER_PATH = os.path.join(DATA_DIR, 'tokenizer.json')
+CHAR_TOKENIZER_PATH = os.path.join(DATA_DIR, 'char_tokenizer.json')
 CHUNK = 1_000_000  # 编码分块大小（字符），控制内存
 
 
@@ -96,6 +98,29 @@ def encode_to_bin(text, tokenizer, out_path):
         for i in range(0, len(text), CHUNK):
             ids = tokenizer.encode(text[i:i + CHUNK]).ids
             np.array(ids, dtype=np.uint16).tofile(f)
+
+
+EOS_ID = 256  # 字节直入模式（dev-notes/48）：0-255 = UTF-8 字节，256 = <eos>
+
+
+def encode_bytes_to_bin(text, out_path):
+    """字节直入版：文本 → UTF-8 字节 id（0-255），字面量 <eos> 映射 256。
+
+    不经过 BPE 分词（Mamba-Byte 思想：无分词器、无 OOV、话术片段不固化在词表）。
+    整段编码（<eos> 分割避免跨块切半），uint16 增量写 bin。
+    """
+    with open(out_path, 'wb') as f:
+        buf = []
+        parts = text.split('<eos>')
+        for i, part in enumerate(parts):
+            buf.extend(part.encode('utf-8'))       # 0-255 字节
+            if i < len(parts) - 1:
+                buf.append(EOS_ID)
+            if len(buf) >= 1 << 20:                # 每 ~1M id flush，控峰值内存
+                np.array(buf, dtype=np.uint16).tofile(f)
+                buf = []
+        if buf:
+            np.array(buf, dtype=np.uint16).tofile(f)
 
 
 def sha256_file(path):
@@ -170,6 +195,15 @@ def main():
                     help='每条 模型： 回复后插入 <eos>（turn-level 终止符，治喋喋不休，默认开启）')
     ap.add_argument('--no-insert-eos', action='store_true',
                     help='关闭 --insert-eos（不插 <eos>，旧数据行为）')
+    ap.add_argument('--byte-level', action='store_true',
+                    help='字节直入模式（dev-notes/48）：输出 train_byte.bin/val_byte.bin，'
+                         '0-255=UTF-8 字节 + 256=<eos>，不经过 BPE 分词。不动 BPE 的 train.bin')
+    ap.add_argument('--split-sentences', action='store_true',
+                    help='数据分句（dev-notes/49）：按句末标点切分（保留标点、超长句二次切），'
+                         '模型按完整句子阅读/生成，不硬截断句子')
+    ap.add_argument('--char-level', action='store_true',
+                    help='字级模式（dev-notes/50）：汉字=1 token，输出 train_char.bin/val_char.bin，'
+                         '词表见 char_tokenizer.json（对齐字符 + 无话术固化）')
     args = ap.parse_args()
     if args.no_insert_eos:
         args.insert_eos = False
@@ -246,18 +280,41 @@ def main():
     val_data = '\n\n'.join(val_samples)
     print(f'{len(train_data):,} 训练字符 / {len(val_data):,} 验证字符')
 
-    # 5) 编码 + 写 bin
-    encode_to_bin(train_data, tokenizer, os.path.join(DATA_DIR, 'train.bin'))
-    encode_to_bin(val_data, tokenizer, os.path.join(DATA_DIR, 'val.bin'))
-    print(f'train token 数：{os.path.getsize(os.path.join(DATA_DIR, "train.bin")) // 2:,}')
-    print(f'val token 数：{os.path.getsize(os.path.join(DATA_DIR, "val.bin")) // 2:,}')
+    # 5) 编码 + 写 bin（--char-level：字级；--byte-level：字节直入；默认：BPE）
+    if args.char_level:
+        train_bin = os.path.join(DATA_DIR, 'train_char.bin')
+        val_bin = os.path.join(DATA_DIR, 'val_char.bin')
+        char_tok = Tokenizer.from_file(CHAR_TOKENIZER_PATH)   # WordLevel 字级（dev-notes/50）
+        encode_to_bin(train_data, char_tok, train_bin)
+        encode_to_bin(val_data, char_tok, val_bin)
+        vocab_size = char_tok.get_vocab_size()
+        meta = {'vocab_size': vocab_size, 'char_level': True,
+                'tokenizer_path': os.path.basename(CHAR_TOKENIZER_PATH)}
+        meta_path = os.path.join(DATA_DIR, 'meta_char.pkl')   # 独立 meta，不覆盖 BPE/byte
+    elif args.byte_level:
+        train_bin = os.path.join(DATA_DIR, 'train_byte.bin')
+        val_bin = os.path.join(DATA_DIR, 'val_byte.bin')
+        encode_bytes_to_bin(train_data, train_bin)
+        encode_bytes_to_bin(val_data, val_bin)
+        vocab_size = 257  # 0-255 字节 + <eos>=256
+        meta = {'vocab_size': vocab_size, 'byte_level': True}
+        meta_path = os.path.join(DATA_DIR, 'meta_byte.pkl')   # 独立 meta，不覆盖 BPE 的 meta.pkl
+    else:
+        train_bin = os.path.join(DATA_DIR, 'train.bin')
+        val_bin = os.path.join(DATA_DIR, 'val.bin')
+        encode_to_bin(train_data, tokenizer, train_bin)
+        encode_to_bin(val_data, tokenizer, val_bin)
+        vocab_size = tokenizer.get_vocab_size()
+        meta = {
+            'vocab_size': vocab_size,
+            'tokenizer_path': os.path.basename(TOKENIZER_PATH),
+        }
+        meta_path = os.path.join(DATA_DIR, 'meta.pkl')
+    print(f'train token 数：{os.path.getsize(train_bin) // 2:,}')
+    print(f'val token 数：{os.path.getsize(val_bin) // 2:,}')
 
     # 6) meta 信息（train.py 只读 vocab_size；推理端用 tokenizer.json 编解码）
-    meta = {
-        'vocab_size': vocab_size,
-        'tokenizer_path': os.path.basename(TOKENIZER_PATH),
-    }
-    with open(os.path.join(DATA_DIR, 'meta.pkl'), 'wb') as f:
+    with open(meta_path, 'wb') as f:
         pickle.dump(meta, f)
     write_manifest(args, tokenizer, train_samples, val_samples,
                    train_data, val_data, meta)
