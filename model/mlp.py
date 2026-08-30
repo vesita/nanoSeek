@@ -22,7 +22,9 @@ class SwiGLU(nn.Module):
         self.c_proj = nn.Linear(hidden, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
+    def forward(self, x, rope_offset=0):
+        # rope_offset：占位参数（SwiGLU 无位置概念）——skip_attn 层与注意力层共用
+        # Block 的统一调用签名（dev-notes/46 推理状态续传的 RoPE 偏移）。
         x = F.silu(self.c_fc(x)) * self.c_fc2(x)  # SiLU(xW1) ⊙ (xW2)
         if self.config.swiglu_clamp > 0:
             # V4 稳定性技巧：钳制门控输出，从源头压制异常值。

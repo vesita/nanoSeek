@@ -83,7 +83,9 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, rope_offset=0):
+        """rope_offset（dev-notes/46 推理状态续传）：输入序列的全局起始位置。
+        窗口截断推理时传窗口起点的绝对位置，RoPE 保持绝对坐标（默认 0 = 训练/全序列）。"""
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"无法前向传播长度为 {t} 的序列，block size 只有 {self.config.block_size}"
@@ -106,7 +108,7 @@ class GPT(nn.Module):
             # mHC：4 个残差流从同一个嵌入出发（在流维扩展）
             x = x.unsqueeze(2).expand(b, x.size(1), self.config.hc_mult, self.config.n_embd)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, rope_offset=rope_offset)
         if self.config.use_mhc:
             # 4 流均值回到 1 流，再给 ln_f / lm_head（V4 用可学习合并，这里用均值简化）
             x = x.mean(dim=2)
@@ -145,6 +147,28 @@ class GPT(nn.Module):
             loss = None
 
         return logits, loss
+
+    def get_memory_state(self):
+        """推理状态续传（dev-notes/46）：收集各记忆层的联想状态末态。
+        key = 层索引；未启用记忆或未前向过的层不包含。"""
+        states = {}
+        for i, blk in enumerate(self.transformer.h):
+            a = blk.attn
+            s = a.get_mem_state() if getattr(a, 'kv_memory_enabled', False) else None
+            if s is not None:
+                states[i] = s
+        return states
+
+    def set_memory_state(self, states):
+        """注入续传状态：下次前向各记忆层从缓存状态继续递推（替代恒 0）。
+        states=None 或空 dict = 清除所有注入（记忆从零开始）。"""
+        if not states:
+            for i, blk in enumerate(self.transformer.h):
+                if getattr(blk.attn, 'kv_memory_enabled', False):
+                    blk.attn.set_mem_state(None)
+            return
+        for i, s in states.items():
+            self.transformer.h[i].attn.set_mem_state(s)
 
     def _compute_mtp_loss(self, x, targets):
         """MTP 损失：第 k 个模块用「位置 t 的隐藏状态 + 目标 t+k+1 的嵌入」预测 t+k+2。

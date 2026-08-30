@@ -124,6 +124,11 @@ class CausalSelfAttention(nn.Module):
         # 仅供离线分析；训练时保持 False，零开销。
         self.capture = False
 
+        # 推理状态续传（dev-notes/46）：set_mem_state 注入外部初始状态（替代恒 0），
+        # get_mem_state 取最近一次前向的联想状态末态。None = 从零开始（训练/默认）。
+        self._mem_state_inject = None
+        self._last_mem_state = None
+
         # QK-Norm：q/k 分别是 (B, T, nh, d)；返回归一化后的 q/k（保留 head 维）。
         # 只对参与点积的 q/k 做，v 不做。
         # 语义：q = normalize(q) * qk_scale，k = normalize(k)。qk_scale 初始 = sqrt(head_dim)，
@@ -137,12 +142,12 @@ class CausalSelfAttention(nn.Module):
         k = F.normalize(k, dim=-1)
         return q, k
 
-    def forward(self, x):
+    def forward(self, x, rope_offset=0):
         B, T, C = x.size() # batch 大小、序列长度、嵌入维度 (n_embd)
 
         if self.use_csa:
             # CSA/HCA 混合注意力（V4 简化版）：走独立的压缩稀疏路径
-            y = self._csa_forward(x)
+            y = self._csa_forward(x, rope_offset)
             y = self.resid_dropout(self.c_proj(y))
             return y
 
@@ -159,7 +164,9 @@ class CausalSelfAttention(nn.Module):
                 # 让模型自己决定每个 head 需要多少位置信息（都能从同一 low-rank 潜在表达还原）
                 q_rope, q_nope = q[..., :self.rope_head_dim], q[..., self.rope_head_dim:]
                 k_rope, k_nope = k[..., :self.rope_head_dim], k[..., self.rope_head_dim:]
-                q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, self.cos[:T], self.sin[:T])
+                q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope,
+                                                      self.cos[rope_offset:rope_offset + T],
+                                                      self.sin[rope_offset:rope_offset + T])
                 q = torch.cat([q_rope, q_nope], dim=-1)
                 k = torch.cat([k_rope, k_nope], dim=-1)
         else:
@@ -174,7 +181,9 @@ class CausalSelfAttention(nn.Module):
 
             if self.use_rope:
                 # 旋转位置编码：只对 q 和 k 做（v 不旋转），这样 q·k 携带相对位置
-                q, k = apply_rotary_pos_emb(q, k, self.cos[:T], self.sin[:T])
+                q, k = apply_rotary_pos_emb(q, k,
+                                            self.cos[rope_offset:rope_offset + T],
+                                            self.sin[rope_offset:rope_offset + T])
 
         if self.capture:
             # 观测台：记录 q/k/v（RoPE/QK-Norm 之后、合并 head 之前）供 KV 统计
@@ -249,7 +258,7 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-    def _csa_forward(self, x):
+    def _csa_forward(self, x, rope_offset=0):
         """CSA + HCA 混合注意力（DeepSeek-V4 的简化教育版）。
 
         CSA（压缩稀疏注意力）：把 K/V 按 m 个 token 一块，平均池化成 1 个潜在向量。
@@ -286,7 +295,9 @@ class CausalSelfAttention(nn.Module):
             # 部分 RoPE：只旋转前 rope_head_dim 维（与 MLA 一致）
             q_rope, q_nope = q[..., :self.rope_head_dim], q[..., self.rope_head_dim:]
             k_rope, k_nope = k[..., :self.rope_head_dim], k[..., self.rope_head_dim:]
-            q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, self.cos[:T], self.sin[:T])
+            q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope,
+                                                  self.cos[rope_offset:rope_offset + T],
+                                                  self.sin[rope_offset:rope_offset + T])
             q = torch.cat([q_rope, q_nope], dim=-1)
             k = torch.cat([k_rope, k_nope], dim=-1)
 
@@ -494,6 +505,15 @@ class CausalSelfAttention(nn.Module):
         """取出本层 Lightning Indexer 的 KL 辅助损失（非 CSA 路径时无意义，返回 0）。"""
         return self.indexer_loss if hasattr(self, 'indexer_loss') else None
 
+    def get_mem_state(self):
+        """推理状态续传（dev-notes/46）：最近一次前向的联想状态末态 (B,nh,l,l) fp32。
+        未前向过或非记忆层返回 None。调用方负责 .detach().clone()（返回即拷贝）。"""
+        return self._last_mem_state
+
+    def set_mem_state(self, state):
+        """注入续传状态：下次记忆前向从 state 继续递推（替代恒 0）。state: (B,nh,l,l)。"""
+        self._mem_state_inject = state
+
     def _compress_block(self, x_block, B, nb, nh, d, m):
         """V4 可学习门控池化：把块内 m 个 token 压成 1 个潜在（替代平均池化）。
         x_block: (B, T_ok, nh, d)，T_ok = nb*m。
@@ -554,7 +574,10 @@ class CausalSelfAttention(nn.Module):
             w = torch.cat([w, w.new_zeros(B, pad, *w.shape[2:])], dim=1)
         g = torch.log(r.clamp_min(1e-12))                        # (B,T,nh,l)，≤0
         tril = torch.tril(torch.ones(CHUNK, CHUNK, device=x.device, dtype=torch.bool))
-        A_in = torch.zeros(B, nh, l, l, device=x.device, dtype=torch.float32)
+        # 推理状态续传（dev-notes/46）：外部注入初始状态，None = 从零开始
+        inj = self._mem_state_inject
+        A_in = (inj.to(device=x.device, dtype=torch.float32) if inj is not None
+                else torch.zeros(B, nh, l, l, device=x.device, dtype=torch.float32))
         A_hist = []
         outs = []
         use_ckpt = getattr(self.config, 'kv_memory_checkpoint', False)
@@ -579,6 +602,7 @@ class CausalSelfAttention(nn.Module):
             self._cap_mem_r = r[:, :T].detach().cpu()   # 保留率 (B,T,nh,l)
             self._cap_mem_w = w[:, :T].detach().cpu()   # 写入门 (B,T,nh,1)
             self._cap_mem_A = A_hist                   # 每 chunk 后的联想状态快照
+        self._last_mem_state = A_in.detach().clone()   # 续传：联想状态末态
         return self.mem_up(o.reshape(B, T, nh * l)).to(x.dtype)
 
     def _kv_memory_forward_delta(self, q_m, k_m, v_m, r, w, persist, B, T, nh, l):
@@ -601,7 +625,10 @@ class CausalSelfAttention(nn.Module):
             v_m = torch.cat([v_m, v_m.new_zeros(B, pad, nh, l)], dim=1)
             r = torch.cat([r, r.new_ones(B, pad, nh, l)], dim=1)
             w = torch.cat([w, w.new_zeros(B, pad, *w.shape[2:])], dim=1)
-        S = torch.zeros(B, nh, l, l, device=q_m.device, dtype=torch.float32)
+        # 推理状态续传（dev-notes/46）：外部注入初始状态，None = 从零开始
+        inj = self._mem_state_inject
+        S = (inj.to(device=q_m.device, dtype=torch.float32) if inj is not None
+             else torch.zeros(B, nh, l, l, device=q_m.device, dtype=torch.float32))
         outs = []
         A_hist = []
         use_ckpt = getattr(self.config, 'kv_memory_checkpoint', False)
@@ -622,6 +649,7 @@ class CausalSelfAttention(nn.Module):
             self._cap_mem_r = r[:, :T].detach().cpu()
             self._cap_mem_w = w[:, :T].detach().cpu()
             self._cap_mem_A = A_hist
+        self._last_mem_state = S.detach().clone()   # 续传：联想状态末态
         return self.mem_up(o.reshape(B, T, nh * l)).to(q_m.dtype)
 
     @staticmethod
@@ -669,7 +697,10 @@ class CausalSelfAttention(nn.Module):
         r_b = r.view(B, Tb, C, nh, l).sum(dim=2) / cnt
         w_b = w.view(B, Tb, C, *w.shape[2:]).sum(dim=2) / cnt  # (B,Tb,nh,1) 或 (B,Tb,nh,l)
         expg_b = torch.exp(torch.log(r_b.clamp_min(1e-12)))     # (B,Tb,nh,l) 保留率，≤1
-        S = torch.zeros(B, nh, l, l, device=x.device, dtype=torch.float32)
+        # 推理状态续传（dev-notes/46）：外部注入初始状态，None = 从零开始
+        inj = self._mem_state_inject
+        S = (inj.to(device=x.device, dtype=torch.float32) if inj is not None
+             else torch.zeros(B, nh, l, l, device=x.device, dtype=torch.float32))
         A_hist = []
         outs = []
         for b in range(Tb):
@@ -688,6 +719,7 @@ class CausalSelfAttention(nn.Module):
             self._cap_mem_r = r[:, :T].detach().cpu()     # 保留率（逐 token）
             self._cap_mem_w = w[:, :T].detach().cpu()     # 写入门（逐 token）
             self._cap_mem_A = A_hist                      # 块级状态快照
+        self._last_mem_state = S.detach().clone()   # 续传：联想状态末态
         return self.mem_up(o.reshape(B, T, nh * l)).to(x.dtype)
 
     @staticmethod

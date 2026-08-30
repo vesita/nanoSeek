@@ -54,15 +54,24 @@ def ngram_rep(s: str, n: int = 3) -> float:
     return sum(1 for g in grams if c[g] > 1) / len(grams)
 
 
-def run_conversation(model, tok, scenario):
-    """跑 4 轮对话，返回每轮指标。"""
+def run_conversation(model, tok, scenario, window=None, no_resume=False):
+    """跑 4 轮对话，返回每轮指标。
+
+    window（dev-notes/46 推理状态选择性续传）：非 None 时输入只保留最近 window
+    token，记忆状态跨轮续传（长对话不随轮次增长）；no_resume 禁用续传（对照）。
+    """
     opening, followups = scenario
     ctx = opening
+    mem_state = None
     turns = []
     for t in range(N_TURNS):
         gen, eos_pos = generate_ids(model, tok, ctx, MAX_NEW_TOKENS, TEMPERATURE,
                                     TOP_K, REPEAT_PENALTY,
-                                    stop_on_turn=True, stop_on_eos=False)
+                                    stop_on_turn=True, stop_on_eos=False,
+                                    window=window, no_resume=no_resume,
+                                    resume_state=None if (no_resume or window is None) else mem_state)
+        if window is not None and not no_resume:
+            mem_state = model.get_memory_state()      # 跨轮续传：存本轮末态
         # generate_ids 返回 (完整 token 列表, eos_pos)；文本 = prompt 之后的部分
         prompt_ids = tok.encode(ctx).ids
         new_tok = gen[len(prompt_ids):]
@@ -88,6 +97,9 @@ def run_conversation(model, tok, scenario):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dirs", nargs="*", default=["out/obs_zh_base", "out/obs_zh_mem"])
+    ap.add_argument("--window", type=int, default=None,
+                    help="窗口+状态续传（dev-notes/46）：输入只保留最近 N token，记忆状态跨轮续传")
+    ap.add_argument("--no-resume", action="store_true", help="窗口模式下禁用状态续传（对照）")
     a = ap.parse_args()
 
     from tokenizers import Tokenizer
@@ -98,14 +110,16 @@ def main():
         if not (Path(d) / "best.pt").exists():
             print(f"⚠ 跳过（无 best.pt）: {d}")
             continue
-        model, _ = build_model_from_checkpoint(d)
+        rope_len = 8192 if a.window is not None else None
+        model, _ = build_model_from_checkpoint(d, rope_len=rope_len)
         model.eval()
-        print(f"\n===== {d} =====")
+        print(f"\n===== {d} (window={a.window}, resume={not a.no_resume}) =====")
         per_model = []
         for sname, opening, followups in SCENARIOS:
             torch.manual_seed(SEED)
             torch.cuda.manual_seed(SEED)
-            turns = run_conversation(model, tok, (opening, followups))
+            turns = run_conversation(model, tok, (opening, followups),
+                                     window=a.window, no_resume=a.no_resume)
             per_model.extend(turns)
             print(f"  [{sname}] 开场: {opening.strip()[:20]}…")
             for tt in turns:

@@ -25,11 +25,13 @@ from tokenizers import Tokenizer
 from model import GPTConfig, GPT
 
 
-def build_model_from_checkpoint(out_dir, device=None):
+def build_model_from_checkpoint(out_dir, device=None, rope_len=None):
     """复刻 train.py _build_model_from_checkpoint：按 checkpoint 的 model_args 建模型并加载权重。
 
     device=None → 自动选（CUDA 可用则 GPU，否则 CPU）。GPU 推理远快于 CPU（~5-10×），
     负载也远轻于训练（3M 参数单序列前向），默认开 GPU。
+    rope_len（dev-notes/46 窗口续传）：扩展 RoPE 表到指定长度（窗口截断推理需要
+    绝对位置偏移，表要覆盖整个对话；None = 保持训练长度）。buffer 加载后替换，不影响权重。
     """
     ckpt = torch.load(Path(out_dir) / "best.pt", map_location="cpu")
     args = dict(ckpt["model_args"])
@@ -43,6 +45,15 @@ def build_model_from_checkpoint(out_dir, device=None):
         if k.startswith("_orig_mod."):
             state[k[len("_orig_mod."):]] = state.pop(k)
     model.load_state_dict(state)
+    if rope_len is not None and conf.use_rope:
+        # 窗口续传：RoPE 表扩到 rope_len（绝对位置偏移需要；buffer 非权重，替换无碍）
+        from model.attention import CausalSelfAttention
+        from model.utils import precompute_rope_freqs
+        for m in model.modules():
+            if isinstance(m, CausalSelfAttention) and m.use_rope:
+                cos, sin = precompute_rope_freqs(m.rope_head_dim, rope_len, conf.rope_theta)
+                m.register_buffer("cos", cos)
+                m.register_buffer("sin", sin)
     model.eval()
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -72,13 +83,22 @@ def _truncate_at_turn(gen_ids, tok):
 
 @torch.no_grad()
 def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_penalty,
-                 stop_on_turn=False, stop_on_eos=False, clip_at_sentence=False):
+                 stop_on_turn=False, stop_on_eos=False, clip_at_sentence=False, window=None,
+                 no_resume=False, resume_state=None, token_callback=None):
     """生成并返回 (完整 token 列表, eos_pos)。
 
     与 generate() 逻辑完全一致，但返回 token 级结果：
     - 完整 token 列表（prompt + 生成，EOS 之前的所有 token）
     - eos_pos：模型自然吐出 <eos> 的生成区位置（-1 = 没吐）
     <eos> 解码为空串，字符串层检测不到，必须在 token 级看。
+
+    window（dev-notes/46 推理状态选择性续传）：非 None 时输入只保留最近 window
+    个 token（RoPE 用全局绝对位置偏移），窗口外信息由缓存的记忆状态承接——
+    上下文不随对话增长。window=None = 完整上下文（现行为）。
+    no_resume：window 模式下禁用状态续传（每步记忆从 0 递推）——对照实验用，
+    量化"续传"本身的价值。
+    resume_state：跨轮续传的外部记忆状态（None = 本轮从零开始）——多轮评估
+    时上一轮结束的状态注入本轮第一步。
     """
     idx = tok.encode(prompt).ids
     device = next(model.parameters()).device        # 与模型同设备（GPU 推理时 idx 也在 GPU）
@@ -87,9 +107,22 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
     seen = list(idx[0].tolist())
     eos_id = tok.token_to_id("<eos>")
     eos_pos = -1
+    mem_state = resume_state
     for step in range(max_new_tokens):
-        idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
-        logits, _ = model(idx_cond)
+        if window is not None:
+            win_len = min(idx.size(1), window)
+            idx_cond = idx[:, -win_len:]                       # 最近 window 个 token
+            rope_offset = idx.size(1) - win_len                # 窗口起点全局绝对位置
+        else:
+            idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
+            rope_offset = 0
+        if mem_state is not None and not no_resume:
+            model.set_memory_state(mem_state)                  # 续传：记忆从缓存状态继续
+        elif no_resume:
+            model.set_memory_state(None)                       # 对照：每步从 0 递推
+        logits, _ = model(idx_cond, rope_offset=rope_offset)
+        if not no_resume:
+            mem_state = model.get_memory_state()               # 更新状态缓存（末态）
         logits = logits[:, -1, :] / temperature
         v = logits.squeeze(0).clone()
         if repeat_penalty > 1.0:
@@ -104,6 +137,8 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
         probs = F.softmax(v, dim=-1)
         nxt = torch.multinomial(probs, 1)
         nxt_id = int(nxt.item())
+        if token_callback is not None:
+            token_callback(nxt_id)                 # 流式输出：每步回调（chat.py 打字机）
         if stop_on_eos and nxt_id == eos_id:
             eos_pos = step            # 模型自己说"完了"：记录并停（EOS 不进输出）
             break
@@ -144,10 +179,12 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
 
 @torch.no_grad()
 def generate(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_penalty,
-             stop_on_turn=False, stop_on_eos=False, clip_at_sentence=False):
+             stop_on_turn=False, stop_on_eos=False, clip_at_sentence=False, window=None,
+             no_resume=False):
     """生成（返回 prompt + 生成全文，保持旧接口）。轴钮语义见 generate_ids。"""
     ids, _ = generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k,
-                          repeat_penalty, stop_on_turn, stop_on_eos, clip_at_sentence)
+                          repeat_penalty, stop_on_turn, stop_on_eos, clip_at_sentence,
+                          window=window, no_resume=no_resume)
     return tok.decode(ids)
 
 
@@ -167,16 +204,22 @@ def main():
                     help="预算用尽时回退到最后一个句号/问号/叹号处，不留半句")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--device", default=None, help="cuda/cpu；默认自动（有 GPU 用 GPU）")
+    ap.add_argument("--no-resume", action="store_true", help="window 模式下禁用状态续传（对照实验）")
+    ap.add_argument("--window", type=int, default=None,
+                    help="推理状态选择性续传（dev-notes/46）：输入只保留最近 N token，"
+                         "窗口外信息由缓存记忆状态承接；None = 完整上下文")
     a = ap.parse_args()
 
     torch.manual_seed(a.seed)
-    model, ckpt = build_model_from_checkpoint(a.out_dir, a.device)
+    rope_len = 8192 if a.window is not None else None   # 窗口续传需 RoPE 表覆盖绝对位置
+    model, ckpt = build_model_from_checkpoint(a.out_dir, a.device, rope_len=rope_len)
     tok = Tokenizer.from_file("data/chinese/tokenizer.json")
     n = sum(p.numel() for p in model.parameters())
     print(f"[{a.out_dir}] {n:,} 参数 | no_attn_layers={ckpt['model_args'].get('no_attn_layers')} | block_order={ckpt['model_args'].get('block_order')}")
 
     out = generate(model, tok, a.prompt, a.max_new_tokens, a.temperature, a.top_k,
-                   a.repeat_penalty, a.stop_on_turn, a.stop_on_eos, a.clip_sentence)
+                   a.repeat_penalty, a.stop_on_turn, a.stop_on_eos, a.clip_sentence,
+                   window=a.window, no_resume=a.no_resume)
     # 打印 prompt + 生成全文
     print("--- 生成 ---")
     print(a.prompt + out[len(a.prompt):] if out.startswith(a.prompt) else out)

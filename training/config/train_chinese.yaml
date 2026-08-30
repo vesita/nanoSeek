@@ -46,6 +46,7 @@ csa_compress: 16    # 每 16 个 token 压成一个潜在 KV
 csa_topk: 4         # 每个 query 稀疏选 4 个压缩块
 csa_window: 64      # 滑窗保留最近 64 个原始 token
 use_hca: true       # 加 HCA 重度压缩全局信号
+use_kv_memory: true # KV 记忆注意力（P1）替换 HCA 槽位——记忆 = 项目基线（dev-notes/42），默认开启
 use_csa_learnable: true   # 可学习门控池化替代平均池化
 
 # --- MTP 多 token 预测（V3/V4 验证过，训练信号增强，推理零开销）---

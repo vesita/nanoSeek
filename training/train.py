@@ -118,14 +118,15 @@ use_hca = False        # HCA 重度压缩全局信号
 use_csa_learnable = True   # V4：可学习门控池化替代平均池化
 use_csa_fused_qkv = True   # CSA 计算优化：Q/K/V 三合一（权重布局变，仅新训练；A/B 2 胜出→默认）
 use_csa_bmm = False        # CSA 计算优化：einsum → 显式批量 matmul（逐位等价；A/B 3 更慢→保持关）
-use_kv_memory = False      # KV 记忆注意力（P1：GLA 式可学习遗忘/写入状态，替换 HCA 槽位）
-kv_memory_latent = 16      # 记忆 latent 维 l（观测台：K 秩~8/V 秩~5 → 16 够用）
+use_kv_memory = True  # KV 记忆注意力（P1：GLA 式可学习遗忘/写入状态，替换 HCA 槽位）。
+# 记忆 = 项目基线（dev-notes/42 决策）→ 默认开启；无记忆对照实验显式 --use_kv_memory=false
+kv_memory_latent = 16      # 记忆 latent 维 l（观测台：K 秩~8/V 秩~5 → 16 够用；1500 步验证 16 > 8）
 kv_memory_chunk = 32       # chunk 并行块大小（dev-notes/42-A：C=32 无 checkpoint 实测 1.36 it/s > C=64+checkpoint 1.27，且显存安全）
 kv_memory_checkpoint = False   # 梯度检查点：backward 重算块内 D，省内存数学等价（dev-notes/39-#4）
-kv_memory_complement_gate = False  # 互补门：写入门 β=1−r（忘记多少写入多少，删独立 mem_write）
-kv_memory_layers = None            # B组：启用记忆的最后 n 层（None=全部层；观测台：底层记忆利用率低）
-kv_memory_block = 1                # C组：块级记忆块大小（token 数）。1=逐 token（现行为）；>1 状态每块更新一次（dev-notes/44）
-kv_memory_delta = False               # P2：Delta 擦写律，先擦后写消除键冲突混叠（dev-notes/45）
+kv_memory_complement_gate = False  # 互补门：写入门 β=1−r（忘记多少写入多少，删独立 mem_write；270 步持平双门未定论）
+kv_memory_layers = None            # B组：启用记忆的最后 n 层（None=全部层；300 步 A/B 否定分层）
+kv_memory_block = 1                # C组：块级记忆块大小（token 数）。1=逐 token（现行为）；300 步 A/B 否定块级（dev-notes/44）
+kv_memory_delta = False               # P2：Delta 擦写律，先擦后写消除键冲突混叠（dev-notes/45；持平但 3× 慢弃用）
 # --- V4 结构设计升级（实验性，默认全关）---
 use_attn_sink = True         # Attention Sinks：打破重复坍缩的必要条件（三重 A/B 验证）
 use_mhc = False              # mHC 超连接：4 流并行残差
@@ -161,7 +162,7 @@ backend = 'nccl' # 'nccl'、'gloo' 等
 # 系统
 device = 'cuda' # 示例：'cpu'、'cuda'、'cuda:0'、'cuda:1' 等，或在 macbook 上试试 'mps'
 dtype = ('bfloat16' if torch.cuda.is_bf16_supported() else 'float16') if torch.cuda.is_available() else 'float32' # 'float32'、'bfloat16' 或 'float16'，后者会自动实现 GradScaler；纯 CPU 默认 float32（避免 float16+GradScaler 报错）
-compile = False # 默认关（dev-notes/42-A：RDNA2 小模型实测 compile 无收益还费 1.5 分钟编译；需要时 --compile=true）
+compile = True # 默认开（dev-notes/42-A 曾用 3 步短测误判"无收益"改为关；实测 20 步：开 1.29 it/s vs 关 ~1.0 it/s，快 ~25%——1.5 分钟编译开销在长训练摊薄后净赚）
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 load_config(globals()) # 从 YAML 配置文件或命令行覆盖
