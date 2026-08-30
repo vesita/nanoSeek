@@ -123,6 +123,9 @@ kv_memory_latent = 16      # 记忆 latent 维 l（观测台：K 秩~8/V 秩~5 �
 kv_memory_chunk = 32       # chunk 并行块大小（dev-notes/42-A：C=32 无 checkpoint 实测 1.36 it/s > C=64+checkpoint 1.27，且显存安全）
 kv_memory_checkpoint = False   # 梯度检查点：backward 重算块内 D，省内存数学等价（dev-notes/39-#4）
 kv_memory_complement_gate = False  # 互补门：写入门 β=1−r（忘记多少写入多少，删独立 mem_write）
+kv_memory_layers = None            # B组：启用记忆的最后 n 层（None=全部层；观测台：底层记忆利用率低）
+kv_memory_block = 1                # C组：块级记忆块大小（token 数）。1=逐 token（现行为）；>1 状态每块更新一次（dev-notes/44）
+kv_memory_delta = False               # P2：Delta 擦写律，先擦后写消除键冲突混叠（dev-notes/45）
 # --- V4 结构设计升级（实验性，默认全关）---
 use_attn_sink = True         # Attention Sinks：打破重复坍缩的必要条件（三重 A/B 验证）
 use_mhc = False              # mHC 超连接：4 流并行残差
@@ -275,7 +278,8 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   csa_window=csa_window, use_hca=use_hca, use_csa_learnable=use_csa_learnable,
                   use_kv_memory=use_kv_memory, kv_memory_latent=kv_memory_latent,
                   kv_memory_chunk=kv_memory_chunk, kv_memory_checkpoint=kv_memory_checkpoint,
-                  kv_memory_complement_gate=kv_memory_complement_gate,
+                  kv_memory_complement_gate=kv_memory_complement_gate, kv_memory_layers=kv_memory_layers,
+                  kv_memory_block=kv_memory_block, kv_memory_delta=kv_memory_delta,
                   use_csa_fused_qkv=use_csa_fused_qkv, use_csa_bmm=use_csa_bmm,
                   use_attn_sink=use_attn_sink, use_mhc=use_mhc, hc_mult=hc_mult,
                   use_lightning_indexer=use_lightning_indexer, num_hash_layers=num_hash_layers,
@@ -303,7 +307,7 @@ def _build_model_from_checkpoint(checkpoint):
               'use_csa', 'csa_compress', 'csa_topk', 'csa_window',
               'use_hca', 'use_csa_learnable', 'use_csa_fused_qkv', 'use_csa_bmm',
               'use_kv_memory', 'kv_memory_latent', 'kv_memory_chunk', 'kv_memory_checkpoint',
-              'kv_memory_complement_gate',
+              'kv_memory_complement_gate', 'kv_memory_layers', 'kv_memory_block', 'kv_memory_delta',
               'use_attn_sink', 'use_mhc', 'hc_mult',
               'use_lightning_indexer', 'num_hash_layers', 'block_order', 'no_attn_layers',
               'n_memory_tokens', 'use_lse_residual', 'use_lse_gate',

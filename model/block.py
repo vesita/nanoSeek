@@ -29,7 +29,7 @@ class Block(nn.Module):
         # CausalSelfAttention 57,604，仅差 attn_sink 的 4 参数/层）→ 规模严格补回基线，
         # 只剩"无注意力"这一个拓扑变量，且所有参数真正参与训练（无冻结废参数）。
         # 布线从 A F 变 F F（FFN 变换 ×2）。
-        self.attn = SwiGLU(config, hidden_scale=3) if self.skip_attn else CausalSelfAttention(config)
+        self.attn = SwiGLU(config, hidden_scale=3) if self.skip_attn else CausalSelfAttention(config, layer_idx=layer_idx)
         # 固定架构：RMSNorm + 残差；FFN 用 MoE（可选）或 SwiGLU
         self.ln_1 = RMSNorm(config.n_embd)
         self.ln_2 = RMSNorm(config.n_embd)

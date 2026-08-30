@@ -64,7 +64,9 @@ def load_config(g):
         for k, v in data.items():
             if k in g:
                 # 类型必须一致，避免 yaml 里的 '2' 把 int 全局变量悄悄变成 str 之类的问题
-                if type(v) is not type(g[k]):
+                # 例外：train.py 默认值是 None（如 kv_memory_layers，Optional 参数）时跳过，
+                # 允许 yaml/命令行用任意类型覆盖（None = 未设置）。
+                if type(v) is not type(g[k]) and g[k] is not None:
                     raise TypeError(
                         f"配置键 '{k}': yaml 里是 {type(v).__name__} = {v!r}, "
                         f"但 train.py 期望 {type(g[k]).__name__}"
@@ -92,7 +94,7 @@ def load_config(g):
                 except (SyntaxError, ValueError):
                     # 解析不了就当成字符串
                     attempt = val
-            if type(attempt) is not type(g[key]):
+            if type(attempt) is not type(g[key]) and g[key] is not None:
                 raise TypeError(
                     f"命令行覆盖 '{key}={val}' 类型是 {type(attempt).__name__}, "
                     f"但期望 {type(g[key]).__name__}"

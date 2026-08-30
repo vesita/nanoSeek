@@ -9,9 +9,10 @@ from .utils import RMSNorm, precompute_rope_freqs, apply_rotary_pos_emb
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx=0):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
         assert config.n_embd % config.n_head == 0
         # 所有 head 的 key、query、value 投影，但放在同一个 batch 里计算
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -61,7 +62,13 @@ class CausalSelfAttention(nn.Module):
                 self.idx_q = nn.Linear(config.n_embd, config.n_head, bias=False)  # (n_embd→nh)
                 self.idx_k = nn.Linear(self.head_dim, 1, bias=False)              # 块→标量分
                 nn.init.zeros_(self.idx_k.weight)  # 起步打分≈0，中性选块
-        if config.use_kv_memory:
+        # B 组（dev-notes/43）：kv_memory_layers 限制记忆只开最后 n 层（top-n）。
+        # 依据：观测台高层读写比 0.41-0.48 vs 底层 0.25-0.27 → 底层记忆利用率低。
+        # 非记忆层回退 HCA 全局摘要路径（与 use_kv_memory=False 行为一致）。
+        kv_layers = getattr(config, 'kv_memory_layers', None)
+        self.kv_memory_enabled = config.use_kv_memory and (
+            kv_layers is None or layer_idx >= config.n_layer - kv_layers)
+        if self.kv_memory_enabled:
             assert config.use_csa, "KV 记忆注意力（P1）要求 use_csa=True（替换 HCA 槽位）"
             l = config.kv_memory_latent
             # 每头 latent 投影：q/k/v 各 nh·l 维（拼一个 Linear 一次算完）
@@ -448,7 +455,7 @@ class CausalSelfAttention(nn.Module):
         # HCA = 把所有允许的压缩块平均成一个全局潜在（"全文一句话摘要"）。
         # KV 记忆 = 每头一个可写状态矩阵，网络自行决定写入/遗忘，query 主动检索。
         # 观测台（dev-notes/33）：HCA 是三条路径里贡献最弱的 → 记忆的天然槽位。
-        if self.config.use_kv_memory:
+        if self.kv_memory_enabled:
             pass  # 记忆输出跨头，在合并 head 之后进残差（见函数尾部）
         elif self.config.use_hca and nb > 0:
             # 只用真实块：sink 模式下 v_blocks 末尾多了一个占位零块，切掉它
@@ -475,7 +482,7 @@ class CausalSelfAttention(nn.Module):
             # 观测台：记录合并前的多头输出（B,T,nh,d）
             self._cap_y_heads = y.detach()
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        if self.config.use_kv_memory:
+        if self.kv_memory_enabled:
             # KV 记忆输出是跨头的（nh·l → C），在合并后加入残差
             mem_out = self._kv_memory_forward(x)
             y = y + mem_out
@@ -527,6 +534,15 @@ class CausalSelfAttention(nn.Module):
         else:
             w = torch.sigmoid(self.mem_write(x).float().view(B, T, nh, 1))
         persist = self.mem_persist.float().unsqueeze(0)          # (1,nh,l,l)
+        # C 组块级分支（dev-notes/44）：kv_memory_block>1 时状态每块更新一次，
+        # 块内 k/v/r/w 均值池化，读取仍逐 token。块内局部信息由 CSA 滑窗兜底。
+        if getattr(self.config, 'kv_memory_block', 1) > 1:
+            assert not getattr(self.config, 'kv_memory_delta', False), \
+                "kv_memory_block 与 kv_memory_delta 互斥（块级用均值摘要，Delta 用逐 token 擦写）"
+            return self._kv_memory_forward_block(x, q_m, k_m, v_m, r, w, persist, B, T, nh, l)
+        # P2 Delta 擦写分支（dev-notes/45）：先擦后写消除键冲突混叠
+        if getattr(self.config, 'kv_memory_delta', False):
+            return self._kv_memory_forward_delta(q_m, k_m, v_m, r, w, persist, B, T, nh, l)
         # 补齐 T 到 CHUNK 整数倍：空位保留率=1、写入门=0（不产生任何写入）
         Tpad = ((T + CHUNK - 1) // CHUNK) * CHUNK
         if Tpad > T:
@@ -563,6 +579,115 @@ class CausalSelfAttention(nn.Module):
             self._cap_mem_r = r[:, :T].detach().cpu()   # 保留率 (B,T,nh,l)
             self._cap_mem_w = w[:, :T].detach().cpu()   # 写入门 (B,T,nh,1)
             self._cap_mem_A = A_hist                   # 每 chunk 后的联想状态快照
+        return self.mem_up(o.reshape(B, T, nh * l)).to(x.dtype)
+
+    def _kv_memory_forward_delta(self, q_m, k_m, v_m, r, w, persist, B, T, nh, l):
+        """P2 Delta 擦写（dev-notes/45）：S_t = r⊙S_{t-1} + w_t(v_t − S_{t-1}·k_t)k_tᵀ。
+
+        先擦后写：写入前用当前键检索已存值 u = S·k，从 v 中减去再写 →
+        新状态对键 k 的检索精确逼近 v，消除叠加式写入的键冲突混叠（记忆精度→接话相关性）。
+        写后读（o_t 含自身写入，与 P1 同语义）；块内顺序递推 + 梯度检查点
+        （块边界存 S，backward 重算块内，避免保存每步 S 的 1.5GB）。
+        """
+        CHUNK = getattr(self.config, 'kv_memory_chunk', 64)
+        # 数值稳定（DeltaNet 标准做法）：键单位化 → 擦写外积 (v−u)k̂ᵀ 范数 ≤ |v−u|，
+        # 避免 S·k 与 k 范数正反馈爆炸（30 步训练后 NaN 根因）。
+        k_m = F.normalize(k_m, dim=-1)
+        Tpad = ((T + CHUNK - 1) // CHUNK) * CHUNK
+        if Tpad > T:
+            pad = Tpad - T
+            q_m = torch.cat([q_m, q_m.new_zeros(B, pad, nh, l)], dim=1)
+            k_m = torch.cat([k_m, k_m.new_zeros(B, pad, nh, l)], dim=1)
+            v_m = torch.cat([v_m, v_m.new_zeros(B, pad, nh, l)], dim=1)
+            r = torch.cat([r, r.new_ones(B, pad, nh, l)], dim=1)
+            w = torch.cat([w, w.new_zeros(B, pad, *w.shape[2:])], dim=1)
+        S = torch.zeros(B, nh, l, l, device=q_m.device, dtype=torch.float32)
+        outs = []
+        A_hist = []
+        use_ckpt = getattr(self.config, 'kv_memory_checkpoint', False)
+        for s in range(0, Tpad, CHUNK):
+            qc = q_m[:, s:s + CHUNK]; kc = k_m[:, s:s + CHUNK]; vc = v_m[:, s:s + CHUNK]
+            rc = r[:, s:s + CHUNK]; wc = w[:, s:s + CHUNK]
+            if use_ckpt:
+                o_c, S = torch.utils.checkpoint.checkpoint(
+                    self._mem_delta_chunk, S, qc, kc, vc, rc, wc, persist,
+                    use_reentrant=False)
+            else:
+                o_c, S = self._mem_delta_chunk(S, qc, kc, vc, rc, wc, persist)
+            outs.append(o_c)
+            if self.capture:
+                A_hist.append(S.detach().cpu().clone())
+        o = torch.cat(outs, dim=1)[:, :T]                             # (B,T,nh,l)
+        if self.capture:
+            self._cap_mem_r = r[:, :T].detach().cpu()
+            self._cap_mem_w = w[:, :T].detach().cpu()
+            self._cap_mem_A = A_hist
+        return self.mem_up(o.reshape(B, T, nh * l)).to(q_m.dtype)
+
+    @staticmethod
+    def _mem_delta_chunk(S_in, qc, kc, vc, rc, wc, persist):
+        """Delta 擦写块内顺序递推（C 步）：检索 → 擦写 → 写后读。返回 (o_c, S_out)。"""
+        B, C, nh, l = qc.shape
+        S = S_in
+        o_list = []
+        for t in range(C):
+            k_t = kc[:, t]; v_t = vc[:, t]             # (B,nh,l)
+            r_t = rc[:, t]                             # (B,nh,l) 逐通道保留率
+            u = torch.einsum('bhlm,bhm->bhl', S, k_t)  # 检索：当前键下已存值
+            wv = wc[:, t] * (v_t - u)                  # 擦写残差（w 每头标量或逐通道）
+            delta = torch.einsum('bhm,bhn->bhmn', wv, k_t)   # 外积 (B,nh,l,l)
+            S = r_t.unsqueeze(-1) * S + delta          # 行缩放（输出通道逐通道衰减）
+            o_t = torch.einsum('bhlm,bhm->bhl', S + persist, qc[:, t])  # 写后读
+            o_list.append(o_t)
+        return torch.stack(o_list, dim=1), S           # (B,C,nh,l), (B,nh,l,l)
+
+    def _kv_memory_forward_block(self, x, q_m, k_m, v_m, r, w, persist, B, T, nh, l):
+        """C 组（dev-notes/44）：块级写入 + 逐 token 读取（P1 chunk 公式的块级化）。
+
+        块 b 摘要 = 块内 k/v/r/w 均值（投影后池化，pad 空位用有效计数）；
+        块级衰减 Ĝ = cumsum(log r̂)，状态 S_{b+1} = exp(ĝ_b) ⊙ S_b + ŵ_b k̂_b v̂_bᵀ；
+        读取（逐 token）：o_t = exp(ĝ_b) ⊙ (S_b·q_t) + persist·q_t，
+        读块**开始**状态、本块摘要延迟（b'<b 因果，无未来泄漏）；
+        块内局部信息由 CSA 滑窗（w=64 ≥ 块大小）兜底。
+        r̂ 在读取的衰减因子里参与 → 全参数有梯度（v1 读前写 bug：r 梯度全断）。
+        Tb 很小（C=16 → 16 块）顺序循环即可；S 递推保持 fp32。
+        """
+        C = getattr(self.config, 'kv_memory_block', 1)
+        Tpad = ((T + C - 1) // C) * C
+        if Tpad > T:
+            pad = Tpad - T
+            k_m = torch.cat([k_m, k_m.new_zeros(B, pad, nh, l)], dim=1)
+            v_m = torch.cat([v_m, v_m.new_zeros(B, pad, nh, l)], dim=1)
+            r = torch.cat([r, r.new_ones(B, pad, nh, l)], dim=1)
+            w = torch.cat([w, w.new_zeros(B, pad, *w.shape[2:])], dim=1)
+        Tb = Tpad // C
+        counts = torch.full((Tb,), C, dtype=torch.float32, device=x.device)
+        counts[-1] = T - (Tb - 1) * C                     # 末块有效 token 数
+        cnt = counts.view(1, Tb, 1, 1)
+        k_b = k_m.view(B, Tb, C, nh, l).sum(dim=2) / cnt  # (B,Tb,nh,l)
+        v_b = v_m.view(B, Tb, C, nh, l).sum(dim=2) / cnt
+        r_b = r.view(B, Tb, C, nh, l).sum(dim=2) / cnt
+        w_b = w.view(B, Tb, C, *w.shape[2:]).sum(dim=2) / cnt  # (B,Tb,nh,1) 或 (B,Tb,nh,l)
+        expg_b = torch.exp(torch.log(r_b.clamp_min(1e-12)))     # (B,Tb,nh,l) 保留率，≤1
+        S = torch.zeros(B, nh, l, l, device=x.device, dtype=torch.float32)
+        A_hist = []
+        outs = []
+        for b in range(Tb):
+            qc = q_m[:, b * C:(b + 1) * C]                # (B,Cb,nh,l)
+            read = torch.einsum('bhlm,bthm->bthl', S, qc)  # (B,Cb,nh,l)
+            o = expg_b[:, b].view(B, 1, nh, l) * read + \
+                torch.einsum('bhlm,bthm->bthl', persist, qc)
+            outs.append(o)
+            if self.capture:
+                A_hist.append(S.detach().cpu().clone())   # 块开始状态快照
+            # S ← exp(ĝ_b) ⊙ S + ŵ_b ⊙ k̂_b v̂_bᵀ（行缩放 + 新写入）
+            S = expg_b[:, b].unsqueeze(-1) * S + w_b[:, b].view(B, nh, -1, 1) * \
+                torch.einsum('bhm,bhn->bhmn', k_b[:, b], v_b[:, b])
+        o = torch.cat(outs, dim=1)[:, :T]                 # (B,T,nh,l)
+        if self.capture:
+            self._cap_mem_r = r[:, :T].detach().cpu()     # 保留率（逐 token）
+            self._cap_mem_w = w[:, :T].detach().cpu()     # 写入门（逐 token）
+            self._cap_mem_A = A_hist                      # 块级状态快照
         return self.mem_up(o.reshape(B, T, nh * l)).to(x.dtype)
 
     @staticmethod
