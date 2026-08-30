@@ -10,7 +10,7 @@
 # 旧模型（lm/eos/ab1/ab2/ab3）加载需显式 --use_csa_fused_qkv=false。
 # 重训会用 out_dir/old 保护机制归档旧实验。
 out_dir: out/chinese-reb
-eval_interval: 250
+eval_interval: 300   # dev-notes/42-A：150→300 省 ~7% 训练时间（eval 频率减半，趋势仍清楚）
 eval_iters: 100
 log_interval: 10
 always_save_checkpoint: false

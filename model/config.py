@@ -69,6 +69,7 @@ class GPTConfig:
     kv_memory_latent: int = 16      # 记忆 latent 维 l（状态矩阵 l×l，每头）
     kv_memory_chunk: int = 64       # chunk 并行块大小（显存：D 矩阵总量 = B·T·C·nh·l，C=64@batch64 会 OOM → 训大模型时降 32/16）
     kv_memory_checkpoint: bool = False  # 梯度检查点：backward 重算块内 D（省逐 chunk 保存，数学等价，C=64 可恢复）
+    kv_memory_complement_gate: bool = False  # 互补门：写入门 β=1−r（忘记多少写入多少，删独立 mem_write）
     # --- V4 结构设计升级（实验性，默认全关）---
     # Attention Sinks：每头一个可学习标量偏置，作为 softmax 的"垃圾桶"吸收无关注意力。
     use_attn_sink: bool = False

@@ -66,15 +66,20 @@ class CausalSelfAttention(nn.Module):
             l = config.kv_memory_latent
             # 每头 latent 投影：q/k/v 各 nh·l 维（拼一个 Linear 一次算完）
             self.mem_qkv = nn.Linear(config.n_embd, 3 * config.n_head * l, bias=False)
-            # 遗忘门 logits（逐通道 nh·l）+ 写入门 logits（每头 1 个）——网络自行决定淘汰
+            # 遗忘门 logits（逐通道 nh·l）——网络自行决定淘汰
             self.mem_forget = nn.Linear(config.n_embd, config.n_head * l, bias=True)
-            self.mem_write = nn.Linear(config.n_embd, config.n_head, bias=True)
+            # 互补门（dev-notes/39-#3）：写入门 β = 1 − r（忘记多少就写入多少），
+            # 删独立 mem_write 网络（省参 + 信息守恒：空出的黑板位置被新信息填上）。
+            self.use_complement_gate = getattr(config, 'kv_memory_complement_gate', False)
+            if not self.use_complement_gate:
+                # 双门版：独立写入门 logits（每头 1 个）
+                self.mem_write = nn.Linear(config.n_embd, config.n_head, bias=True)
+                nn.init.constant_(self.mem_write.bias, math.log(0.1 / 0.9))
             # 持久记忆：学习到的静态"工作台"（不递推、不衰减）；联想部分从零开始被写入
             self.mem_persist = nn.Parameter(torch.zeros(config.n_head, l, l))
             self.mem_up = nn.Linear(config.n_head * l, config.n_embd, bias=False)
             # 初始门控保守：遗忘率≈0.1（保留 0.9）、写入≈0.1（先少写，不扰动基线行为）
             nn.init.constant_(self.mem_forget.bias, math.log(0.1 / 0.9))
-            nn.init.constant_(self.mem_write.bias, math.log(0.1 / 0.9))
         if config.use_mla:
             assert config.qk_rope_head_dim % 2 == 0 and config.qk_rope_head_dim <= self.head_dim, \
                 "qk_rope_head_dim 需为偶数且不超过 head_dim"
@@ -516,7 +521,11 @@ class CausalSelfAttention(nn.Module):
         qkv = self.mem_qkv(x).float().view(B, T, nh, 3, l)
         q_m, k_m, v_m = qkv.unbind(dim=3)                        # (B,T,nh,l)
         r = 1.0 - torch.sigmoid(self.mem_forget(x).float().view(B, T, nh, l))
-        w = torch.sigmoid(self.mem_write(x).float().view(B, T, nh, 1))
+        if self.use_complement_gate:
+            # 互补门：写入门 = 遗忘率（逐通道，忘记多少写入多少）
+            w = (1.0 - r)                                     # (B,T,nh,l)，逐通道写入门
+        else:
+            w = torch.sigmoid(self.mem_write(x).float().view(B, T, nh, 1))
         persist = self.mem_persist.float().unsqueeze(0)          # (1,nh,l,l)
         # 补齐 T 到 CHUNK 整数倍：空位保留率=1、写入门=0（不产生任何写入）
         Tpad = ((T + CHUNK - 1) // CHUNK) * CHUNK
@@ -526,7 +535,7 @@ class CausalSelfAttention(nn.Module):
             k_m = torch.cat([k_m, k_m.new_zeros(B, pad, nh, l)], dim=1)
             v_m = torch.cat([v_m, v_m.new_zeros(B, pad, nh, l)], dim=1)
             r = torch.cat([r, r.new_ones(B, pad, nh, l)], dim=1)
-            w = torch.cat([w, w.new_zeros(B, pad, nh, 1)], dim=1)
+            w = torch.cat([w, w.new_zeros(B, pad, *w.shape[2:])], dim=1)
         g = torch.log(r.clamp_min(1e-12))                        # (B,T,nh,l)，≤0
         tril = torch.tril(torch.ones(CHUNK, CHUNK, device=x.device, dtype=torch.bool))
         A_in = torch.zeros(B, nh, l, l, device=x.device, dtype=torch.float32)

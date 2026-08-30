@@ -25,11 +25,18 @@ from tokenizers import Tokenizer
 from model import GPTConfig, GPT
 
 
-def build_model_from_checkpoint(out_dir):
-    """复刻 train.py _build_model_from_checkpoint：按 checkpoint 的 model_args 建模型并加载权重。"""
+def build_model_from_checkpoint(out_dir, device=None):
+    """复刻 train.py _build_model_from_checkpoint：按 checkpoint 的 model_args 建模型并加载权重。
+
+    device=None → 自动选（CUDA 可用则 GPU，否则 CPU）。GPU 推理远快于 CPU（~5-10×），
+    负载也远轻于训练（3M 参数单序列前向），默认开 GPU。
+    """
     ckpt = torch.load(Path(out_dir) / "best.pt", map_location="cpu")
     args = dict(ckpt["model_args"])
     conf = GPTConfig(**args)
+    # 推理无反向传播：梯度检查点纯浪费（profile：每步 414 次 checkpoint 调用）
+    if getattr(conf, "kv_memory_checkpoint", False):
+        conf.kv_memory_checkpoint = False
     model = GPT(conf)
     state = ckpt["model"]
     for k in list(state.keys()):  # 修 torch.compile 的 _orig_mod. 前缀
@@ -37,6 +44,10 @@ def build_model_from_checkpoint(out_dir):
             state[k[len("_orig_mod."):]] = state.pop(k)
     model.load_state_dict(state)
     model.eval()
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device.startswith("cuda"):
+        model = model.to(device)
     return model, ckpt
 
 
@@ -70,7 +81,8 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
     <eos> 解码为空串，字符串层检测不到，必须在 token 级看。
     """
     idx = tok.encode(prompt).ids
-    idx = torch.tensor([idx], dtype=torch.long)
+    device = next(model.parameters()).device        # 与模型同设备（GPU 推理时 idx 也在 GPU）
+    idx = torch.tensor([idx], dtype=torch.long, device=device)
     new_start = idx.shape[1]
     seen = list(idx[0].tolist())
     eos_id = tok.token_to_id("<eos>")
@@ -81,9 +93,10 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
         logits = logits[:, -1, :] / temperature
         v = logits.squeeze(0).clone()
         if repeat_penalty > 1.0:
-            for t in seen:
-                l = v[t]
-                v[t] = l / repeat_penalty if l >= 0 else l * repeat_penalty
+            # 向量化（原 O(T²) python 循环：每步遍历全部已见 token）
+            seen_t = torch.as_tensor(seen, dtype=torch.long, device=v.device)
+            vs = v[seen_t]
+            v[seen_t] = torch.where(vs >= 0, vs / repeat_penalty, vs * repeat_penalty)
         if top_k is not None:
             k = min(top_k, v.size(-1))
             topv, _ = torch.topk(v, k)
@@ -98,13 +111,16 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
         idx = torch.cat((idx, nxt.unsqueeze(0)), dim=1)
         if stop_on_turn:
             gen_ids = idx[0][new_start:].tolist()
-            truncated, hit = _truncate_at_turn(gen_ids, tok)
-            if hit:
-                keep = torch.tensor([truncated], dtype=torch.long)
-                idx = torch.cat([idx[:, :new_start], keep], dim=1)
-                if eos_pos == -1:
-                    eos_pos = step + 1    # 轮次截断 = 模型自然收尾的中止点
-                break
+            # 每步全量 decode 是 O(T²)：只在末尾 16-token 窗口里找轮次标记（marker ≤4 字符≈2-4 token），
+            # 命中才全量截断。窗口内漏检最多晚几步截断，不影响截断语义。
+            if any(m in tok.decode(gen_ids[-16:]) for m in ("\n用户：", "\n模型：", "\nUser:", "\nModel:")):
+                truncated, hit = _truncate_at_turn(gen_ids, tok)
+                if hit:
+                    keep = torch.tensor([truncated], dtype=torch.long, device=idx.device)
+                    idx = torch.cat([idx[:, :new_start], keep], dim=1)
+                    if eos_pos == -1:
+                        eos_pos = step + 1    # 轮次截断 = 模型自然收尾的中止点
+                    break
     gen = idx[0].tolist()
     if clip_at_sentence:
         gen_ids = gen[new_start:]
@@ -150,10 +166,11 @@ def main():
     ap.add_argument("--clip-sentence", action="store_true",
                     help="预算用尽时回退到最后一个句号/问号/叹号处，不留半句")
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--device", default=None, help="cuda/cpu；默认自动（有 GPU 用 GPU）")
     a = ap.parse_args()
 
     torch.manual_seed(a.seed)
-    model, ckpt = build_model_from_checkpoint(a.out_dir)
+    model, ckpt = build_model_from_checkpoint(a.out_dir, a.device)
     tok = Tokenizer.from_file("data/chinese/tokenizer.json")
     n = sum(p.numel() for p in model.parameters())
     print(f"[{a.out_dir}] {n:,} 参数 | no_attn_layers={ckpt['model_args'].get('no_attn_layers')} | block_order={ckpt['model_args'].get('block_order')}")
