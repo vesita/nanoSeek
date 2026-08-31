@@ -1,7 +1,7 @@
 # 主题 D · 工程与工具踩坑
 
-> 吸收笔记：[01](01-重训后要重新部署.md) [02](02-生成循环要加EOS停止.md) [03](03-prompt格式要和训练数据一致.md)
-> [08](08-续训要同步调lr_decay.md) [09](09-matplotlib中文字体.md) [10](10-torch-compile良性警告.md) [15](15-Windows交叉编译用gnu不用msvc.md)
+> 吸收笔记（编号笔记已精简，完整版见 git 历史：`git show <旧commit>:dev-notes/xx-*.md`）：
+> 01 02 03 08 09 10 15
 
 ## 部署链路
 
@@ -25,7 +25,7 @@
 
 6. **matplotlib 中文三件套**（09）：① `font_manager.findfont` 找 CJK 字体（Noto Sans CJK SC 等，找不到
    try/except 回退）② 设 `plt.rcParams['font.family']` ③ `axes.unicode_minus=False`。验证：把 UserWarning
-   当错误抛，有 glyph 警告即失败。`training/compare_ab.py` / `train.py` 的画图函数已内置这套。
+   当错误抛，有 glyph 警告即失败。`training/train.py` 的画图函数已内置这套。
 7. **torch.compile 的 inductor 良性警告**（10）：RTX 5060 只有 30 SM（<68），`max_autotune_gemm` 用不了，
    打印后退回默认 matmul —— 纯良性。这是 logging 不是 warnings，用自定义 `logging.Filter` 定向静音
    （`train.py` 已内置），别把整个 logger 调 ERROR。
