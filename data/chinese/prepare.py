@@ -93,12 +93,29 @@ def insert_eos_after_replies(block: str) -> str:
 
 
 def encode_to_bin(text, tokenizer, out_path):
-    """分块编码文本为 uint16 token ids，增量写入 bin 文件。"""
-    with open(out_path, 'wb') as f:
-        for i in range(0, len(text), CHUNK):
-            ids = tokenizer.encode(text[i:i + CHUNK]).ids
-            np.array(ids, dtype=np.uint16).tofile(f)
+    """分块编码文本为 uint16 token ids，增量写入 bin 文件。
 
+    字面量 <eos> 映射为 tokenizer 的 EOS token id（而非逐字符编码），
+    与 encode_bytes_to_bin 逻辑一致——先按 <eos> 分割，各段独立编码，
+    段间插入 EOS id。分块 flush 控制内存。
+    """
+    eos_id = tokenizer.token_to_id("<eos>")
+    with open(out_path, 'wb') as f:
+        buf = []
+        parts = text.split('<eos>')
+        for i, part in enumerate(parts):
+            # 大段分块编码，控制内存
+            for j in range(0, max(len(part), 1), CHUNK):
+                chunk = part[j:j + CHUNK]
+                if chunk:
+                    buf.extend(tokenizer.encode(chunk).ids)
+            if i < len(parts) - 1 and eos_id is not None:
+                buf.append(eos_id)
+            if len(buf) >= 1 << 20:
+                np.array(buf, dtype=np.uint16).tofile(f)
+                buf = []
+        if buf:
+            np.array(buf, dtype=np.uint16).tofile(f)
 
 EOS_ID = 256  # 字节直入模式（dev-notes/48）：0-255 = UTF-8 字节，256 = <eos>
 

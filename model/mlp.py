@@ -22,9 +22,9 @@ class SwiGLU(nn.Module):
         self.c_proj = nn.Linear(hidden, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x, rope_offset=0):
-        # rope_offset：占位参数（SwiGLU 无位置概念）——skip_attn 层与注意力层共用
-        # Block 的统一调用签名（dev-notes/46 推理状态续传的 RoPE 偏移）。
+    def forward(self, x, rope_offset=0, is_eos=None, **kwargs):
+        # rope_offset / is_eos：占位参数（SwiGLU 无位置概念）——skip_attn 层与注意力层共用
+        # Block 的统一调用签名（dev-notes/46 推理状态续传的 RoPE 偏移与样本边界阻断）。
         x = F.silu(self.c_fc(x)) * self.c_fc2(x)  # SiLU(xW1) ⊙ (xW2)
         if self.config.swiglu_clamp > 0:
             # V4 稳定性技巧：钳制门控输出，从源头压制异常值。
@@ -64,10 +64,11 @@ class MoE(nn.Module):
         # 路由器：给每个 token 在每个专家上打一个分（hash 模式下仍保留，作为后续层复用）
         self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
         # 专家：每个专家是一份完整的 SwiGLU FFN
-        self.experts = nn.ModuleList([SwiGLU(config) for _ in range(config.n_experts)])
+        h_scale = getattr(config, 'moe_hidden_scale', 8 / 3)
+        self.experts = nn.ModuleList([SwiGLU(config, hidden_scale=h_scale) for _ in range(config.n_experts)])
         # V4 共享专家：始终激活，捕获所有 token 的共性特征（语法、常见搭配）
         if self.use_shared_expert:
-            self.shared_expert = SwiGLU(config)
+            self.shared_expert = SwiGLU(config, hidden_scale=h_scale)
         # 本次前向累积的辅助损失，forward 后由 GPT 取走并清零
         self.aux_loss = torch.tensor(0.0)
         self.z_loss = torch.tensor(0.0)
@@ -128,9 +129,9 @@ class MoE(nn.Module):
             if self.use_aux_free_balance:
                 # V4 aux-free：无辅助损失，改为按负载偏差更新 bias（无梯度，决定性推动均衡）。
                 # 过载专家（f_i > 均值）bias 下降 → 更难被选中；欠载专家 bias 上升 → 更容易被选中。
-                self.aux_loss = torch.tensor(0.0)
+                self.aux_loss = torch.tensor(0.0, device=x_flat.device, dtype=x_flat.dtype)
                 with torch.no_grad():
-                    self.router_bias.add_((f_i - 1.0 / self.n_experts).sign() * self.balance_factor)
+                    self.router_bias.sub_((f_i - 1.0 / self.n_experts).sign() * self.balance_factor)
             else:
                 # Switch Transformer 辅助损失：P_i = 路由器给第 i 个专家的平均概率。
                 # 两者都高意味着该专家又热门又常被选，均衡时 sum(f_i * P_i) 取最小。

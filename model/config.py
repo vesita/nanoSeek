@@ -29,6 +29,7 @@ class GPTConfig:
     balance_factor: float = 0.001   # aux-free 偏置每步更新幅度
     use_sqrtsoftplus: bool = False  # V4：路由打分用 √softplus(logits)*route_scale 替代 softmax
     route_scale: float = 2.5        # √softplus 打分的缩放系数（V4 默认）
+    moe_hidden_scale: float = 8 / 3 # MoE 单专家隐层缩放（8/3 粗粒度标准；4/3 细粒度轻量化）
     # --- MLA 多头潜在注意力（DeepSeek-V2 核心）。低秩压缩 KV + 部分 RoPE ---
     use_mla: bool = False       # 用 MLA 替换标准 KV 投影
     kv_lora_rank: int = 64      # KV 压缩后的潜在维度
@@ -74,9 +75,11 @@ class GPTConfig:
     kv_memory_layers: Optional[int] = None  # B组：启用记忆的最后 n 层（None=全部层）。观测台：底层读写比 0.25 vs 高层 0.41 → 底层记忆利用率低，可省
     kv_memory_block: int = 1  # C组：块级记忆块大小（token 数）。1=逐 token（现行为）；>1 块内 k/v/r/w 均值池化、状态每块更新一次，粒度变粗（dev-notes/44）
     kv_memory_delta: bool = False  # P2：Delta 擦写律——S←r⊙S+w(v−S·k)kᵀ 先擦后写，消除键冲突混叠（dev-notes/45）
+    kv_memory_output_gate: bool = False  # KV 记忆输出门控 (Output Gate) + 状态 RMSNorm（GLA/RetNet 思想）
+    sample_boundary_reset: bool = True   # 样本边界重置与因果阻断：遇到 <eos> 时清空记忆黑板并阻断滑窗跨样本注意
     byte_level: bool = False  # 字节直入+3:1聚合（dev-notes/48）：输入 UTF-8 字节流，聚合层学"字节→语义单位"，无 BPE 分词
     char_level: bool = False  # 字级（dev-notes/50）：汉字=1 token，标准 GPT + WordLevel 词表（对齐字符、无话术固化）
-    # --- V4 结构设计升级（实验性，默认全关）---
+    factorized_emb_dim: int = 0  # 因式分解嵌入维度：>0 时启用低秩嵌入（ALBERT 思想），wte 降至 E 维 + 升降维投影，省参数加深网络
     # Attention Sinks：每头一个可学习标量偏置，作为 softmax 的"垃圾桶"吸收无关注意力。
     use_attn_sink: bool = False
     # mHC 超连接：4 流并行残差（X_{l+1} = B·X_l + C·F(A·X_l)，A/C sigmoid 有界、B 双重随机）。

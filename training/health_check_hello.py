@@ -15,7 +15,6 @@ import sys, re, os, argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
 from collections import Counter
-from tokenizers import Tokenizer
 from model import GPTConfig, GPT
 from inference.scripts.sample_py import generate_ids
 
@@ -68,11 +67,14 @@ def main():
                     help="打印前几个 seed 的原始文本（默认 3）")
     a = ap.parse_args()
 
-    tok = Tokenizer.from_file("data/chinese/tokenizer.json")
-    plen = len(tok.encode(PROMPT).ids)
+    # 按 checkpoint 的词表模式选 tokenizer（与推理侧 load_tokenizer 一致）
+    from inference.scripts.sample_py import load_tokenizer
+    tok = None  # 延迟到每模型各自加载
 
     for d in a.dirs:
         model, ck = load(d)
+        tok = load_tokenizer(ck)
+        plen = len(tok.encode(PROMPT).ids)
         rows = []
         for s in SEEDS:
             torch.manual_seed(s); torch.cuda.manual_seed(s)

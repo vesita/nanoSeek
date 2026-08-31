@@ -87,6 +87,11 @@ class CausalSelfAttention(nn.Module):
             self.mem_up = nn.Linear(config.n_head * l, config.n_embd, bias=False)
             # 初始门控保守：遗忘率≈0.1（保留 0.9）、写入≈0.1（先少写，不扰动基线行为）
             nn.init.constant_(self.mem_forget.bias, math.log(0.1 / 0.9))
+            self.use_kv_memory_output_gate = getattr(config, 'kv_memory_output_gate', False)
+            if self.use_kv_memory_output_gate:
+                self.mem_out_gate = nn.Linear(config.n_embd, config.n_head * l, bias=True)
+                self.mem_out_norm = RMSNorm(l)
+                nn.init.constant_(self.mem_out_gate.bias, 0.0)
         if config.use_mla:
             assert config.qk_rope_head_dim % 2 == 0 and config.qk_rope_head_dim <= self.head_dim, \
                 "qk_rope_head_dim 需为偶数且不超过 head_dim"
@@ -142,12 +147,12 @@ class CausalSelfAttention(nn.Module):
         k = F.normalize(k, dim=-1)
         return q, k
 
-    def forward(self, x, rope_offset=0):
+    def forward(self, x, rope_offset=0, is_eos=None):
         B, T, C = x.size() # batch 大小、序列长度、嵌入维度 (n_embd)
 
         if self.use_csa:
             # CSA/HCA 混合注意力（V4 简化版）：走独立的压缩稀疏路径
-            y = self._csa_forward(x, rope_offset)
+            y = self._csa_forward(x, rope_offset, is_eos=is_eos)
             y = self.resid_dropout(self.c_proj(y))
             return y
 
@@ -258,9 +263,8 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-    def _csa_forward(self, x, rope_offset=0):
+    def _csa_forward(self, x, rope_offset=0, is_eos=None):
         """CSA + HCA 混合注意力（DeepSeek-V4 的简化教育版）。
-
         CSA（压缩稀疏注意力）：把 K/V 按 m 个 token 一块，平均池化成 1 个潜在向量。
         每个 query 只稀疏地选 top-k 个「它之前」的压缩块（长程信号用摘要传递），
         再保留一段滑窗的原始 token（近处信息用细节传递）。注意力开销从 O(T²)
@@ -416,8 +420,14 @@ class CausalSelfAttention(nn.Module):
         i = torch.arange(T, device=x.device)
         # 因果滑窗掩码（[query, key] 取向）：query q 允许 key k ∈ [q-win, q]。
         # 注意方向：r 行允许 c 列当且仅当 c ≤ r 且 r-c ≤ win。
-        # （历史上此处曾写反，导致滑窗偷看 +win 个未来 token——观测台抓到并修复）
         win_causal = (i.unsqueeze(0) <= i.unsqueeze(-1)) & (i.unsqueeze(-1) - i.unsqueeze(0) <= win)
+        if is_eos is not None and getattr(self.config, 'sample_boundary_reset', True):
+            # 样本边界因果阻断：跨 <eos> 的两段对话属于不同样本，禁止滑窗跨越
+            sample_id = torch.cumsum(F.pad(is_eos[:, :-1].long(), (1, 0), value=0), dim=1)  # (B, T)
+            same_sample = (sample_id.unsqueeze(2) == sample_id.unsqueeze(1))                # (B, T, T)
+            win_causal_b = win_causal.unsqueeze(0) & same_sample                            # (B, T, T)
+        else:
+            win_causal_b = win_causal.unsqueeze(0).expand(B, -1, -1)                        # (B, T, T)
         scale = 1.0 if self.use_qk_norm else 1.0 / math.sqrt(d)
         if self.flash and not self.capture:
             qt, kt, vt = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (B,nh,T,d)
@@ -425,14 +435,14 @@ class CausalSelfAttention(nn.Module):
                 k_pad = torch.cat([kt, kt.new_zeros(B, nh, 1, d)], dim=2)   # (B,nh,T+1,d)
                 v_pad = torch.cat([vt, vt.new_zeros(B, nh, 1, d)], dim=2)
                 mask = torch.zeros(B, nh, T, T + 1, device=x.device, dtype=x.dtype)
-                mask[:, :, :, :T].masked_fill_(~win_causal.unsqueeze(0).unsqueeze(1), float('-inf'))
+                mask[:, :, :, :T].masked_fill_(~win_causal_b.unsqueeze(1), float('-inf'))
                 mask[:, :, :, T] = self.attn_sink.view(1, nh, 1)
                 y_win = torch.nn.functional.scaled_dot_product_attention(
                     qt, k_pad, v_pad, attn_mask=mask,
                     dropout_p=0.0, is_causal=False, scale=scale)
             else:
                 mask = torch.zeros(B, nh, T, T, device=x.device, dtype=x.dtype)
-                mask.masked_fill_(~win_causal.unsqueeze(0).unsqueeze(1), float('-inf'))
+                mask.masked_fill_(~win_causal_b.unsqueeze(1), float('-inf'))
                 y_win = torch.nn.functional.scaled_dot_product_attention(
                     qt, kt, vt, attn_mask=mask,
                     dropout_p=0.0, is_causal=False, scale=scale)
@@ -441,7 +451,7 @@ class CausalSelfAttention(nn.Module):
             s_win = torch.einsum('bthd,bjhd->bthj', q, k)
             if not self.use_qk_norm:
                 s_win = s_win / math.sqrt(d)  # (B,T,nh,T)
-            s_win = s_win.masked_fill(~win_causal.unsqueeze(0).unsqueeze(2), float('-inf'))
+            s_win = s_win.masked_fill(~win_causal_b.unsqueeze(2), float('-inf'))
             v_win = v
             if self.use_attn_sink:
                 # Attention Sink：滑窗注意力同样追加一列（v 补零行占位）
@@ -495,7 +505,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         if self.kv_memory_enabled:
             # KV 记忆输出是跨头的（nh·l → C），在合并后加入残差
-            mem_out = self._kv_memory_forward(x)
+            mem_out = self._kv_memory_forward(x, is_eos=is_eos)
             y = y + mem_out
             if self.capture:
                 self._cap_mag["mem"] = mem_out.float().norm(dim=-1).mean().item()
@@ -525,9 +535,8 @@ class CausalSelfAttention(nn.Module):
         gate = torch.sigmoid(self.csa_gate_linear(flat))     # 门控 (0,1)
         return (h * gate).view(B, nb, nh, d)
 
-    def _kv_memory_forward(self, x):
+    def _kv_memory_forward(self, x, is_eos=None):
         """KV 记忆路径（P1，GLA 式 chunk 并行版）：每头一个可写状态矩阵。
-
         递推（与顺序版数学等价，块内并行）：
             r_t = 1 − σ(W_f·x_t)         逐通道保留率（遗忘门 → 学出来的淘汰策略）
             β_t = σ(W_b·x_t)             写入门
@@ -548,6 +557,9 @@ class CausalSelfAttention(nn.Module):
         qkv = self.mem_qkv(x).float().view(B, T, nh, 3, l)
         q_m, k_m, v_m = qkv.unbind(dim=3)                        # (B,T,nh,l)
         r = 1.0 - torch.sigmoid(self.mem_forget(x).float().view(B, T, nh, l))
+        if is_eos is not None and getattr(self.config, 'sample_boundary_reset', True):
+            # 样本边界记忆重置：遇到 <eos> 时强制保留率 r=0.0，瞬时清空黑板，杜绝跨对话记忆污染
+            r = r.masked_fill(is_eos.unsqueeze(2).unsqueeze(3), 0.0)
         if self.use_complement_gate:
             # 互补门：写入门 = 遗忘率（逐通道，忘记多少写入多少）
             w = (1.0 - r)                                     # (B,T,nh,l)，逐通道写入门
@@ -598,6 +610,11 @@ class CausalSelfAttention(nn.Module):
             if self.capture:
                 A_hist.append(A_in.detach().cpu().clone())       # 观测台：每 chunk 后黑板快照
         o = torch.cat(outs, dim=1)[:, :T]                           # (B,T,nh,l)
+        if getattr(self, 'use_kv_memory_output_gate', False):
+            # 输出门控 + 状态 RMSNorm（GLA/RetNet 思想）：压制背景噪声与状态漂移
+            o = self.mem_out_norm(o)
+            g_out = torch.sigmoid(self.mem_out_gate(x).float().view(B, T, nh, l))
+            o = o * g_out
         if self.capture:
             self._cap_mem_r = r[:, :T].detach().cpu()   # 保留率 (B,T,nh,l)
             self._cap_mem_w = w[:, :T].detach().cpu()   # 写入门 (B,T,nh,1)
@@ -606,13 +623,7 @@ class CausalSelfAttention(nn.Module):
         return self.mem_up(o.reshape(B, T, nh * l)).to(x.dtype)
 
     def _kv_memory_forward_delta(self, q_m, k_m, v_m, r, w, persist, B, T, nh, l):
-        """P2 Delta 擦写（dev-notes/45）：S_t = r⊙S_{t-1} + w_t(v_t − S_{t-1}·k_t)k_tᵀ。
-
-        先擦后写：写入前用当前键检索已存值 u = S·k，从 v 中减去再写 →
-        新状态对键 k 的检索精确逼近 v，消除叠加式写入的键冲突混叠（记忆精度→接话相关性）。
-        写后读（o_t 含自身写入，与 P1 同语义）；块内顺序递推 + 梯度检查点
-        （块边界存 S，backward 重算块内，避免保存每步 S 的 1.5GB）。
-        """
+        """P2 Delta 擦写（dev-notes/45）：S_t = r⊙S_{t-1} + w_t(v_t − S_{t-1}·k_t)k_tᵀ。"""
         CHUNK = getattr(self.config, 'kv_memory_chunk', 64)
         # 数值稳定（DeltaNet 标准做法）：键单位化 → 擦写外积 (v−u)k̂ᵀ 范数 ≤ |v−u|，
         # 避免 S·k 与 k 范数正反馈爆炸（30 步训练后 NaN 根因）。

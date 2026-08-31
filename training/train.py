@@ -98,6 +98,7 @@ use_aux_free_balance = False   # V4：aux-free 偏置修正替代 Switch aux los
 balance_factor = 0.001         # aux-free 偏置每步更新幅度
 use_sqrtsoftplus = False       # V4：路由打分 √softplus 替代 softmax
 route_scale = 2.5              # √softplus 打分缩放系数
+moe_hidden_scale = 8 / 3       # MoE 单专家隐层缩放（8/3 粗粒度标准；4/3 细粒度轻量化）
 # --- MLA 多头潜在注意力（DeepSeek-V2），与 CSA 二选一 ---
 use_mla = False        # 多头潜在注意力：低秩压缩 KV
 kv_lora_rank = 64      # KV 压缩后的潜在维度
@@ -128,6 +129,8 @@ kv_memory_complement_gate = False  # 互补门：写入门 β=1−r（忘记多�
 kv_memory_layers = None            # B组：启用记忆的最后 n 层（None=全部层；300 步 A/B 否定分层）
 kv_memory_block = 1                # C组：块级记忆块大小（token 数）。1=逐 token（现行为）；300 步 A/B 否定块级（dev-notes/44）
 kv_memory_delta = False               # P2：Delta 擦写律，先擦后写消除键冲突混叠（dev-notes/45；持平但 3× 慢弃用）
+kv_memory_output_gate = False         # KV 记忆输出门控 (Output Gate) + 状态 RMSNorm（GLA/RetNet 思想）
+sample_boundary_reset = True          # 样本边界重置与因果阻断：遇到 <eos> 时清空记忆黑板并阻断滑窗跨样本注意
 # --- V4 结构设计升级（实验性，默认全关）---
 use_attn_sink = True         # Attention Sinks：打破重复坍缩的必要条件（三重 A/B 验证）
 use_mhc = False              # mHC 超连接：4 流并行残差
@@ -167,7 +170,7 @@ compile = True # 默认开（dev-notes/42-A 曾用 3 步短测误判"无收益"�
 byte_level = False      # 字节直入模式（dev-notes/48，Mamba-Byte 思想）：无 BPE 分词，
                         # 词表 0-255 字节+<eos>=256，读 train_byte.bin/val_byte.bin
 char_level = False      # 字级模式（dev-notes/50）：汉字=1 token，读 train_char.bin/val_char.bin
-# -----------------------------------------------------------------------------
+factorized_emb_dim = 0  # 因式分解嵌入维度：>0 启用低秩嵌入（ALBERT 思想），wte 降至 E 维，省参数加深网络
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 load_config(globals()) # 从 YAML 配置文件或命令行覆盖
 config = {k: globals()[k] for k in config_keys} # 对日志记录很有用
@@ -298,6 +301,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_moe=use_moe, n_experts=n_experts, n_top_k=n_top_k, moe_aux_weight=moe_aux_weight,
                   use_shared_expert=use_shared_expert, use_aux_free_balance=use_aux_free_balance,
                   balance_factor=balance_factor, use_sqrtsoftplus=use_sqrtsoftplus, route_scale=route_scale,
+                  moe_hidden_scale=moe_hidden_scale,
                   use_mla=use_mla, kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim,
                   use_mtp=use_mtp, n_mtp=n_mtp, mtp_weight=mtp_weight,
                   use_muon=use_muon, muon_momentum=muon_momentum, muon_ns_steps=muon_ns_steps,
@@ -307,6 +311,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   kv_memory_chunk=kv_memory_chunk, kv_memory_checkpoint=kv_memory_checkpoint,
                   kv_memory_complement_gate=kv_memory_complement_gate, kv_memory_layers=kv_memory_layers,
                   kv_memory_block=kv_memory_block, kv_memory_delta=kv_memory_delta,
+                  kv_memory_output_gate=kv_memory_output_gate, sample_boundary_reset=sample_boundary_reset,
                   use_csa_fused_qkv=use_csa_fused_qkv, use_csa_bmm=use_csa_bmm,
                   use_attn_sink=use_attn_sink, use_mhc=use_mhc, hc_mult=hc_mult,
                   use_lightning_indexer=use_lightning_indexer, num_hash_layers=num_hash_layers,
@@ -316,8 +321,8 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_lse_gate=use_lse_gate,
                     use_qk_norm=use_qk_norm,
                     z_loss_weight=z_loss_weight,
-                  byte_level=byte_level, char_level=char_level)
-
+                  byte_level=byte_level, char_level=char_level,
+                  factorized_emb_dim=factorized_emb_dim)
 def _build_model_from_checkpoint(checkpoint):
     """按 checkpoint 里的 model_args 构建模型并加载权重（供 resume / 后训练复用）。"""
     checkpoint_model_args = checkpoint['model_args']
@@ -328,7 +333,7 @@ def _build_model_from_checkpoint(checkpoint):
     for k in ['use_rope', 'rope_theta', 'swiglu_clamp',
               'use_moe', 'n_experts', 'n_top_k', 'moe_aux_weight',
               'use_shared_expert', 'use_aux_free_balance', 'balance_factor',
-              'use_sqrtsoftplus', 'route_scale',
+              'use_sqrtsoftplus', 'route_scale', 'moe_hidden_scale',
               'use_mla', 'kv_lora_rank', 'qk_rope_head_dim',
               'use_mtp', 'n_mtp', 'mtp_weight',
               'use_muon', 'muon_momentum', 'muon_ns_steps',
@@ -336,10 +341,11 @@ def _build_model_from_checkpoint(checkpoint):
               'use_hca', 'use_csa_learnable', 'use_csa_fused_qkv', 'use_csa_bmm',
               'use_kv_memory', 'kv_memory_latent', 'kv_memory_chunk', 'kv_memory_checkpoint',
               'kv_memory_complement_gate', 'kv_memory_layers', 'kv_memory_block', 'kv_memory_delta',
+              'kv_memory_output_gate', 'sample_boundary_reset',
               'use_attn_sink', 'use_mhc', 'hc_mult',
               'use_lightning_indexer', 'num_hash_layers', 'block_order', 'no_attn_layers',
               'n_memory_tokens', 'use_lse_residual', 'use_lse_gate',
-               'use_qk_norm', 'z_loss_weight']:
+               'use_qk_norm', 'z_loss_weight', 'factorized_emb_dim']:
         model_args[k] = checkpoint_model_args.get(k, model_args[k])
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -403,6 +409,9 @@ def print_summary():
     epoch_note = f" · ≈{max_iters/steps_per_epoch:.1f} epoch" if steps_per_epoch else ""
     print(f"  训练      {max_iters} 步 · {tokens_per_iter:,} tokens/步{epoch_note}")
     print(f"  设备      {device} · {dtype} · compile {'开' if compile else '关'}")
+    es_note = (f"开（patience={patience}·min_improve={min_val_improve}·min_iters={min_iters}）"
+               if enable_early_stop else "关（训满 max_iters）")
+    print(f"  早停      {es_note}")
     print(f"  检查点    best.pt（val 最优）+ last.pt（最新）· 续训自动从 best.pt 恢复")
     print(border)
     print()
@@ -721,7 +730,7 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         epoch_str = f"{iter_num/steps_per_epoch:.2f}" if steps_per_epoch else "-"
-        pbar.set_postfix(轮次=f"{epoch_str}", 损失=f"{lossf:.4f}", MFU=f"{running_mfu*100:.1f}%")
+        pbar.set_postfix(轮次=f"{epoch_str}", 损失=f"{lossf:.4f}", MFU=f"{max(running_mfu, 0.0)*100:.1f}%")
     iter_num += 1
     local_iter_num += 1
     if pbar is not None:
@@ -737,6 +746,7 @@ if master_process:
         print(f"训练提前终止：{iter_num} 步（早停，best_val_loss {best_val_loss:.4f}）")
     else:
         print(f"训练完成：{iter_num} 步（达 max_iters {max_iters}）")
+    print(f"  最终 best_val_loss {best_val_loss:.4f} · 总耗时 {time.time()-train_start:.1f}s")
 join_save_threads()
 if results_csv is not None:
     results_csv.close()

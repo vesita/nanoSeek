@@ -55,9 +55,9 @@ class Block(nn.Module):
         if self.use_lse_gate:
             self.raw_gate = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x, rope_offset=0):
+    def forward(self, x, rope_offset=0, is_eos=None):
         if self.use_mhc:
-            return self._mhc_forward(x, rope_offset)
+            return self._mhc_forward(x, rope_offset=rope_offset, is_eos=is_eos)
         # skip_attn 层的 attn 槽已是宽 FFN（SwiGLU），走同样双子层路径，无特殊分支。
         # 计算图重排：默认 attn→ffn；block_order="ffn_attn" 时先 FFN 后注意力。
         # norm 与子层绑定不可拆：attn 永远用 ln_1，mlp 永远用 ln_2，只调换两段顺序。
@@ -76,14 +76,14 @@ class Block(nn.Module):
         if self.config.block_order == "ffn_attn":
             x = res(x, self.mlp(self.ln_2(x)))
             x = res(x, self.attn(self.ln_1(x)) if self.skip_attn
-                    else self.attn(self.ln_1(x), rope_offset=rope_offset))
+                    else self.attn(self.ln_1(x), rope_offset=rope_offset, is_eos=is_eos))
         else:
             x = res(x, self.attn(self.ln_1(x)) if self.skip_attn
-                    else self.attn(self.ln_1(x), rope_offset=rope_offset))
+                    else self.attn(self.ln_1(x), rope_offset=rope_offset, is_eos=is_eos))
             x = res(x, self.mlp(self.ln_2(x)))
         return x
 
-    def _mhc_forward(self, x, rope_offset=0):
+    def _mhc_forward(self, x, rope_offset=0, is_eos=None):
         """mHC 4-copy：X' = B·X + C·F(A·X)。
 
         x: (B, T, hc, d)  4 个并行残差流。
@@ -95,28 +95,27 @@ class Block(nn.Module):
         # skip_attn 层的 attn 槽已是宽 FFN，is_attn=True 子层照样跑（SwiGLU 变换），
         # 只是不涉及注意力；两组 A/B/C 都参与训练。
         if self.config.block_order == "ffn_attn":
-            x = self._mhc_sublayer(x, hc, is_attn=False, rope_offset=rope_offset)  # FFN 先
-            x = self._mhc_sublayer(x, hc, is_attn=True, rope_offset=rope_offset)   # 注意力后
+            x = self._mhc_sublayer(x, hc, is_attn=False, rope_offset=rope_offset, is_eos=is_eos)  # FFN 先
+            x = self._mhc_sublayer(x, hc, is_attn=True, rope_offset=rope_offset, is_eos=is_eos)   # 注意力后
         else:
-            x = self._mhc_sublayer(x, hc, is_attn=True, rope_offset=rope_offset)   # 注意力先
-            x = self._mhc_sublayer(x, hc, is_attn=False, rope_offset=rope_offset)  # FFN 后
+            x = self._mhc_sublayer(x, hc, is_attn=True, rope_offset=rope_offset, is_eos=is_eos)   # 注意力先
+            x = self._mhc_sublayer(x, hc, is_attn=False, rope_offset=rope_offset, is_eos=is_eos)  # FFN 后
         return x
 
-    def _mhc_sublayer(self, x, hc, is_attn, rope_offset=0):
+    def _mhc_sublayer(self, x, hc, is_attn, rope_offset=0, is_eos=None):
         """mHC 单个子层：A 压流 → 子层 F 跑 1 次 → C 展开 → B 混合残差。
         is_attn=True 取 attn 组 A/B/C + ln_1/attn；False 取 ffn 组 + ln_2/mlp。
         两组权重各自跟随所属子层，重排顺序时无需 remap。
         """
         A = torch.sigmoid(self.raw_A_attn if is_attn else self.raw_A_ffn)
         h_in = (x * A.view(1, 1, hc, 1)).sum(dim=2)            # (B, T, d)
-        h_out = (self.attn(self.ln_1(h_in), rope_offset=rope_offset) if is_attn
+        h_out = (self.attn(self.ln_1(h_in), rope_offset=rope_offset, is_eos=is_eos) if is_attn
                  else self.mlp(self.ln_2(h_in)))               # 子层只跑 1 次
         C = torch.sigmoid(self.raw_C_attn if is_attn else self.raw_C_ffn)
         delta = h_out.unsqueeze(2) * C.view(1, 1, hc, 1)       # (B, T, hc, d)
         B_ds = sinkhorn_knopp(F.softplus(
             self.raw_B_attn if is_attn else self.raw_B_ffn))   # (hc, hc) 双重随机
         return torch.einsum('bthd,hc->btcd', x, B_ds) + delta  # 残差混合 + 子层增量
-
     def get_moe_aux_loss(self):
         """如果本块是 MoE，返回其辅助损失；否则返回 None（GPT 据此累加）。"""
         if isinstance(self.mlp, MoE):
@@ -146,9 +145,9 @@ class MTPModule(nn.Module):
         # 强制关闭 mHC：MTP 的输入是单流 hidden + next_emb，不是 4 流残差。
         self.block = Block(dataclasses.replace(config, use_mhc=False))
 
-    def forward(self, hidden, next_emb):
+    def forward(self, hidden, next_emb, is_eos=None):
         # hidden:  (B, T, n_embd) 主模型在位置 t 的隐藏状态
         # next_emb: (B, T, n_embd) 目标 token t+1 的嵌入（提前剧透下一步）
         h = self.hidden_proj(hidden) + self.emb_proj(next_emb)
         h = self.norm(h)
-        return self.block(h)
+        return self.block(h, is_eos=is_eos)

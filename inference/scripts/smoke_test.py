@@ -41,6 +41,8 @@ CASES = [
     ("aux-free", dict(use_moe=True, n_experts=4, n_top_k=2, use_aux_free_balance=True)),
     ("√softplus", dict(use_moe=True, n_experts=4, n_top_k=2, use_sqrtsoftplus=True)),
     ("MLA", dict(use_mla=True, kv_lora_rank=32, qk_rope_head_dim=8)),
+    ("因式分解嵌入", dict(factorized_emb_dim=24)),
+    ("因式分解+MTP", dict(factorized_emb_dim=24, use_mtp=True, n_mtp=1)),
     ("MTP", dict(use_mtp=True, n_mtp=1)),
     ("CSA均池", dict(use_csa=True, csa_compress=16, csa_topk=2, csa_window=32, use_csa_learnable=False)),
     ("CSA可学习", dict(use_csa=True, csa_compress=16, csa_topk=2, csa_window=32)),
@@ -97,13 +99,19 @@ assert moe.aux_loss.item() > 0
 
 # aux-free 偏置修正：过载专家 bias 应下降、欠载专家上升，且不再产生辅助损失
 moe_af = MoE(GPTConfig(n_embd=64, n_experts=4, n_top_k=2, use_aux_free_balance=True))
-bias_before = moe_af.router_bias.clone()
-for _ in range(10):
-    moe_af(torch.randn(4, 16, 64))
-print(f"aux-free 偏置更新后：max|Δbias| = {(moe_af.router_bias - bias_before).abs().max().item():.4f}，aux_loss = {moe_af.aux_loss.item()}")
-assert (moe_af.router_bias - bias_before).abs().max().item() > 0, "aux-free 偏置没有更新！"
+# 设置固定权重使得专家 0 和 1 总是被选中（过载），专家 2 和 3 永远不被选（欠载）
+with torch.no_grad():
+    moe_af.router.weight[0].fill_(0.1)
+    moe_af.router.weight[1].fill_(0.05)
+    moe_af.router.weight[2].fill_(-0.05)
+    moe_af.router.weight[3].fill_(-0.1)
+moe_af(torch.ones(4, 16, 64))
+assert moe_af.router_bias[0] < 0, "过载专家 0 的偏置应该下降（< 0）！"
+assert moe_af.router_bias[1] < 0, "过载专家 1 的偏置应该下降（< 0）！"
+assert moe_af.router_bias[2] > 0, "欠载专家 2 的偏置应该上升（> 0）！"
+assert moe_af.router_bias[3] > 0, "欠载专家 3 的偏置应该上升（> 0）！"
 assert moe_af.aux_loss.item() == 0.0, "aux-free 模式不应产生辅助损失！"
-
+print(f"aux-free 偏置方向验证：过载降 {moe_af.router_bias[0].item():.4f} / 欠载升 {moe_af.router_bias[3].item():.4f}，aux_loss = 0.0 ✅")
 # 验证 mHC 的 Sinkhorn-Knopp 投影：结果必须是双重随机矩阵（行和列和都为 1、非负）
 from model import sinkhorn_knopp
 import torch.nn.functional as F

@@ -31,6 +31,15 @@ class GPT(nn.Module):
             self.byte_emb = nn.Embedding(config.vocab_size, config.n_embd)
             self.byte_agg = nn.Linear(3 * config.n_embd, config.n_embd, bias=False)
             self.byte_unagg = nn.Linear(config.n_embd, 3 * config.vocab_size, bias=False)
+            self.lm_head = None
+        elif config.factorized_emb_dim > 0:
+            # 因式分解嵌入（ALBERT 思想）：词表先投影到 factorized_emb_dim 低秩空间，
+            # 再由 emb_proj 升维到 n_embd；输出头由 head_down 降维后复用 wte.weight 做 weight tying。
+            # 极大削减静态词表参数（省 60~70% 嵌入参数），将参数预算重投到 Transformer 深度。
+            self.transformer['wte'] = nn.Embedding(config.vocab_size, config.factorized_emb_dim)
+            self.emb_proj = nn.Linear(config.factorized_emb_dim, config.n_embd, bias=False)
+            self.head_down = nn.Linear(config.n_embd, config.factorized_emb_dim, bias=False)
+            self.lm_head = None
         else:
             self.transformer['wte'] = nn.Embedding(config.vocab_size, config.n_embd)
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -42,18 +51,17 @@ class GPT(nn.Module):
         # 用 RoPE 时，位置信息由 attention 内部注入，不需要可学习的位置编码表
         if not config.use_rope:
             self.transformer['wpe'] = nn.Embedding(config.block_size, config.n_embd)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) if not config.byte_level else None
         # MTP 模块（可选）：额外的"小 transformer 层"，训练时预测更远的 token
         if config.use_mtp:
             self.mtp_modules = nn.ModuleList([MTPModule(config) for _ in range(config.n_mtp)])
-            self.mtp_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+            if config.factorized_emb_dim == 0 and not config.byte_level:
+                self.mtp_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # 使用 torch.compile() 做权重共享（weight tying）时会产生一些警告：
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
-        # 不完全确定这是什么原因，目前看是无害的。TODO 调查一下
-        if not config.byte_level:
+        if not config.byte_level and config.factorized_emb_dim == 0:
             self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-        if config.use_mtp:
+        if config.use_mtp and config.factorized_emb_dim == 0 and not config.byte_level:
             # V4：MTP 输出头和主模型共享 lm_head 权重（节省参数，DeepSeek-V3/V4 都这么做）
             if self.lm_head is not None:
                 self.mtp_head.weight = self.lm_head.weight
@@ -94,6 +102,16 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def get_token_emb(self, idx):
+        if self.config.factorized_emb_dim > 0:
+            return self.emb_proj(self.transformer.wte(idx))
+        return self.transformer.wte(idx)
+
+    def compute_logits(self, x):
+        if self.config.factorized_emb_dim > 0:
+            return F.linear(self.head_down(x), self.transformer.wte.weight)
+        return self.lm_head(x)
+
     def forward(self, idx, targets=None, rope_offset=0):
         """rope_offset（dev-notes/46 推理状态续传）：输入序列的全局起始位置。
         窗口截断推理时传窗口起点的绝对位置，RoPE 保持绝对坐标（默认 0 = 训练/全序列）。"""
@@ -105,7 +123,7 @@ class GPT(nn.Module):
         assert t <= self.config.block_size, f"无法前向传播长度为 {t} 的序列，block size 只有 {self.config.block_size}"
 
         # 前向传播 GPT 模型本身
-        tok_emb = self.transformer.wte(idx) # 形状为 (b, t, n_embd) 的 token 嵌入
+        tok_emb = self.get_token_emb(idx) # 形状为 (b, t, n_embd) 的 token 嵌入
         if self.config.use_rope:
             # RoPE：位置信息在 attention 内部注入，这里只需要 token embedding
             x = self.transformer.drop(tok_emb)
@@ -113,7 +131,6 @@ class GPT(nn.Module):
             pos = torch.arange(0, t, dtype=torch.long, device=device) # 形状 (t)
             pos_emb = self.transformer.wpe(pos) # 形状为 (t, n_embd) 的位置嵌入
             x = self.transformer.drop(tok_emb + pos_emb)
-        # 显式记忆 token：拼到序列前，作为每一层的全局工作区（真实 token 的相对位置不变）。
         # RoPE 表已扩到 block_size+K，前缀位置 0..K-1 正常旋转。
         if self.config.n_memory_tokens > 0:
             mem = self.memory_tokens.unsqueeze(0).expand(b, -1, -1)  # (b, K, n_embd)
@@ -121,8 +138,9 @@ class GPT(nn.Module):
         if self.config.use_mhc:
             # mHC：4 个残差流从同一个嵌入出发（在流维扩展）
             x = x.unsqueeze(2).expand(b, x.size(1), self.config.hc_mult, self.config.n_embd)
+        is_eos = (idx == 0) if (not self.config.byte_level and getattr(self.config, 'sample_boundary_reset', True)) else None
         for block in self.transformer.h:
-            x = block(x, rope_offset=rope_offset)
+            x = block(x, rope_offset=rope_offset, is_eos=is_eos)
         if self.config.use_mhc:
             # 4 流均值回到 1 流，再给 ln_f / lm_head（V4 用可学习合并，这里用均值简化）
             x = x.mean(dim=2)
@@ -133,7 +151,7 @@ class GPT(nn.Module):
 
         if targets is not None:
             # 如果给了目标 targets，就同时计算损失
-            logits = self.lm_head(x)
+            logits = self.compute_logits(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
             if self.config.use_moe:
                 # 把各层 MoE 的负载均衡辅助损失加到总损失上
@@ -145,7 +163,7 @@ class GPT(nn.Module):
                 loss = loss + moe_loss
             if self.config.use_mtp:
                 # 多 token 预测：额外预测 t+2、t+3...，按权重加进总损失
-                loss = loss + self.config.mtp_weight * self._compute_mtp_loss(x, targets)
+                loss = loss + self.config.mtp_weight * self._compute_mtp_loss(x, targets, is_eos=is_eos)
             if self.config.use_lightning_indexer:
                 # Lightning Indexer 辅助损失：让 indexer 的选块分布逼近真实注意力分布
                 # （权重 0.01，作为辅助信号，不喧宾夺主）
@@ -157,7 +175,7 @@ class GPT(nn.Module):
                 loss = loss + 0.01 * idx_loss
         else:
             # 推理时的小优化：只对最后一个位置前向传播 lm_head
-            logits = self.lm_head(x[:, [-1], :]) # 注意：用列表 [-1] 来保留时间维度
+            logits = self.compute_logits(x[:, [-1], :]) # 注意：用列表 [-1] 来保留时间维度
             loss = None
 
         return logits, loss
@@ -239,7 +257,7 @@ class GPT(nn.Module):
         for i, s in states.items():
             self.transformer.h[i].attn.set_mem_state(s)
 
-    def _compute_mtp_loss(self, x, targets):
+    def _compute_mtp_loss(self, x, targets, is_eos=None):
         """MTP 损失：第 k 个模块用「位置 t 的隐藏状态 + 目标 t+k+1 的嵌入」预测 t+k+2。
         x: (B, T, n_embd) 主模型 ln_f 的输出；targets: (B, T) 训练目标（即 t+1 的正确答案）。
         """
@@ -260,10 +278,11 @@ class GPT(nn.Module):
             # 对 embedding 查找用 clamp 替换 -100（loss masking 屏蔽位），
             # 这些位置在 cross_entropy 中仍被 ignore_index=-100 忽略。
             safe_targets = targets.clamp(min=0)
-            next_emb = self.transformer.wte(safe_targets[:, off : off+length])       # (B, len, C)
+            next_emb = self.get_token_emb(safe_targets[:, off : off+length])       # (B, len, C)
             mtp_targets = targets[:, off+1 : off+1+length]                      # (B, len)
-            h = self.mtp_modules[k](hidden, next_emb)                           # (B, len, C)
-            logits = self.mtp_head(h)
+            is_eos_mtp = is_eos[:, off : off+length] if is_eos is not None else None
+            h = self.mtp_modules[k](hidden, next_emb, is_eos=is_eos_mtp)       # (B, len, C)
+            logits = self.compute_logits(h)
             mtp_loss = mtp_loss + F.cross_entropy(
                 logits.view(-1, logits.size(-1)), mtp_targets.reshape(-1), ignore_index=-100)
         return mtp_loss / self.config.n_mtp
