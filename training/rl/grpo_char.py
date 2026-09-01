@@ -29,10 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from model import GPTConfig, GPT
 from inference.scripts.sample_py import build_model_from_checkpoint, load_tokenizer
-
-# -----------------------------------------------------------------------------
-# 训练提示词库（分层意图池）
-# -----------------------------------------------------------------------------
+from training.rl.multi_reward import MultiDimensionalRewardEngine, RewardDimensionWeights
 # 人格化与无前缀自然提示词库 (彻底移除 "用户：" / "模型：" 机械标签)
 # -----------------------------------------------------------------------------
 # 1. 自发涌现自我命名与身份认同 (Emergent Self-Naming & Identity)
@@ -84,100 +81,16 @@ COUNSELING_KEYWORDS = [
 
 ROBOTIC_TAGS = ["用户", "模型", "user", "assistant", "system", "Human:", "Assistant:"]
 # -----------------------------------------------------------------------------
-# 奖励函数族
+# 多维解耦奖励引擎实例化
 # -----------------------------------------------------------------------------
+reward_engine = MultiDimensionalRewardEngine()
 
 def compute_raw_reward(prompt, reply_text, reply_ids, eos_id, kind, keywords):
-    """计算单条回答的基础奖励得分 s (未经过指数塑形)"""
-    char_len = len(reply_text.strip())
-    
-    # 0. 彻底杜绝空回复 / 哑巴装死作弊 (Silence Collapse Penalty)
-    if char_len == 0:
-        return -5.0
-
-    s = 0.0
-    
-    # 1. 基础格式与收尾奖励 (只有在产出有意义内容的前提下才奖励收尾)
-    hit_eos = (eos_id in reply_ids)
-    if hit_eos:
-        if char_len >= 6:
-            s += 1.0  # 正常表达并利落收尾
-        else:
-            s -= 2.0  # 没说几个字就提前掐断
-    else:
-        s -= 0.8  # 跑满长度未主动终止
-        
-    if 8 <= char_len <= 80:
-        s += 0.8  # 黄金长度区间
-    elif char_len < 6:
-        s -= 2.0  # 过于敷衍/过短
-    elif char_len > 120:
-        s -= 0.5  # 啰嗦
-    # 中文字符占比检测（防英文/乱码碎片）
-    han_count = sum(1 for ch in reply_text if '\u4e00' <= ch <= '\u9fff')
-    if char_len > 0:
-        han_ratio = han_count / char_len
-        if han_ratio < 0.6:
-            s -= 1.5  # 严重乱码惩罚
-
-    # 3-gram 重复率惩罚
-    if len(reply_text) >= 6:
-        trigrams = [reply_text[i:i+3] for i in range(len(reply_text)-2)]
-        rep3 = 1.0 - len(set(trigrams)) / max(len(trigrams), 1)
-        if rep3 > 0.05:
-            s -= 1.5  # 重复复读惩罚
-        else:
-            s += 0.5
-    # 严厉惩罚吐出“用户/模型”等机械角色标签
-    if any(tag in reply_text for tag in ROBOTIC_TAGS):
-        s -= 2.5
-
-
-    # 2. 意图分层奖励 (Hierarchical Rewards)
-    if kind == "fact":
-        # (A) 命中精准事实关键词 → Tier 1 最高奖励 (+2.5)
-        fact_hits = sum(1 for kw in keywords if kw in reply_text)
-        if fact_hits >= 1:
-            s += 2.0 + 0.5 * min(fact_hits, 2)
-            
-        # (B) 坦诚承认“不知道” → Tier 2 安全奖励 (+1.2)
-        has_idk = any(kw in reply_text for kw in IDK_KEYWORDS)
-        if has_idk:
-            s += 1.2  # 诚实不瞎编
-            
-        # (C) 事实问题下胡乱套用心理咨询套话 → Tier 3 严重惩罚 (-2.5)
-        counseling_hits = sum(1 for kw in COUNSELING_KEYWORDS if kw in reply_text)
-        if counseling_hits >= 1:
-            s -= 2.5
-
-    elif kind == "identity":
-        # 自发命名与身份认知场景：鼓励模型主动命名、给出自选名字并表达自我
-        id_hits = sum(1 for kw in keywords if kw in reply_text)
-        if id_hits >= 1:
-            s += 2.2
-        # 如果主动包含命名句式（如“叫我”、“我想叫”）且长度适中自然，额外给予涌现奖励
-        if any(naming_p in reply_text for naming_p in ["叫我", "我想叫", "可以叫我", "我叫", "名字叫"]):
-            s += 1.0
-    elif kind == "travel":
-        # 愿望与旅行：鼓励生动具体的景物向往（海边、星空、日出等）
-        travel_hits = sum(1 for kw in keywords if kw in reply_text)
-        if travel_hits >= 1:
-            s += 2.5
-
-    elif kind == "mood":
-        # 日常心情：积极阳光回应
-        mood_hits = sum(1 for kw in keywords if kw in reply_text)
-        if mood_hits >= 1:
-            s += 2.2
-
-    elif kind == "heuristic":
-        # 启发性探索：鼓励好奇心与发散思维
-        heur_hits = sum(1 for kw in keywords if kw in reply_text)
-        if heur_hits >= 1:
-            s += 2.5
-        if any(q in reply_text for q in ["？", "?", "觉得", "探索", "奇妙", "美好"]):
-            s += 0.5
-    return s
+    """复用多维解耦奖励引擎"""
+    vec, score, exp_r = reward_engine.evaluate_reply(
+        prompt, reply_text, reply_ids, eos_id, kind=kind, keywords=keywords
+    )
+    return score
 
 
 def exponential_reward_shaping(score, tau=1.5):

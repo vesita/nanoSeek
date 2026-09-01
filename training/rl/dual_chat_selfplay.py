@@ -32,7 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from model import GPTConfig, GPT
 from inference.scripts.sample_py import build_model_from_checkpoint, load_tokenizer
-
+from training.rl.multi_reward import MultiDimensionalRewardEngine
 # 启发式开场白列表
 STARTER_TOPICS = [
     "今天天气格外晴朗，阳光洒在身上暖洋洋的，感觉整个人充满干劲！",
@@ -51,66 +51,17 @@ COUNSELING_TEMPLATES = [
 ]
 
 ROBOTIC_TAGS = ["用户", "模型", "user", "assistant", "system", "Human:", "Assistant:"]
-def exponential_reward(score, tau=1.5):
-    sign = 1.0 if score >= 0 else -1.0
-    return sign * (math.exp(abs(score) / tau) - 1.0)
+reward_engine = MultiDimensionalRewardEngine()
 
+def exponential_reward(score, tau=1.5):
+    return reward_engine.exponential_shaping(score)
 
 def evaluate_conversational_turn(speaker_text, speaker_ids, eos_id, listener_last_msg):
-    """质检打分器：评估本轮回答在对话流中的质量"""
-    char_len = len(speaker_text.strip())
-    
-    # 0. 彻底杜绝空回复 / 哑巴装死作弊
-    if char_len == 0:
-        return -5.0
-
-    s = 0.0
-
-    # 1. 命中 <eos> 且具有实际对话内容
-    if eos_id in speaker_ids:
-        if char_len >= 6:
-            s += 1.0
-        else:
-            s -= 2.0  # 没说几个字提前掐断
-    else:
-        s -= 0.8
-
-    # 2. 长度控制（对话单句最忌又长又臭）
-    if 8 <= char_len <= 65:
-        s += 0.8  # 对话黄金长度
-    elif char_len < 6:
-        s -= 2.0  # 过于敷衍/过短
-    elif char_len > 90:
-        s -= 0.6  # 独白式啰嗦
-    # 3. 中文字符与无乱码
-    han_count = sum(1 for ch in speaker_text if '\u4e00' <= ch <= '\u9fff')
-    if char_len > 0:
-        han_ratio = han_count / char_len
-        if han_ratio < 0.7:
-            s -= 1.5
-
-    # 4. 3-gram 循环复读惩罚
-    if len(speaker_text) >= 6:
-        trigrams = [speaker_text[i:i+3] for i in range(len(speaker_text)-2)]
-        rep3 = 1.0 - len(set(trigrams)) / max(len(trigrams), 1)
-        if rep3 > 0.05:
-            s -= 1.5
-        else:
-            s += 0.4
-
-    # 5. 上下文承接与提问互动奖励
-    if any(q in speaker_text for q in ["？", "?", "吗", "呢", "怎么", "什么", "觉得"]):
-        s += 0.5  # 鼓励主动抛出话题延续对话
-
-    # 6. 严厉惩罚单调的心理模板复读
-    # 7. 严厉惩罚吐出“用户/模型”等机械角色标签
-    if any(tag in speaker_text for tag in ROBOTIC_TAGS):
-        s -= 2.5
-
-    if any(tpl in speaker_text for tpl in COUNSELING_TEMPLATES):
-        s -= 2.0
-
-    return s
+    """复用多维解耦奖励引擎"""
+    vec, score, exp_r = reward_engine.evaluate_reply(
+        listener_last_msg, speaker_text, speaker_ids, eos_id, kind="general", keywords=[]
+    )
+    return score
 
 
 @torch.no_grad()

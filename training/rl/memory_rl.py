@@ -33,6 +33,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from model import GPTConfig, GPT
 from inference.scripts.sample_py import build_model_from_checkpoint, load_tokenizer
+from training.rl.multi_reward import MultiDimensionalRewardEngine
 
 # -----------------------------------------------------------------------------
 # 逐句多轮记忆探针测试集
@@ -85,55 +86,17 @@ COUNSELING_TEMPLATES = [
 ROBOTIC_TAGS = ["用户", "模型", "user", "assistant", "system", "Human:", "Assistant:"]
 
 
-def exponential_reward(score, tau=1.5):
-    sign = 1.0 if score >= 0 else -1.0
-    return sign * (math.exp(abs(score) / tau) - 1.0)
+reward_engine = MultiDimensionalRewardEngine()
 
+def exponential_reward(score, tau=1.5):
+    return reward_engine.exponential_shaping(score)
 
 def evaluate_memory_reply(reply_text, reply_ids, eos_id, expected_keywords):
-    """对单句记忆召回回答进行打分"""
-    char_len = len(reply_text.strip())
-    
-    # 0. 彻底杜绝空回复 / 哑巴装死作弊
-    if char_len == 0:
-        return -5.0
-
-    s = 0.0
-
-    # 1. 命中 <eos> 且长度合理
-    if eos_id in reply_ids:
-        if char_len >= 5:
-            s += 1.0
-        else:
-            s -= 2.0
-    else:
-        s -= 0.8
-
-    # 2. 长度合理（召回回答应当简短精准）
-    if 6 <= char_len <= 50:
-        s += 0.8
-    elif char_len < 6:
-        s -= 2.0  # 过于短小敷衍
-    elif char_len > 80:
-        s -= 0.5  # 啰嗦拖沓
-    # 3. 核心记忆召回奖励 (最关键项)
-    hits = sum(1 for kw in expected_keywords if kw in reply_text)
-    if hits >= 2:
-        s += 3.5  # 完美全部召回
-    elif hits == 1:
-        s += 2.0  # 部分召回
-    else:
-        s -= 1.5  # 遗忘
-
-    # 5. 严厉惩罚吐出机械角色标签
-    if any(tag in reply_text for tag in ROBOTIC_TAGS):
-        s -= 2.5
-
-    # 4. 严厉惩罚在记忆提问下套用心理咨询套话
-    if any(tpl in reply_text for tpl in COUNSELING_TEMPLATES):
-        s -= 2.5
-
-    return s
+    """复用多维解耦奖励引擎"""
+    vec, score, exp_r = reward_engine.evaluate_reply(
+        "", reply_text, reply_ids, eos_id, kind="memory", keywords=expected_keywords
+    )
+    return score
 
 
 @torch.no_grad()
