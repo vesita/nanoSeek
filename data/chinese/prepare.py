@@ -163,7 +163,7 @@ def main():
     ap.add_argument('--with-books', action='store_true',
                     help='顺带下载四大名著补充语料（默认只用手头已有的 txt）')
     ap.add_argument('--task-ratio', type=float, default=1.0,
-                    help='非对话(任务/指令)样本保留比例：1.0=全保留(默认,所有数据)，0=剔除，0.1=留10%')
+                    help='非对话(任务/指令)样本保留比例：1.0=全保留(默认,所有数据)，0=剔除，0.1=留10%%')
     ap.add_argument('--source-ratio', action='append', default=[], metavar='NAME=RATIO',
                     help='按文件名前缀降采样某源（仅 train 侧，val 不变保持可比）。'
                          '可重复：--source-ratio multi_turn=0.15 --source-ratio zhuangxialie=0.2')
