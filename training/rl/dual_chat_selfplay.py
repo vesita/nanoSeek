@@ -103,13 +103,14 @@ def generate_turn(model, tok, prompt_text, eos_id, resume_state=None,
             break
 
     reply_ids = seen[prompt_len:]
+    # 保留原始含 EOS 的 ids 用于奖励评估; 展示用文本剥掉 <eos>
     reply_text = tok.decode(reply_ids).replace("<eos>", "").strip()
     return reply_ids, reply_text, mem_state
 
 
 def step_agent_rl(model, optimizer, ref_model, tok, prompt_text, reply_ids, eos_id,
-                  resume_state, reward, beta_kl=0.03, lambda_quiet=0.02, device='cuda'):
-    """对说话方执行单步在线策略梯度微调"""
+                  resume_state, reward, degenerate=False, beta_kl=0.4, lambda_quiet=0.02, device='cuda'):
+    """对说话方执行单步在线策略梯度微调; degenerate=True 时跳过策略梯度(只 KL+静默)"""
     if not reply_ids:
         return
     prompt_ids = tok.encode(prompt_text).ids
@@ -136,17 +137,20 @@ def step_agent_rl(model, optimizer, ref_model, tok, prompt_text, reply_ids, eos_
 
     log_probs = F.log_softmax(logits, dim=-1)
     target_lp = log_probs.gather(2, y.unsqueeze(-1)).squeeze(-1).squeeze(0)
-    curr_reply_lp = target_lp[prompt_len-1 : prompt_len-1+reply_len]
+    curr_reply_lp = target_lp[prompt_len : prompt_len+reply_len]
 
     with torch.no_grad():
         if resume_state is not None:
             ref_model.set_memory_state(resume_state)
         ref_logits, _ = ref_model(x, targets=y)
         ref_lp_all = F.log_softmax(ref_logits, dim=-1).gather(2, y.unsqueeze(-1)).squeeze(-1).squeeze(0)
-        ref_reply_lp = ref_lp_all[prompt_len-1 : prompt_len-1+reply_len]
+        ref_reply_lp = ref_lp_all[prompt_len : prompt_len+reply_len]
 
-    # 策略损失 (以指数奖励为杠杆)
-    policy_loss = -reward * curr_reply_lp.sum()
+    # 策略损失 (以指数奖励为杠杆); 退化时跳过, 避免反着强化垃圾
+    if degenerate:
+        policy_loss = torch.tensor(0.0, device=device)
+    else:
+        policy_loss = -reward * curr_reply_lp.sum()
     kl_loss = F.kl_div(curr_reply_lp, ref_reply_lp, log_target=True, reduction='sum')
 
     # EOS 静默范数
@@ -171,6 +175,9 @@ def main():
     ap.add_argument("--rounds", type=int, default=20, help="交替对话轮数")
     ap.add_argument("--lr", type=float, default=2e-5, help="在线强化学习率")
     ap.add_argument("--tau", type=float, default=1.5, help="指数奖励塑形温度")
+    ap.add_argument("--beta_kl", type=float, default=0.4, help="基座 KL 散度惩罚系数 (需足够强, 防策略漂移坍缩)")
+    ap.add_argument("--min_reward", type=float, default=0.5,
+                    help="抗坍缩门: 说话方得分低于此值(原始分)时跳过策略梯度, 只做 KL/EOS 静默, 防反着强化垃圾")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -211,47 +218,45 @@ def main():
 
     for turn in range(1, args.rounds + 1):
         if current_speaker == "A":
-            # Alice 的回合：接收 Bob (或开场) 的单句输入
-            prompt_turn = f"{current_msg}\n"
-            reply_ids, reply_text, mem_state_a = generate_turn(
-                model_a, tok, prompt_turn, eos_id, resume_state=mem_state_a, device=device
-            )
-            # Bob 对 Alice 的表现进行打分质检
-            score = evaluate_conversational_turn(reply_text, reply_ids, eos_id, current_msg)
-            reward = exponential_reward(score, tau=args.tau)
-
-            # Alice 实时微调优化
-            step_agent_rl(
-                model_a, opt_a, ref_model, tok, prompt_turn, reply_ids, eos_id,
-                mem_state_a, reward, device=device
-            )
-
-            print(f"👩 Alice [第 {turn:2d} 轮 | 得分 {score:+.2f} | R={reward:+.2f}]:")
-            print(f"   \"{reply_text}\"\n")
-
-            current_msg = reply_text
-            current_speaker = "B"
-
+            agent_m, opt_m, mem_m = model_a, opt_a, mem_state_a
+            label = "👩 Alice"
         else:
-            # Bob 的回合：接收 Alice 的单句输入
-            prompt_turn = f"{current_msg}\n"
-            reply_ids, reply_text, mem_state_b = generate_turn(
-                model_b, tok, prompt_turn, eos_id, resume_state=mem_state_b, device=device
-            )
-            # Alice 对 Bob 的表现进行打分质检
-            score = evaluate_conversational_turn(reply_text, reply_ids, eos_id, current_msg)
-            reward = exponential_reward(score, tau=args.tau)
+            agent_m, opt_m, mem_m = model_b, opt_b, mem_state_b
+            label = "👨 Bob"
 
-            # Bob 实时微调优化
-            step_agent_rl(
-                model_b, opt_b, ref_model, tok, prompt_turn, reply_ids, eos_id,
-                mem_state_b, reward, device=device
-            )
+        prompt_turn = f"{current_msg}\n"
+        reply_ids, reply_text, mem_m = generate_turn(
+            agent_m, tok, prompt_turn, eos_id, resume_state=mem_m, device=device
+        )
 
-            print(f"👨 Bob   [第 {turn:2d} 轮 | 得分 {score:+.2f} | R={reward:+.2f}]:")
-            print(f"   \"{reply_text}\"\n")
+        # 对方对说话方打分; 原始分低于阈值视为退化(空回复/<eos>/乱码) → 跳过策略梯度
+        score = evaluate_conversational_turn(reply_text, reply_ids, eos_id, current_msg)
+        reward = exponential_reward(score, tau=args.tau)
+        degenerate = (score < args.min_reward) or (not reply_text.strip())
+        if degenerate and score >= args.min_reward:
+            print(f"  ⚠ 空回复退化 → 跳过策略梯度")
+        elif degenerate:
+            print(f"  ⚠ 退化 (得分 {score:+.2f} < {args.min_reward}) → 跳过策略梯度, 仅 KL/EOS 静默")
 
+        step_agent_rl(
+            agent_m, opt_m, ref_model, tok, prompt_turn, reply_ids, eos_id,
+            mem_m, reward, degenerate=degenerate, beta_kl=args.beta_kl, device=device
+        )
+
+        print(f"{label} [第 {turn:2d} 轮 | 得分 {score:+.2f} | R={reward:+.2f}]:")
+        print(f"   \"{reply_text}\"\n")
+
+        # 抗坍缩续言: 说话方退化(空/<eos>)时不再把它当下一轮输入, 换成新开场白, 避免坍缩在自对话里滚雪球
+        if degenerate and not reply_text.strip():
+            current_msg = random.choice(STARTER_TOPICS)
+        else:
             current_msg = reply_text
+
+        if current_speaker == "A":
+            mem_state_a = mem_m
+            current_speaker = "B"
+        else:
+            mem_state_b = mem_m
             current_speaker = "A"
 
         time.sleep(0.3)

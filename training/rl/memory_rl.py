@@ -197,7 +197,8 @@ def get_turn_logprobs_with_state(model, prompt_ids, reply_ids, eos_id, resume_st
 
     log_probs = F.log_softmax(logits, dim=-1)
     target_lp = log_probs.gather(2, y.unsqueeze(-1)).squeeze(-1).squeeze(0)
-    reply_lp = target_lp[prompt_len-1 : prompt_len-1+reply_len]
+    # 只对生成区域 (回复区域) 计算 Loss —— 起点是 prompt_len (第 0 个回复 token)
+    reply_lp = target_lp[prompt_len : prompt_len+reply_len]
 
     # EOS 静默范数
     quiet_loss = torch.tensor(0.0, device=device)
@@ -218,7 +219,7 @@ def main():
     ap.add_argument("--group_size", type=int, default=4, help="第2轮候选采样数 G")
     ap.add_argument("--lr", type=float, default=3e-5, help="学习率")
     ap.add_argument("--tau", type=float, default=1.5, help="指数奖励温度")
-    ap.add_argument("--beta_kl", type=float, default=0.03, help="KL 散度系数")
+    ap.add_argument("--beta_kl", type=float, default=0.4, help="KL 散度系数 (需足够强, 防策略漂移坍缩)")
     ap.add_argument("--lambda_quiet", type=float, default=0.02, help="EOS 静默系数")
     args = ap.parse_args()
 
@@ -277,6 +278,13 @@ def main():
         std_r = rewards_t.std() + 1e-6
         advantages = (rewards_t - mean_r) / std_r
 
+        # ── 抗坍缩门: 整组退化时跳过策略梯度 ──
+        # 组内最佳候选原始分 < 0 说明本组没有一个像样的召回/回答 (多为空 <eos>/乱码)，
+        # 组内归一化会把"最不烂的垃圾"当正样本反着强化。此时只保留 KL+静默, 等采样回到正常区。
+        degenerate = bool(max(raw_scores) < 0)
+        if degenerate:
+            print(f"  ⚠ 组退化 (组最高分 {max(raw_scores):6.2f} < 0) → 跳过策略梯度, 仅 KL/EOS 静默")
+
         # ── 步骤 4: 策略梯度反向更新（倒逼记忆通道） ──
         model.train()
         optimizer.zero_grad()
@@ -288,7 +296,7 @@ def main():
                 continue
             adv = advantages[i]
 
-            curr_lp, quiet_l = get_logprobs_and_quiet = get_turn_logprobs_with_state(
+            curr_lp, quiet_l = get_turn_logprobs_with_state(
                 model, turn2_ids, reply_ids, eos_id, mem_state_turn1, device
             )
 
@@ -298,7 +306,10 @@ def main():
                 )
 
             # 策略梯度：如果借助 M 成功召回目标，加大该记忆通路的写入与读取权重！
-            pol_loss = -adv * curr_lp.sum()
+            if degenerate:
+                pol_loss = torch.tensor(0.0, device=device)
+            else:
+                pol_loss = -adv * curr_lp.sum()
             kl_loss = F.kl_div(curr_lp, ref_lp, log_target=True, reduction='sum')
             cand_loss = (pol_loss + args.beta_kl * kl_loss + args.lambda_quiet * quiet_l) / args.group_size
             cand_loss.backward()

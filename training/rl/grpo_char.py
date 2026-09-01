@@ -101,13 +101,35 @@ def exponential_reward_shaping(score, tau=1.5):
     sign = 1.0 if score >= 0 else -1.0
     return sign * (math.exp(abs(score) / tau) - 1.0)
 
+
+def log_reward_shaping(score, c=4.0):
+    """对数压缩奖励塑形：R = sign(s) * log1p(|s| / c)  (替代指数, 缓解 -300 爆炸)
+    
+    指数塑形 R=sign*(exp(|s|/tau)-1) 在 |s| 大时趋近无穷 → 单条烂样本(乱码/超大负分)
+    可炸出 R≈-300, 再被组内 std 归一化彻底放大, 压垮同组正常候选的优势。
+    对数压缩把 |s| 的边际增益压成 O(1/|s|): 高分区间梯度平缓, 不再无界爆炸。
+    系数 c 控制压缩强度: c 越小压缩越强(更平), 越大越接近线性。
+    """
+    sign = 1.0 if score >= 0 else -1.0
+    return sign * math.log1p(abs(score) / c)
+
+
+def reward_shaping(score, shape="exp", tau=1.5, c=4.0):
+    """按 --shape 分派奖励塑形形态 (统一入口)"""
+    if shape == "log":
+        return log_reward_shaping(score, c=c)
+    elif shape == "tanh":
+        return math.tanh(score / c) * c  # 有界到 ±c, 避免任何爆炸
+    else:
+        return exponential_reward_shaping(score, tau=tau)
+
 # -----------------------------------------------------------------------------
 # 高性能全并行向量化组采样 (Vectorized Group Batch Sampling)
 # -----------------------------------------------------------------------------
 
 @torch.no_grad()
 def sample_candidates_batch(model, tok, prompt_ids, eos_id, group_size=4,
-                            max_new_tokens=55, temperature=0.85, top_k=200, repeat_penalty=1.2, device='cuda'):
+                            max_new_tokens=55, temperature=1.0, top_k=200, repeat_penalty=1.4, device='cuda'):
     """组内 G 个候选回复全并行 GPU 批处理采样 (速度提升 3~5 倍)"""
     prompt_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
     prompt_len = len(prompt_ids)
@@ -184,8 +206,20 @@ def main():
     ap.add_argument("--group_size", type=int, default=4, help="每 Prompt 并行采样数 G")
     ap.add_argument("--lr", type=float, default=2e-5, help="RL 学习率 (较小学习率防策略坍缩)")
     ap.add_argument("--tau", type=float, default=1.5, help="指数奖励塑形温度")
-    ap.add_argument("--beta_kl", type=float, default=0.04, help="SFT 基座 KL 散度惩罚系数")
+    ap.add_argument("--beta_kl", type=float, default=0.4, help="SFT 基座 KL 散度惩罚系数 (需足够强, 防策略漂移坍缩)")
     ap.add_argument("--lambda_quiet", type=float, default=0.02, help="EOS 神经元静默损失权重")
+    ap.add_argument("--temperature", type=float, default=1.0, help="采样温度 (防模式坍缩需偏高)")
+    ap.add_argument("--repeat_penalty", type=float, default=1.4, help="repeat penalty (压固定短语回环)")
+    ap.add_argument("--div_weight", type=float, default=1.5,
+                    help="组内多样性惩罚权重: 候选与组内其他候选 n-gram 重叠越高扣分越多, "
+                         "打破'单一短语滚雪球'式模式坍缩 (0=关闭)")
+    ap.add_argument("--winsorize", type=float, default=3.0,
+                    help="组内优势 winsorize 裁剪: 以 median±k*MAD 收窄极端异常样本(乱码/超大负分), "
+                         "防止单候选炸裂 std 归一化 (0=关闭)")
+    ap.add_argument("--dyn_tau", action="store_true",
+                    help="动态 tau: 用组内 exp 奖励的尺度 EMA 自适应缩放指数塑形温度, 防止尺度漂移")
+    ap.add_argument("--shape", default="tanh", choices=["exp", "log", "tanh"],
+                    help="奖励塑形形态: tanh(默认,有界防-300爆炸) / exp(指数,拉大头部分差) / log(对数压缩)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -226,8 +260,17 @@ def main():
     print(f"  提示词池: {len(pool)} 条 (涵盖 身份认知、旅行向往、日常心情、启发探索、科学常识)")
     print("=" * 65)
 
+    # 动态 tau: EMA 跟踪组内 raw_score 绝对尺度, 缩放指数塑形温度, 防尺度漂移
+    # 当奖励幅度整体偏低(如退化期), 缩小 tau 让正负对比更锐利; 偏高时放大 tau 防爆炸。
+    ema_abs_scale = 1.0  # 起点 = 组内 raw_s 绝对值的平滑
+    dyn_tau_ema = 0.9    # EMA 系数
+
     for step in range(1, args.steps + 1):
         prompt_text, kind, keywords = random.choice(pool)
+        # 朝"无标签自然对话"渐进: 73% 概率带 用户：/模型： 标签, 27% 概率裸 prompt
+        # (标签给模型稳定的对话锚点, 裸 prompt 训练泛化到无前缀自然输入)
+        if random.random() >= 0.27:
+            prompt_text = f"用户：{prompt_text}\n模型："
         prompt_ids = tok.encode(prompt_text).ids
 
         # 1. 对该 Prompt 全并行采样 G 个候选回复
@@ -237,21 +280,80 @@ def main():
         exp_rewards = []
 
         batch_reply_ids = sample_candidates_batch(
-            model, tok, prompt_ids, eos_id, group_size=args.group_size, max_new_tokens=55, device=device
+            model, tok, prompt_ids, eos_id, group_size=args.group_size, max_new_tokens=55,
+            temperature=args.temperature, top_k=200, repeat_penalty=args.repeat_penalty, device=device
         )
 
+        # 先收集全部候选与原始分
+        candidates = []
+        raw_scores = []
         for reply_ids in batch_reply_ids:
-            reply_text = tok.decode(reply_ids)
+            reply_text = tok.decode(reply_ids).replace("<eos>", "").strip()
             score = compute_raw_reward(prompt_text, reply_text, reply_ids, eos_id, kind, keywords)
-            exp_r = exponential_reward_shaping(score, tau=args.tau)
             candidates.append((reply_ids, reply_text))
             raw_scores.append(score)
-            exp_rewards.append(exp_r)
-        # 2. 计算组相对优势 (Group Relative Advantages)
+
+        # 动态 tau: 用本组 raw_scores 的绝对均值更新 EMA 尺度, 据此缩放 tau
+        if args.dyn_tau:
+            import numpy as _np
+            batch_abs = float(_np.mean([abs(s) for s in raw_scores])) if raw_scores else 1.0
+            ema_abs_scale = dyn_tau_ema * ema_abs_scale + (1.0 - dyn_tau_ema) * max(batch_abs, 0.2)
+            # 尺度越大 tau 越大(更平缓), 尺度越小 tau 越小(对比更锐利); 以 1.0 为参考基线
+            tau_eff = args.tau * max(0.7, min(1.4, ema_abs_scale / 1.0))
+        else:
+            tau_eff = args.tau
+
+        # 组内多样性惩罚 (Anti-Mode-Collapse): 候选与组内"最像的其他候选"重叠越多扣分越多。
+        # 作用: 当某一短语在组内重复出现(模式坍缩雪球期), 它的相对优势被压下去,
+        #       反而鼓励组内其他"不同但还行"的表达 → 打破"单一短语越滚越大"的正反馈。
+        # 注意: 全组同分时 std≈0 → advantage≈0 已天然防更新; 这里解决的是"主流短语
+        #       混杂在多样候选里、持续拿正优势"的阶段。
+        exp_rewards = []
+        if args.div_weight > 0:
+            from training.rl.multi_reward import _ngram_set
+            ngrams = [_ngram_set(t.strip()) for _, t in candidates]
+            for i in range(len(candidates)):
+                a = ngrams[i]
+                best_overlap = 0.0
+                for j in range(len(candidates)):
+                    if j == i:
+                        continue
+                    b = ngrams[j]
+                    if not a or not b:
+                        continue
+                    inter = len(a & b)
+                    overlap = 2.0 * inter / (len(a) + len(b))
+                    best_overlap = max(best_overlap, overlap)
+                # 重叠越高扣分越多; 权重 1.5, 完全重复(~1.0)扣 ~1.5
+                penalty = args.div_weight * best_overlap
+                exp_rewards.append(reward_shaping(raw_scores[i] - penalty, shape=args.shape, tau=tau_eff, c=4.0))
+        else:
+            exp_rewards = [reward_shaping(s, shape=args.shape, tau=tau_eff, c=4.0) for s in raw_scores]
+        # 2. 计算组相对优势 (Group Relative Advantages) —— 鲁棒化 (winsorize 裁剪)
+        # 指数塑形对极端烂样本(乱码/超大负分)会爆炸出 R≈-300; 组内 std 归一化会被单
+        # 个异常值彻底炸裂, 让同组其余正常候选的优势全部失真。先在组内对 exp_rewards
+        # 做 winsorize 裁剪 (以组内 median ± k*MAD 收窄), 再去 std 归一化。
         rewards_t = torch.tensor(exp_rewards, dtype=torch.float32, device=device)
-        mean_r = rewards_t.mean()
-        std_r = rewards_t.std() + 1e-6
-        advantages = (rewards_t - mean_r) / std_r
+        if args.winsorize > 0 and rewards_t.numel() >= 3:
+            med = torch.median(rewards_t)
+            mad = (rewards_t - med).abs().median() + 1e-6
+            lo = med - args.winsorize * mad
+            hi = med + args.winsorize * mad
+            clipped = rewards_t.clamp(lo, hi)
+        else:
+            clipped = rewards_t
+        mean_r = clipped.mean()
+        std_r = clipped.std() + 1e-6
+        advantages = (clipped - mean_r) / std_r
+
+        # 3. 整组退化保护 (Anti-Collapse Gate)
+        # 用"组内最高原始分"判断 (scale 无关, 不受奖励塑形尺度影响)：
+        # 若整组最佳候选的原始分都 < 0, 说明本组没有任何像样的回答 (空回复/<eos>/乱码扎堆)。
+        # 此时组内归一化会把"最不烂的垃圾"当正样本, 反着强化坍缩方向。
+        # 因此跳过策略梯度, 只保留 KL(拉回基座) + EOS 静默, 等下次采样回到正常区。
+        degenerate = bool(max(raw_scores) < 0)
+        if degenerate:
+            print(f"  ⚠ 组退化 (组最高分 {max(raw_scores):6.2f} < 0) → 跳过策略梯度, 仅 KL/EOS 静默")
 
         # 3. 计算策略梯度 + KL 惩罚 + EOS 神经元静默损失
         model.train()
@@ -275,15 +377,17 @@ def main():
             with torch.no_grad():
                 ref_logprobs, _ = get_token_logprobs_and_hidden(ref_model, full_ids, device)
 
-            # 只对生成区域 (回复区域) 计算 Loss
-            curr_reply_lp = curr_logprobs[prompt_len-1 : prompt_len-1+reply_len]
-            ref_reply_lp = ref_logprobs[prompt_len-1 : prompt_len-1+reply_len]
+            # 只对生成区域 (回复区域) 计算 Loss —— 注意起点是 prompt_len (第 0 个回复 token)
+            curr_reply_lp = curr_logprobs[prompt_len : prompt_len+reply_len]
+            ref_reply_lp = ref_logprobs[prompt_len : prompt_len+reply_len]
 
-            # 策略梯度损失 (优势加权)
-            # adv > 0 鼓励该回答生成概率上升，adv < 0 压低
-            policy_loss = -adv * curr_reply_lp.sum()
+            # 策略梯度损失 (优势加权; 整组退化时跳过, 避免反着强化垃圾)
+            if degenerate:
+                policy_loss = torch.tensor(0.0, device=device)
+            else:
+                policy_loss = -adv * curr_reply_lp.sum()
 
-            # KL 散度约束 (防策略漂移坍缩)
+            # KL 散度约束 (防策略漂移坍缩) —— 退化时这条是拉回基座的主力
             kl = F.kl_div(curr_reply_lp, ref_reply_lp, log_target=True, reduction='sum')
 
             # 终止符 EOS 静默约束 (L1 能量惩罚)

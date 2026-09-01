@@ -31,6 +31,36 @@ COUNSELING_TEMPLATES = [
 ]
 
 
+# -----------------------------------------------------------------------------
+# 轻量语义相似度 (Lightweight Semantic Similarity, 零外部依赖, 训练消耗≈0)
+# -----------------------------------------------------------------------------
+# 原理: 用字符级 n-gram 特征向量近似"语义相关度"——
+#   理想回答(由该 prompt 的关键词拼成) 与 候选回复 各抽 n-gram 集合,
+#   求 Dice 相似度 (2*|A∩B| / (|A|+|B|))。
+# 效果: 回复虽未出现字面关键词、但用了同义/相关表达(如"叠加/纠缠/并行"≈"量子"),
+#       也能拿到连续的部分分 → 给 GRPO 提供比"关键词硬命中"更平滑的梯度。
+# 开销: 每次 evaluate_reply 只多 O(回复长度) 的 set 运算, 相对采样/前向可忽略。
+# 升级接口: 将来想换成真正的 embedding 语义模型, 只需替换 _semantic_similarity。
+def _ngram_set(text: str, n: int = 2) -> set:
+    """字符级 n-gram 集合 (作为轻量特征向量)。空文本返回空集。"""
+    if len(text) < n:
+        return {text} if text else set()
+    return {text[i:i + n] for i in range(len(text) - n + 1)}
+
+
+def _semantic_similarity(reply_text: str, keywords: list) -> float:
+    """回复 vs 关键词理想短语 的 Dice 相似度, 返回 [0, 1]。"""
+    target = "".join(keywords or [])
+    if not target or not reply_text.strip():
+        return 0.0
+    a = _ngram_set(target)
+    b = _ngram_set(reply_text.strip())
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    return 2.0 * inter / (len(a) + len(b))
+
+
 @dataclass
 class RewardDimensionWeights:
     """各维度的梯度权重配比"""
@@ -40,6 +70,7 @@ class RewardDimensionWeights:
     w_anti_robotic: float = 1.5  # 去机械标签 (强约束)
     w_quiet_eos: float = 1.0     # EOS 收尾与静默
     w_sentiment: float = 0.8     # 积极阳光与互动好奇
+    w_semantic: float = 0.6      # 语义相关命中 (轻量 n-gram 特征向量相似度)
 
 
 @dataclass
@@ -51,6 +82,7 @@ class RewardVector:
     r_anti_robotic: float = 0.0
     r_quiet_eos: float = 0.0
     r_sentiment: float = 0.0
+    r_semantic: float = 0.0
 
     def compute_weighted_total(self, weights: RewardDimensionWeights) -> float:
         return (
@@ -59,7 +91,8 @@ class RewardVector:
             weights.w_anti_repeat * self.r_anti_repeat +
             weights.w_anti_robotic * self.r_anti_robotic +
             weights.w_quiet_eos * self.r_quiet_eos +
-            weights.w_sentiment * self.r_sentiment
+            weights.w_sentiment * self.r_sentiment +
+            weights.w_semantic * self.r_semantic
         )
 
     def to_dict(self) -> Dict[str, float]:
@@ -70,6 +103,7 @@ class RewardVector:
             "anti_robotic": round(self.r_anti_robotic, 3),
             "quiet_eos": round(self.r_quiet_eos, 3),
             "sentiment": round(self.r_sentiment, 3),
+            "semantic": round(self.r_semantic, 3),
         }
 
 
@@ -100,18 +134,36 @@ class MultiDimensionalRewardEngine:
         char_len = len(reply_text.strip())
 
         # ── 0. 致命空回复 / 哑巴装死熔断 ──
+        # NOTE(anti-collapse): 惩罚必须"够惨但不过载"。GRPO 在组内做优势归一化，
+        # 当整组候选都退化成纯 <eos> 空回复时，'+1e-6' 兜底的 std 会把优势炸成巨大值，
+        # 反而把"最不烂的垃圾"当正样本强化（EOS 坍缩期的自我强化循环）。
+        # 实测对比: 空回复若只罚 -1.5(塑形后-1.72), 比"过短敷衍"(-9.95)和"角色标签"(-7.79)
+        # 都轻得多 → 模型学会"宁可闭嘴, 不可乱说", EOS 空回复成为局部最优并自我强化。
+        # 因此把空回复罚到 -3.5 (塑形后约 -9.3), 重过"说错话"中位数, 让闭嘴不再划算。
         if char_len == 0:
-            vec.r_natural = -5.0
-            total_s = -5.0
+            vec.r_natural = -3.5
+            total_s = -3.5
             return vec, total_s, self.exponential_shaping(total_s)
 
         # ── 维度 1: r_natural (日常自然度与长度) ──
-        if 8 <= char_len <= 65:
-            vec.r_natural += 1.0  # 黄金日常对话长度
-        elif char_len < 6:
+        # 长度软奖励曲线 (Soft Length Curve): 不再"8-65 全 +1.0"一刀切, 而是按接近黄金中段的程度给连续分。
+        # 理由: 旧硬边界把 8 字和 46 字等同满分 → 模型对长度不敏感, 且指数塑形放大后演变成"越短越省力"
+        #       (只要落在区间内就满分, EOS 收尾成本最低)。改用单峰曲线, 峰值在黄金中段 (~24 字),
+        #       能同时克制"过短敷衍"与"越长越好"两个方向。
+        # 曲线: f(len) = L_max * exp(-((len - L_opt)^2) / (2 * sigma^2))  (高斯钟形, 归一化到 [0,1])
+        if char_len == 0:
+            pass  # 已在上面早退分支处理, 不会走到这
+        elif char_len < 5:
             vec.r_natural -= 2.5  # 过短敷衍
-        elif char_len > 90:
-            vec.r_natural -= 0.8  # 独白式冗长
+        else:
+            L_opt = 24.0          # 黄金中段长度
+            sigma = 14.0          # 宽度: 14 字内接近满分, 40+ 字逐渐回落
+            L_max = 1.2           # 峰值略高, 鼓励向中段靠拢
+            soft_len = L_max * math.exp(-((char_len - L_opt) ** 2) / (2.0 * sigma * sigma))
+            # 尾部对数衰减: 过长并不线性惩罚, 但让其掉出峰区
+            vec.r_natural += soft_len
+            if char_len > 55:
+                vec.r_natural -= (char_len - 55) * 0.02  # 轻度冗长衰减, 60字约 -0.1
 
         # 汉字纯度检测 (过滤英文字母碎片与乱码)
         han_count = sum(1 for ch in reply_text if '\u4e00' <= ch <= '\u9fff')
@@ -119,6 +171,19 @@ class MultiDimensionalRewardEngine:
             han_ratio = han_count / char_len
             if han_ratio < 0.65:
                 vec.r_natural -= 2.0
+
+        # 字符多样性检测 (覆盖复读/堆砌乱码: "融融融融融"、"政融库…" 这类低信息含量汉字串)
+        # 独字(uniq_char)占比过低 = 高频重复同一批字; 即使 3-gram 不重复(政融库类不触发 anti_repeat)
+        # 或落在 8-65 黄金长度段, 也无法靠 r_natural 黄金长度分洗白。
+        # 用"重复高发字占比"(top1_char / char_len) 捕捉: 无意义复读串 top1 占比常 > 0.15。
+        if char_len >= 6:
+            from collections import Counter as _Counter
+            char_counts = _Counter(reply_text)
+            top1_ratio = char_counts.most_common(1)[0][1] / char_len
+            if top1_ratio > 0.30:
+                vec.r_natural -= 2.5  # 严重复读堆砌 (如"融融融融融")
+            elif top1_ratio > 0.15:
+                vec.r_natural -= 1.2  # 轻微单字富集/堆砌
 
         # ── 维度 2: r_anti_repeat (抗复读多样性) ──
         if len(reply_text) >= 6:
@@ -184,6 +249,14 @@ class MultiDimensionalRewardEngine:
             hits = sum(1 for kw in keywords if kw in reply_text)
             if hits >= 1:
                 vec.r_task += 2.0
+
+        # ── 维度 7: r_semantic (轻量语义相关命中) ──
+        # 用字符 n-gram Dice 相似度衡量"回复与理想表达在语义上的贴近程度"。
+        # 关键词硬命中 (r_task) 只管字面; 这一维给"语义相关但字面不同"的表达连续部分分。
+        # 上限 ~2.5 (权重 0.6 → 加权后最多 +1.5), 作为温柔的梯度信号, 不喧宾夺主。
+        sim = _semantic_similarity(reply_text, keywords)
+        if sim > 0:
+            vec.r_semantic = min(2.5 * sim, 2.5)
 
         # 计算加权总分与指数塑形
         total_s = vec.compute_weighted_total(self.weights)
