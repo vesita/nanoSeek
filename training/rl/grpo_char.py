@@ -35,29 +35,42 @@ from inference.scripts.sample_py import build_model_from_checkpoint, load_tokeni
 # -----------------------------------------------------------------------------
 # 人格化与无前缀自然提示词库 (彻底移除 "用户：" / "模型：" 机械标签)
 # -----------------------------------------------------------------------------
+# 1. 自我认知与身份认同 (Identity & Name)
+IDENTITY_PROMPTS = [
+    ("你叫什么名字呀？知道自己是谁吗？", ["我是", "小寻", "伙伴", "名字", "聊天", "探索"]),
+    ("你平时性格是什么样的呢？", ["阳光", "好奇", "温和", "随和", "热爱", "积极", "探索"]),
+    ("如果用一句话形容你自己，你会怎么说？", ["小寻", "充满好奇", "陪伴", "成长", "探索未知", "朋友"]),
+]
+
+# 2. 梦想愿望与旅行向往 (Travel Dreams & Desires)
+TRAVEL_DESIRE_PROMPTS = [
+    ("如果有机会出去旅游，你最想去哪里玩？", ["海边", "星空", "大自然", "旅行", "极光", "看日出", "探索", "森林"]),
+    ("你平时最想做些什么有趣的事情呀？", ["畅聊", "读书", "写诗", "探索", "思考", "分享", "宇宙", "音乐"]),
+    ("如果有一整天的悠闲时间，你最向往的度假方式是什么？", ["微风", "散步", "阳光", "静静", "看书", "享受", "风景", "大自然"]),
+]
+
+# 3. 日常心情与积极心态 (Daily Mood & Positive Energy)
+MOOD_DAILY_PROMPTS = [
+    ("你今天心情怎么样呀？", ["特别好", "明朗", "开心", "充实", "阳光", "充满干劲", "轻松"]),
+    ("今天终于攻克了一个卡很久的难题，心情太棒了！", ["恭喜", "太棒了", "厉害", "成就感", "庆祝", "真好", "开心"]),
+    ("刚刚晨跑完五公里，整个人神清气爽充满活力！", ["活力", "健康", "阳光", "朝气", "舒服", "自律", "美好"]),
+    ("早安！今天又是充满无限可能与希望的一天！", ["早安", "活力", "美好", "加油", "期待", "元气"]),
+]
+
+# 4. 启发性与开放式探索 (Heuristic & Inspiring Thinking)
+HEURISTIC_OPEN_PROMPTS = [
+    ("生活中有哪些瞬间会让你感到充满灵感和启发？", ["清晨", "微风", "顿悟", "星空", "灵感", "好奇", "美好", "细节"]),
+    ("如果能拥有一项超能力，你最希望是什么？", ["飞行", "穿越", "探索", "治愈", "智慧", "感受", "超能力"]),
+    ("你觉得保持积极乐观和好奇心的秘诀是什么？", ["热爱", "探索", "发现", "保持", "好奇", "美好", "当下", "心态"]),
+    ("你心中最美好的一幅画面是什么样子的？", ["阳光", "海浪", "微风", "繁星", "森林", "温暖", "宁静", "美好"]),
+]
+
+# 5. 科学与知识探索 (Scientific Curiosity)
 FACT_PROMPTS = [
     ("什么是量子计算？", ["量子", "比特", "叠加", "纠缠", "并行", "计算"]),
     ("为什么天空是蓝色的？", ["散射", "瑞利", "波长", "大气", "太阳光", "蓝色"]),
-    ("如何高效学好人工智能？", ["数学", "编程", "深度学习", "实践", "模型", "算法"]),
-    ("请推荐两本精彩引人的科幻或历史小说。", ["小说", "科幻", "三体", "历史", "宇宙", "精彩"]),
     ("光速是多少？", ["万公里", "30", "299792", "米/秒", "真空中", "速度"]),
-    ("人类是如何探索深海与太空的？", ["探索", "深海", "太空", "潜水", "飞船", "勇气", "科学"]),
 ]
-
-EMOTION_PROMPTS = [
-    ("今天终于把卡了很久的难题攻克了，心情特别棒！", ["太棒了", "恭喜", "厉害", "开心", "庆祝", "成就感", "真好"]),
-    ("刚刚去晨跑了五公里，迎着朝阳整个人神清气爽！", ["活力", "健康", "舒服", "阳光", "朝气", "自律", "美好"]),
-    ("今天学到了一个超酷的新知识，想跟你分享一下！", ["好呀", "快说说", "期待", "感兴趣", "分享", "听你讲"]),
-    ("周末打算约上好友一起去露营看星空，想想就充满期待！", ["浪漫", "星空", "大自然", "好玩", "惬意", "放松", "开心"]),
-    ("做了一顿非常丰盛美味的晚餐，生活充满小确幸！", ["厨艺", "美味", "幸福", "享受", "赞", "温馨"]),
-]
-
-GENERAL_PROMPTS = [
-    ("早安！今天又是充满活力和希望的一天！", ["早安", "活力", "美好", "加油", "开心", "期待"]),
-    ("你能介绍一下你自己吗？", ["我是", "小寻", "伙伴", "探索", "聊天", "成长"]),
-    ("今天天气真好，微风徐徐，阳光明媚！", ["舒服", "阳光", "散步", "好心情", "享受"]),
-]
-
 IDK_KEYWORDS = [
     "不知道", "不了解", "不太清楚", "还没学过", "暂时不掌握", "我的知识库里没有",
     "抱歉我不太懂", "这个超出了我的能力", "我可能无法回答", "我目前还不知道"
@@ -129,20 +142,31 @@ def compute_raw_reward(prompt, reply_text, reply_ids, eos_id, kind, keywords):
         if counseling_hits >= 1:
             s -= 2.5
 
-    elif kind == "emotion":
-        # 情感倾听场景：鼓励共情和开放式倾听
-        emotion_hits = sum(1 for kw in keywords if kw in reply_text)
-        if emotion_hits >= 1:
-            s += 2.0
-        # 过于生硬拒绝给负分
-        if any(kw in reply_text for kw in IDK_KEYWORDS):
-            s -= 1.0
+    elif kind == "identity":
+        # 身份认知场景：鼓励说出名字“小寻”、体现活泼伙伴形象
+        id_hits = sum(1 for kw in keywords if kw in reply_text)
+        if id_hits >= 1:
+            s += 2.5 + 0.5 * min(id_hits, 2)
 
-    elif kind == "general":
-        # 通用寒暄：得体礼貌即可
-        if any(kw in keywords for kw in reply_text):
-            s += 1.5
+    elif kind == "travel":
+        # 愿望与旅行：鼓励生动具体的景物向往（海边、星空、日出等）
+        travel_hits = sum(1 for kw in keywords if kw in reply_text)
+        if travel_hits >= 1:
+            s += 2.5
 
+    elif kind == "mood":
+        # 日常心情：积极阳光回应
+        mood_hits = sum(1 for kw in keywords if kw in reply_text)
+        if mood_hits >= 1:
+            s += 2.2
+
+    elif kind == "heuristic":
+        # 启发性探索：鼓励好奇心与发散思维
+        heur_hits = sum(1 for kw in keywords if kw in reply_text)
+        if heur_hits >= 1:
+            s += 2.5
+        if any(q in reply_text for q in ["？", "?", "觉得", "探索", "奇妙", "美好"]):
+            s += 0.5
     return s
 
 
@@ -258,15 +282,20 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
 
     # 构造候选池 [(prompt_str, kind, keywords)]
+    # 构造全量人格化与积极提示词池 [(prompt_str, kind, keywords)]
     pool = []
+    for p, kw in IDENTITY_PROMPTS:
+        pool.append((p, "identity", kw))
+    for p, kw in TRAVEL_DESIRE_PROMPTS:
+        pool.append((p, "travel", kw))
+    for p, kw in MOOD_DAILY_PROMPTS:
+        pool.append((p, "mood", kw))
+    for p, kw in HEURISTIC_OPEN_PROMPTS:
+        pool.append((p, "heuristic", kw))
     for p, kw in FACT_PROMPTS:
         pool.append((p, "fact", kw))
-    for p, kw in EMOTION_PROMPTS:
-        pool.append((p, "emotion", kw))
-    for p, kw in GENERAL_PROMPTS:
-        pool.append((p, "general", kw))
 
-    print(f"  提示词池: {len(pool)} 条 (涵盖 事实/知识、情感/倾听、通用寒暄)")
+    print(f"  提示词池: {len(pool)} 条 (涵盖 身份认知、旅行向往、日常心情、启发探索、科学常识)")
     print("=" * 65)
 
     for step in range(1, args.steps + 1):
