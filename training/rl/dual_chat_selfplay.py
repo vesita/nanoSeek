@@ -58,23 +58,30 @@ def exponential_reward(score, tau=1.5):
 
 def evaluate_conversational_turn(speaker_text, speaker_ids, eos_id, listener_last_msg):
     """质检打分器：评估本轮回答在对话流中的质量"""
-    s = 0.0
     char_len = len(speaker_text.strip())
+    
+    # 0. 彻底杜绝空回复 / 哑巴装死作弊
+    if char_len == 0:
+        return -5.0
 
-    # 1. 命中 <eos>
+    s = 0.0
+
+    # 1. 命中 <eos> 且具有实际对话内容
     if eos_id in speaker_ids:
-        s += 1.0
+        if char_len >= 6:
+            s += 1.0
+        else:
+            s -= 2.0  # 没说几个字提前掐断
     else:
-        s -= 0.5
+        s -= 0.8
 
     # 2. 长度控制（对话单句最忌又长又臭）
     if 8 <= char_len <= 65:
         s += 0.8  # 对话黄金长度
-    elif char_len < 4:
-        s -= 1.0  # 过于敷衍
+    elif char_len < 6:
+        s -= 2.0  # 过于敷衍/过短
     elif char_len > 90:
         s -= 0.6  # 独白式啰嗦
-
     # 3. 中文字符与无乱码
     han_count = sum(1 for ch in speaker_text if '\u4e00' <= ch <= '\u9fff')
     if char_len > 0:

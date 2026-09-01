@@ -92,21 +92,30 @@ def exponential_reward(score, tau=1.5):
 
 def evaluate_memory_reply(reply_text, reply_ids, eos_id, expected_keywords):
     """对单句记忆召回回答进行打分"""
-    s = 0.0
     char_len = len(reply_text.strip())
+    
+    # 0. 彻底杜绝空回复 / 哑巴装死作弊
+    if char_len == 0:
+        return -5.0
 
-    # 1. 命中 <eos>
+    s = 0.0
+
+    # 1. 命中 <eos> 且长度合理
     if eos_id in reply_ids:
-        s += 1.0
+        if char_len >= 5:
+            s += 1.0
+        else:
+            s -= 2.0
     else:
-        s -= 0.5
+        s -= 0.8
 
     # 2. 长度合理（召回回答应当简短精准）
-    if 5 <= char_len <= 50:
-        s += 0.5
+    if 6 <= char_len <= 50:
+        s += 0.8
+    elif char_len < 6:
+        s -= 2.0  # 过于短小敷衍
     elif char_len > 80:
         s -= 0.5  # 啰嗦拖沓
-
     # 3. 核心记忆召回奖励 (最关键项)
     hits = sum(1 for kw in expected_keywords if kw in reply_text)
     if hits >= 2:

@@ -89,23 +89,30 @@ ROBOTIC_TAGS = ["用户", "模型", "user", "assistant", "system", "Human:", "As
 
 def compute_raw_reward(prompt, reply_text, reply_ids, eos_id, kind, keywords):
     """计算单条回答的基础奖励得分 s (未经过指数塑形)"""
+    char_len = len(reply_text.strip())
+    
+    # 0. 彻底杜绝空回复 / 哑巴装死作弊 (Silence Collapse Penalty)
+    if char_len == 0:
+        return -5.0
+
     s = 0.0
     
-    # 1. 基础格式与收尾奖励
+    # 1. 基础格式与收尾奖励 (只有在产出有意义内容的前提下才奖励收尾)
     hit_eos = (eos_id in reply_ids)
     if hit_eos:
-        s += 1.0  # 命中终止符
+        if char_len >= 6:
+            s += 1.0  # 正常表达并利落收尾
+        else:
+            s -= 2.0  # 没说几个字就提前掐断
     else:
-        s -= 0.5  # 跑满长度未主动终止惩罚
+        s -= 0.8  # 跑满长度未主动终止
         
-    char_len = len(reply_text.strip())
-    if 10 <= char_len <= 80:
-        s += 0.5  # 长度黄金区间
-    elif char_len < 5:
-        s -= 1.0  # 过于敷衍/过短
+    if 8 <= char_len <= 80:
+        s += 0.8  # 黄金长度区间
+    elif char_len < 6:
+        s -= 2.0  # 过于敷衍/过短
     elif char_len > 120:
-        s -= 0.3  # 啰嗦
-
+        s -= 0.5  # 啰嗦
     # 中文字符占比检测（防英文/乱码碎片）
     han_count = sum(1 for ch in reply_text if '\u4e00' <= ch <= '\u9fff')
     if char_len > 0:

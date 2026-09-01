@@ -29,28 +29,28 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 CURRICULUM_STAGES = [
-    # Phase 1: 语言纯度与 EOS 收尾 (1-300 轮)
-    {"stage": 1, "rounds": 100, "phase": 1, "task": "grpo", "lr": "2e-5", "desc": "基础表达去模板化与 EOS 静默强化"},
-    {"stage": 2, "rounds": 100, "phase": 1, "task": "grpo", "lr": "2e-5", "desc": "常识百科与精准问答去冗余强化"},
-    {"stage": 3, "rounds": 100, "phase": 1, "task": "grpo", "lr": "1.5e-5", "desc": "短句自然度与 3-gram 重复率压制"},
+    # Phase 1: 日常自然对话去机械化与 EOS 收尾 (1-300 轮)
+    {"stage": 1, "rounds": 100, "phase": 1, "task": "grpo", "lr": "2e-5", "desc": "日常阳光问候、心情交流与去机械标签强化"},
+    {"stage": 2, "rounds": 100, "phase": 1, "task": "grpo", "lr": "2e-5", "desc": "日常生活、周末计划与自然喜好表达强化"},
+    {"stage": 3, "rounds": 100, "phase": 1, "task": "grpo", "lr": "1.5e-5", "desc": "日常短句节奏、汉字纯度与 3-gram 重复率压制"},
 
-    # Phase 2: 逐句输入记忆倒逼强化 (301-700 轮)
-    {"stage": 4, "rounds": 100, "phase": 2, "task": "memory", "lr": "3e-5", "desc": "基础身份实体(姓名/城市/职业)单句跨轮召回"},
-    {"stage": 5, "rounds": 100, "phase": 2, "task": "memory", "lr": "3e-5", "desc": "用户个性化偏好与日常习惯跨轮记忆"},
-    {"stage": 6, "rounds": 100, "phase": 2, "task": "memory", "lr": "2e-5", "desc": "突发事件与上下文情绪长程留存"},
-    {"stage": 7, "rounds": 100, "phase": 2, "task": "memory", "lr": "2e-5", "desc": "复合实体联想与多跳信息单句检索"},
+    # Phase 2: 日常对话长程记忆与实体留存 (301-700 轮)
+    {"stage": 4, "rounds": 100, "phase": 2, "task": "memory", "lr": "3e-5", "desc": "朋友日常信息(姓名/城市/职业)单句跨轮记忆"},
+    {"stage": 5, "rounds": 100, "phase": 2, "task": "memory", "lr": "3e-5", "desc": "日常饮食、运动与喜好偏好跨轮长程留存"},
+    {"stage": 6, "rounds": 100, "phase": 2, "task": "memory", "lr": "2e-5", "desc": "日常生活趣事与成就事件跨轮回忆"},
+    {"stage": 7, "rounds": 100, "phase": 2, "task": "memory", "lr": "2e-5", "desc": "自发涌现命名与自我认同跨轮一致性验证"},
 
-    # Phase 3: 双模型自博弈与交替互训 (701-1200 轮)
-    {"stage": 8, "rounds": 100, "phase": 3, "task": "selfplay", "lr": "2e-5", "desc": "Alice vs Bob 日常生活主题交替对聊"},
-    {"stage": 9, "rounds": 100, "phase": 3, "task": "selfplay", "lr": "2e-5", "desc": "知识与技术探讨主题对抗质检与进化"},
-    {"stage": 10, "rounds": 100, "phase": 3, "task": "selfplay", "lr": "1.5e-5", "desc": "情感倾听与适度共情交替互动"},
-    {"stage": 11, "rounds": 100, "phase": 3, "task": "selfplay", "lr": "1.5e-5", "desc": "开放式辩论与逻辑澄清对聊"},
-    {"stage": 12, "rounds": 100, "phase": 3, "task": "selfplay", "lr": "1.2e-5", "desc": "自由主题长程自博弈与 Model Soup 融合"},
+    # Phase 3: 双模型日常生活交替自博弈 (701-1200 轮)
+    {"stage": 8, "rounds": 100, "phase": 3, "task": "selfplay", "lr": "2e-5", "desc": "双 Agent 日常生活、早安与闲聊交替对聊"},
+    {"stage": 9, "rounds": 100, "phase": 3, "task": "selfplay", "lr": "2e-5", "desc": "双 Agent 兴趣爱好、旅行与美食探索交替对聊"},
+    {"stage": 10, "rounds": 100, "phase": 3, "task": "selfplay", "lr": "1.5e-5", "desc": "双 Agent 温暖陪伴、倾听与积极互动对聊"},
+    {"stage": 11, "rounds": 100, "phase": 3, "task": "selfplay", "lr": "1.5e-5", "desc": "双 Agent 奇思妙想、科幻与灵感发散对聊"},
+    {"stage": 12, "rounds": 100, "phase": 3, "task": "selfplay", "lr": "1.2e-5", "desc": "自由日常长程自博弈与 Model Soup 认知融合"},
 
-    # Phase 4: 极限抗扰与全局收敛 (1201-1500 轮)
-    {"stage": 13, "rounds": 100, "phase": 4, "task": "selfplay", "lr": "1e-5", "desc": "跨领域生僻问题与抗偏题微调"},
-    {"stage": 14, "rounds": 100, "phase": 4, "task": "memory", "lr": "8e-6", "desc": "终极单句记忆鲁棒性退火"},
-    {"stage": 15, "rounds": 100, "phase": 4, "task": "grpo", "lr": "5e-6", "desc": "全场景小学习率平滑收敛封顶"},
+    # Phase 4: 全局鲁棒性与平滑收敛 (1201-1500 轮)
+    {"stage": 13, "rounds": 100, "phase": 4, "task": "selfplay", "lr": "1e-5", "desc": "开放式日常话题与抗偏题微调"},
+    {"stage": 14, "rounds": 100, "phase": 4, "task": "memory", "lr": "8e-6", "desc": "日常记忆终极退火与稳健固化"},
+    {"stage": 15, "rounds": 100, "phase": 4, "task": "grpo", "lr": "5e-6", "desc": "全场景极低学习率平滑收敛封顶"},
 ]
 
 
@@ -126,7 +126,7 @@ def main():
     ap = argparse.ArgumentParser(description="nanoSeek 1500 轮训练总控流水线")
     ap.add_argument("--stage", type=int, default=None, help="执行指定单阶段 (1-15)")
     ap.add_argument("--all", action="store_true", help="连续运行全部 15 个阶段 (1500 轮)")
-    ap.add_argument("--ckpt", default="out/rl_grpo_2epoch/best.pt", help="起始检查点")
+    ap.add_argument("--ckpt", default="out/eos_fix_1epoch/best.pt", help="起始检查点 (默认纯净 SFT 黄金节点)")
     ap.add_argument("--out", default="out/curriculum", help="归档总目录")
     args = ap.parse_args()
 
