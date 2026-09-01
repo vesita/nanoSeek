@@ -317,8 +317,9 @@ def main():
             print(f"  [记忆联想召回 Top1]: {best_reply[:60]}")
             print("─" * 65)
 
-    # 保存记忆强化模型
+    # 保存记忆强化模型 (强校验并自动创建父目录)
     ckpt_out = os.path.join(args.out, "best.pt")
+    os.makedirs(os.path.dirname(os.path.abspath(ckpt_out)), exist_ok=True)
     save_dict = deepcopy(ckpt)
     save_dict['model'] = model.state_dict()
     torch.save(save_dict, ckpt_out)

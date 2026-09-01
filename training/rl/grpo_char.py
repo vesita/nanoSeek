@@ -312,8 +312,9 @@ def main():
             print(f"  A (Top-1, raw_s={raw_scores[best_idx]:.2f}, exp_R={exp_rewards[best_idx]:.2f}): {best_reply[:60]}")
             print("─" * 65)
 
-    # 保存 RL 强化后模型
+    # 保存 RL 强化后模型 (强校验并自动创建父目录)
     ckpt_out = os.path.join(args.out, "best.pt")
+    os.makedirs(os.path.dirname(os.path.abspath(ckpt_out)), exist_ok=True)
     save_dict = deepcopy(ckpt)
     save_dict['model'] = model.state_dict()
     torch.save(save_dict, ckpt_out)

@@ -266,8 +266,8 @@ def main():
     save_dict = deepcopy(ckpt)
     save_dict['model'] = merged_state
     save_path = os.path.join(args.out, "best.pt")
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     torch.save(save_dict, save_path)
-    print("═" * 65)
     print(f"🎉 双模型 {args.rounds} 轮交替自博弈对话互训完成！")
     print(f"💾 共同进化权重已保存至: {save_path}")
 
