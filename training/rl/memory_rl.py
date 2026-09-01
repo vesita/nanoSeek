@@ -101,44 +101,77 @@ def evaluate_memory_reply(reply_text, reply_ids, eos_id, expected_keywords):
 
 @torch.no_grad()
 def sample_turn(model, tok, prompt_ids, eos_id, resume_state=None,
-                max_new_tokens=60, temperature=0.8, top_k=200, repeat_penalty=1.2, device='cuda'):
-    """单轮采样：支持注入外部 KV 记忆状态，并返回 (生成的 token 列表, 轮次末态记忆)"""
+                max_new_tokens=55, temperature=0.8, top_k=200, repeat_penalty=1.2, device='cuda'):
+    """单轮采样：支持注入外部 KV 记忆状态"""
     idx = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     prompt_len = len(prompt_ids)
     seen = list(prompt_ids)
-
     mem_state = resume_state
 
     for _ in range(max_new_tokens):
         idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
-        
         if mem_state is not None:
             model.set_memory_state(mem_state)
-            
         logits, _ = model(idx_cond)
         mem_state = model.get_memory_state()
-
         v = logits[:, -1, :].squeeze(0).clone() / temperature
-
         if repeat_penalty > 1.0 and seen:
             seen_t = torch.as_tensor(seen, dtype=torch.long, device=v.device)
             vs = v[seen_t]
             v[seen_t] = torch.where(vs >= 0, vs / repeat_penalty, vs * repeat_penalty)
-
         if top_k is not None:
             k = min(top_k, v.size(-1))
             topv, _ = torch.topk(v, k, dim=-1)
             v[v < topv[-1]] = -float("Inf")
-
         probs = F.softmax(v, dim=-1)
         nxt = torch.multinomial(probs, 1).item()
         seen.append(nxt)
         idx = torch.cat((idx, torch.tensor([[nxt]], dtype=torch.long, device=device)), dim=1)
-
         if nxt == eos_id:
             break
-
     return seen[prompt_len:], mem_state
+
+
+@torch.no_grad()
+def sample_candidates_batch(model, tok, prompt_ids, eos_id, resume_state=None, group_size=4,
+                            max_new_tokens=55, temperature=0.8, top_k=200, repeat_penalty=1.2, device='cuda'):
+    """组内 G 个候选样本全并行 GPU 批处理采样 (记忆注入版)"""
+    prompt_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+    prompt_len = len(prompt_ids)
+    idx = prompt_t.unsqueeze(0).expand(group_size, -1).clone()
+    finished = torch.zeros(group_size, dtype=torch.bool, device=device)
+
+    for _ in range(max_new_tokens):
+        idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
+        if resume_state is not None:
+            model.set_memory_state(resume_state)
+        logits, _ = model(idx_cond)
+        v = logits[:, -1, :].clone() / temperature
+
+        if repeat_penalty > 1.0:
+            seen_mask = torch.zeros_like(v, dtype=torch.bool)
+            seen_mask.scatter_(1, idx, True)
+            v = torch.where(seen_mask, torch.where(v >= 0, v / repeat_penalty, v * repeat_penalty), v)
+
+        if top_k is not None:
+            topv, _ = torch.topk(v, top_k, dim=-1)
+            v[v < topv[:, -1:]] = -float("Inf")
+
+        probs = F.softmax(v, dim=-1)
+        nxt = torch.multinomial(probs, 1)
+        nxt = torch.where(finished.unsqueeze(1), torch.full_like(nxt, eos_id), nxt)
+        idx = torch.cat((idx, nxt), dim=1)
+        finished = finished | (nxt.squeeze(1) == eos_id)
+        if finished.all():
+            break
+
+    results = []
+    for b in range(group_size):
+        gen = idx[b, prompt_len:].tolist()
+        if eos_id in gen:
+            gen = gen[:gen.index(eos_id)+1]
+        results.append(gen)
+    return results
 
 
 def get_turn_logprobs_with_state(model, prompt_ids, reply_ids, eos_id, resume_state, device):
@@ -221,19 +254,19 @@ def main():
             # Ref 模型也同步生成第 1 轮记忆
             _, ref_mem_state_turn1 = sample_turn(ref_model, tok, turn1_ids, eos_id, resume_state=None, device=device)
 
-        # ── 步骤 2: 第 2 轮纯单句输入，采样 G 个候选回答 ──
+        # ── 步骤 2: 第 2 轮纯单句输入，全并行采样 G 个候选回答 ──
         candidates = []
         raw_scores = []
         exp_rewards = []
 
-        for _ in range(args.group_size):
-            reply_ids, _ = sample_turn(
-                model, tok, turn2_ids, eos_id, resume_state=mem_state_turn1, device=device
-            )
+        batch_reply_ids = sample_candidates_batch(
+            model, tok, turn2_ids, eos_id, resume_state=mem_state_turn1, group_size=args.group_size, max_new_tokens=55, device=device
+        )
+
+        for reply_ids in batch_reply_ids:
             reply_text = tok.decode(reply_ids)
             score = evaluate_memory_reply(reply_text, reply_ids, eos_id, target_keywords)
             exp_r = exponential_reward(score, tau=args.tau)
-
             candidates.append((reply_ids, reply_text))
             raw_scores.append(score)
             exp_rewards.append(exp_r)
