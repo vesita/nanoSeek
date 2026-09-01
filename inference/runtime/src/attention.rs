@@ -10,9 +10,19 @@ use candle_core::{DType, Device, Tensor};
 use crate::model::{linear, topk_last, Config};
 
 pub struct CausalSelfAttention {
-    // 标准路径权重（use_csa 时不加载）
+    // 标准路径权重（use_csa/use_mla 时不加载）
     c_attn_w: Option<Tensor>, // (3*n_embd, n_embd)
     c_attn_b: Option<Tensor>,
+    // MLA 路径权重（DeepSeek-V2/V3 低秩 KV 压缩；use_mla 时加载）
+    q_proj_w: Option<Tensor>,   // (n_embd, n_embd)
+    q_proj_b: Option<Tensor>,
+    kv_down_w: Option<Tensor>,  // (kv_lora_rank, n_embd)
+    kv_down_b: Option<Tensor>,
+    k_up_w: Option<Tensor>,     // (n_embd, kv_lora_rank)
+    k_up_b: Option<Tensor>,
+    v_up_w: Option<Tensor>,     // (n_embd, kv_lora_rank)
+    v_up_b: Option<Tensor>,
+    use_mla: bool,
     // CSA 路径权重（use_csa 时加载，bias=False）
     q_proj_csa_w: Option<Tensor>, // (n_embd, n_embd)
     k_proj_csa_w: Option<Tensor>,
@@ -23,7 +33,7 @@ pub struct CausalSelfAttention {
     n_head: usize,
     n_embd: usize,
     head_dim: usize,
-    rope_head_dim: usize, // 部分 RoPE 的旋转维数（CSA 时 = qk_rope_head_dim）
+    rope_head_dim: usize, // 部分 RoPE 的旋转维数（CSA/MLA 时 = qk_rope_head_dim）
     cos: Option<Tensor>,  // (block_size, rope_head_dim)，use_rope 时才有
     sin: Option<Tensor>,
     // CSA 参数
@@ -54,17 +64,32 @@ impl CausalSelfAttention {
         let n_embd = config.n_embd;
         let n_head = config.n_head;
         let head_dim = n_embd / n_head;
-        let rope_head_dim = if config.use_csa {
+        let rope_head_dim = if config.use_csa || config.use_mla {
             config.qk_rope_head_dim
         } else {
             head_dim
         };
 
-        // 标准路径或 CSA 路径的 Q/K/V 权重（二选一）
-        let (c_attn_w, c_attn_b, q_proj_csa_w, k_proj_csa_w, v_proj_csa_w) = if config.use_csa {
+        // Q/K/V 权重三选一：MLA（低秩 KV）｜ CSA（压缩稀疏）｜ 标准 c_attn
+        let (c_attn_w, c_attn_b,
+             q_proj_w, q_proj_b, kv_down_w, kv_down_b, k_up_w, k_up_b, v_up_w, v_up_b,
+             q_proj_csa_w, k_proj_csa_w, v_proj_csa_w) = if config.use_mla {
             (
-                None,
-                None,
+                None, None,
+                Some(vb.get_unchecked(&format!("{prefix}.q_proj.weight"))?),
+                vb.get_unchecked(&format!("{prefix}.q_proj.bias")).ok(),
+                Some(vb.get_unchecked(&format!("{prefix}.kv_down.weight"))?),
+                vb.get_unchecked(&format!("{prefix}.kv_down.bias")).ok(),
+                Some(vb.get_unchecked(&format!("{prefix}.k_up.weight"))?),
+                vb.get_unchecked(&format!("{prefix}.k_up.bias")).ok(),
+                Some(vb.get_unchecked(&format!("{prefix}.v_up.weight"))?),
+                vb.get_unchecked(&format!("{prefix}.v_up.bias")).ok(),
+                None, None, None,
+            )
+        } else if config.use_csa {
+            (
+                None, None,
+                None, None, None, None, None, None, None, None,
                 Some(vb.get_unchecked(&format!("{prefix}.q_proj_csa.weight"))?),
                 Some(vb.get_unchecked(&format!("{prefix}.k_proj_csa.weight"))?),
                 Some(vb.get_unchecked(&format!("{prefix}.v_proj_csa.weight"))?),
@@ -73,9 +98,8 @@ impl CausalSelfAttention {
             (
                 Some(vb.get_unchecked(&format!("{prefix}.c_attn.weight"))?),
                 vb.get_unchecked(&format!("{prefix}.c_attn.bias")).ok(),
-                None,
-                None,
-                None,
+                None, None, None, None, None, None, None, None,
+                None, None, None,
             )
         };
         let c_proj_w = vb.get_unchecked(&format!("{prefix}.c_proj.weight"))?;
@@ -127,6 +151,15 @@ impl CausalSelfAttention {
         Ok(Self {
             c_attn_w,
             c_attn_b,
+            q_proj_w,
+            q_proj_b,
+            kv_down_w,
+            kv_down_b,
+            k_up_w,
+            k_up_b,
+            v_up_w,
+            v_up_b,
+            use_mla: config.use_mla,
             q_proj_csa_w,
             k_proj_csa_w,
             v_proj_csa_w,
@@ -177,24 +210,26 @@ impl CausalSelfAttention {
             return linear(&y, &self.c_proj_w, self.c_proj_b.as_ref());
         }
 
-        // —— 标准路径 ——
+        // —— 标准 / MLA 路径 ——
         let (b, t, _) = x.dims3()?;
         let device = x.device();
 
-        // 一次性投影出 q/k/v：y = x @ W^T (+ b)
-        let qkv = linear(
-            x,
-            self.c_attn_w.as_ref().expect("标准路径缺 c_attn"),
-            self.c_attn_b.as_ref(),
-        )?;
-        let q = qkv.narrow(2, 0, self.n_embd)?;
-        let k = qkv.narrow(2, self.n_embd, self.n_embd)?;
-        let v = qkv.narrow(2, 2 * self.n_embd, self.n_embd)?;
-
-        // 拆成多头：head 维保留在第 2 维，便于先做 RoPE 再转置
-        let q = q.reshape((b, t, self.n_head, self.head_dim))?;
-        let k = k.reshape((b, t, self.n_head, self.head_dim))?;
-        let v = v.reshape((b, t, self.n_head, self.head_dim))?;
+        // q/k/v 投影：MLA（低秩 KV 压缩）或标准 c_attn，都得到 (B,T,nh,d)
+        let (q, k, v) = if self.use_mla {
+            self.mla_qkv(x)?
+        } else {
+            // 一次性投影出 q/k/v：y = x @ W^T (+ b)
+            let qkv = linear(
+                x,
+                self.c_attn_w.as_ref().expect("标准路径缺 c_attn"),
+                self.c_attn_b.as_ref(),
+            )?;
+            // 拆成多头：head 维保留在第 2 维，便于先做 RoPE 再转置
+            let q = qkv.narrow(2, 0, self.n_embd)?.reshape((b, t, self.n_head, self.head_dim))?;
+            let k = qkv.narrow(2, self.n_embd, self.n_embd)?.reshape((b, t, self.n_head, self.head_dim))?;
+            let v = qkv.narrow(2, 2 * self.n_embd, self.n_embd)?.reshape((b, t, self.n_head, self.head_dim))?;
+            (q, k, v)
+        };
 
         // QK-Norm：L2 归一化 q/k，q 乘每头 scale（RoPE 范数保持，前后顺序等价）
         let (q, k) = if self.use_qk_norm {
@@ -203,16 +238,8 @@ impl CausalSelfAttention {
             (q, k)
         };
 
-        // RoPE（全头旋转）：只对 q 和 k 旋转（v 不参与）
-        let (q, k) = if let (Some(cos), Some(sin)) = (&self.cos, &self.sin) {
-            let cos = cos.narrow(0, 0, t)?.unsqueeze(0)?.unsqueeze(2)?; // (1, T, 1, hd)
-            let sin = sin.narrow(0, 0, t)?.unsqueeze(0)?.unsqueeze(2)?;
-            let q = q.broadcast_mul(&cos)?.add(&rotate_half(&q)?.broadcast_mul(&sin)?)?;
-            let k = k.broadcast_mul(&cos)?.add(&rotate_half(&k)?.broadcast_mul(&sin)?)?;
-            (q, k)
-        } else {
-            (q, k)
-        };
+        // RoPE（全头或部分，按 rope_head_dim）：只对 q 和 k 旋转（v 不参与）
+        let (q, k) = self.apply_rope(&q, &k, t)?;
 
         // 把 head 维挪到第 1 维：(B, n_head, T, head_dim)
         let q = q.permute((0, 2, 1, 3))?;
@@ -251,6 +278,54 @@ impl CausalSelfAttention {
 
         // 输出投影
         linear(&y, &self.c_proj_w, self.c_proj_b.as_ref())
+    }
+
+    /// MLA 路径：Q 独立投影；KV 共享一个低秩潜在表示，再分别展开成 K 和 V
+    /// （对应 model.py 的 use_mla 分支：q_proj / kv_down→SiLU / k_up / v_up）。
+    /// 返回 (q, k, v)，形状 (B,T,nh,d)。
+    fn mla_qkv(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let (b, t, _) = x.dims3()?;
+        let q = linear(x, self.q_proj_w.as_ref().expect("use_mla 缺 q_proj"), self.q_proj_b.as_ref())?
+            .reshape((b, t, self.n_head, self.head_dim))?;
+        // kv_latent = SiLU(kv_down(x))：(B, T, kv_lora_rank)，K/V 共享
+        let latent = candle_nn::ops::silu(&linear(
+            x,
+            self.kv_down_w.as_ref().expect("use_mla 缺 kv_down"),
+            self.kv_down_b.as_ref(),
+        )?)?;
+        let k = linear(&latent, self.k_up_w.as_ref().expect("use_mla 缺 k_up"), self.k_up_b.as_ref())?
+            .reshape((b, t, self.n_head, self.head_dim))?;
+        let v = linear(&latent, self.v_up_w.as_ref().expect("use_mla 缺 v_up"), self.v_up_b.as_ref())?
+            .reshape((b, t, self.n_head, self.head_dim))?;
+        Ok((q, k, v))
+    }
+
+    /// RoPE：按 rope_head_dim 旋转 q/k 的前 rope_head_dim 维（部分 RoPE）；
+    /// rope_head_dim == head_dim 时即全头旋转（标准路径）。
+    fn apply_rope(&self, q: &Tensor, k: &Tensor, t: usize) -> Result<(Tensor, Tensor)> {
+        let (Some(cos), Some(sin)) = (&self.cos, &self.sin) else {
+            return Ok((q.clone(), k.clone()));
+        };
+        let rope = self.rope_head_dim;
+        let d = q.dim(3)?;
+        let cos = cos.narrow(0, 0, t)?.unsqueeze(0)?.unsqueeze(2)?; // (1,T,1,rope)
+        let sin = sin.narrow(0, 0, t)?.unsqueeze(0)?.unsqueeze(2)?;
+        if rope < d {
+            // 部分 RoPE：只旋转前 rope_head_dim 维，其余是"无位置"内容维
+            let q_rope = q.narrow(3, 0, rope)?;
+            let q_nope = q.narrow(3, rope, d - rope)?;
+            let q_rope = q_rope.broadcast_mul(&cos)?.add(&rotate_half(&q_rope)?.broadcast_mul(&sin)?)?;
+            let q = Tensor::cat(&[&q_rope, &q_nope], 3)?;
+            let k_rope = k.narrow(3, 0, rope)?;
+            let k_nope = k.narrow(3, rope, d - rope)?;
+            let k_rope = k_rope.broadcast_mul(&cos)?.add(&rotate_half(&k_rope)?.broadcast_mul(&sin)?)?;
+            let k = Tensor::cat(&[&k_rope, &k_nope], 3)?;
+            Ok((q, k))
+        } else {
+            let q = q.broadcast_mul(&cos)?.add(&rotate_half(q)?.broadcast_mul(&sin)?)?;
+            let k = k.broadcast_mul(&cos)?.add(&rotate_half(k)?.broadcast_mul(&sin)?)?;
+            Ok((q, k))
+        }
     }
 
     /// CSA + HCA 混合注意力（V4 简化教育版，逐位对齐 model.py 的 _csa_forward）。

@@ -16,3 +16,6 @@ csa_topk: 2
 max_iters: 50
 lr_decay_iters: 50
 warmup_iters: 10
+# 冒烟也走体检路径（验证不崩）；小模型小步数，体检预算调小
+health_seeds: 2
+health_max_new: 40

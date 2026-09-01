@@ -139,3 +139,33 @@ def zeropower_via_newtonschulz(G, steps=10, eps=1e-7):
     if was_tall:
         X = X.T
     return X.to(G.dtype)
+
+
+def zeropower_via_newtonschulz_split(G, steps=10, eps=1e-7, n_heads=4, head_first=True):
+    """GLM-5 Muon Split：把注意力投影矩阵按「注意力头」分块，逐头做 NS 正交化。
+
+    背景（2026-02 GLM-5 技术报告）：Muon 对整块投影矩阵正交化时配 MLA/注意力追不上
+    简单方案；改成按每个注意力头单独正交化后追平，且注意力分数训练中自动稳定。
+    本函数与 zeropower_via_newtonschulz 的唯一区别：正交化的作用域从整矩阵变成
+    每个头的切片——数学上等价于对每个头分别调原始函数。
+
+    G: (out, in) 注意力投影权重。
+    head_first=True  : 行方向按头拼接（q/k/v 投影，(H·d, n)）→ 每头切片 (d, n)
+    head_first=False : 列方向按头拼接（输出投影，(n, H·d)）→ 每头切片 (n, d)
+    内部统一转成 (H, d, n) 迭代：窄侧 d 小，XX = X·Xᵀ 是 d×d，批处理高效。
+    """
+    assert G.ndim == 2
+    if head_first:
+        X = G.float().view(n_heads, -1, G.size(1))        # (H, d, n)
+    else:
+        X = G.float().view(G.size(0), n_heads, -1)        # (n, H, d)
+        X = X.permute(1, 0, 2)                             # (H, n, d)
+        X = X.transpose(1, 2)                              # (H, d, n) 转窄侧迭代
+    # 逐头 Frobenius 归一（算子范数 ≤ 1，迭代稳定），再批处理 NS
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+    for _ in range(steps):
+        XX = torch.bmm(X, X.transpose(1, 2))               # (H, d, d)
+        X = 2.0 * X - 1.5 * torch.bmm(XX, X) + 0.5 * torch.bmm(torch.bmm(XX, XX), X)
+    if head_first:
+        return X.reshape(G.shape).to(G.dtype)
+    return X.transpose(1, 2).permute(1, 0, 2).reshape(G.shape).to(G.dtype)

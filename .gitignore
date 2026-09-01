@@ -9,8 +9,8 @@ __pycache__/
 # 数据文件不提交（按需通过 data/*/download_*.py 下载、prepare.py 生成）
 data/*/*.txt
 data/*/tokenizer.json
-data/*/train.bin
-data/*/val.bin
+data/*/*.bin
+*.bin
 data/*/meta.pkl
 data/*/manifest.json
 # 字级/字节直入数据产物（dev-notes/48/50，train_tokenizer.py/prepare.py 可重建）

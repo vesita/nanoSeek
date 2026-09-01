@@ -50,6 +50,11 @@ pub struct Config {
     pub csa_window: usize,
     #[serde(default)]
     pub use_hca: bool,
+    // --- MLA（DeepSeek-V2/V3 低秩 KV 压缩注意力）---
+    #[serde(default)]
+    pub use_mla: bool,
+    #[serde(default = "default_kv_lora_rank")]
+    pub kv_lora_rank: usize,
     // --- 部分 RoPE（CSA/MLA 共用）---
     #[serde(default = "default_qk_rope_head_dim")]
     pub qk_rope_head_dim: usize,
@@ -71,6 +76,19 @@ pub struct Config {
     pub use_shared_expert: bool,     // MoE 始终激活的共享专家
     #[serde(default)]
     pub use_csa_learnable: bool,     // 门控池化替代平均池化（旧配置缺字段按 false=平均池化最安全）
+    // --- MoE 路由 V4（DeepSeek-V3：√softplus 打分 + aux-free 偏置修正）---
+    #[serde(default)]
+    pub use_sqrtsoftplus: bool,      // 路由打分 √softplus(logits)×route_scale 替代 softmax
+    #[serde(default = "default_route_scale")]
+    pub route_scale: f64,            // √softplus 打分缩放（DeepSeek-V3 默认 2.5）
+    #[serde(default)]
+    pub use_aux_free_balance: bool,  // aux-free：router_bias 偏置修正替代 Switch aux loss
+    // --- V4 对数放缩门控混合（dev-notes/24 甜点；与 use_mhc 行为互斥）---
+    #[serde(default)]
+    pub use_lse_gate: bool,          // α·x + (1-α)·LSE(x, F(x))，α=sigmoid(raw_gate) 可学习
+    // --- 计算图重排（dev-notes/17）---
+    #[serde(default = "default_block_order")]
+    pub block_order: String,         // attn_ffn（默认）| ffn_attn
 }
 
 fn default_rope_theta() -> f64 {
@@ -90,6 +108,15 @@ fn default_csa_topk() -> usize {
 }
 fn default_csa_window() -> usize {
     64
+}
+fn default_kv_lora_rank() -> usize {
+    64
+}
+fn default_route_scale() -> f64 {
+    2.5
+}
+fn default_block_order() -> String {
+    "attn_ffn".to_string()
 }
 fn default_qk_rope_head_dim() -> usize {
     16
@@ -117,7 +144,24 @@ pub struct GPT {
 impl GPT {
     /// 从 safetensors + config 加载权重。
     pub fn load(model_path: &str, config: &Config, device: &Device) -> Result<Self> {
-        let tensors = candle_core::safetensors::load(model_path, device)?;
+        let mut tensors = candle_core::safetensors::load(model_path, device)?;
+        // Q8 反量化（骨架）：convert.py --q8 把权重存成 uint8（int8+128 偏移）+ {name}_scale。
+        // 加载时先扫描 scale 张量，把对应的 uint8 权重反量化为 F32：(u8-128)*scale，
+        // 再交给 VarBuilder——上层模型代码零改动，量化/非量化共用同一加载路径。
+        let scale_names: Vec<String> = tensors
+            .keys()
+            .filter(|k| k.ends_with("_scale"))
+            .cloned()
+            .collect();
+        for sn in &scale_names {
+            let base = sn.trim_end_matches("_scale").to_string();
+            if let (Some(q), Some(sc)) = (tensors.get(&base), tensors.get(sn)) {
+                let scale = sc.to_vec1::<f32>()?[0] as f64;   // scale 形状 [1]，to_scalar 要求 0 秩
+                let deq = q.to_dtype(DType::F32)?.affine(1.0, -128.0)?.affine(scale, 0.0)?; // (u8-128)*scale
+                tensors.insert(base, deq);
+                tensors.remove(sn);
+            }
+        }
         let vb = candle_nn::VarBuilder::from_tensors(tensors, DType::F32, device);
 
         let wte = vb.get_unchecked("transformer.wte.weight")?;
@@ -159,6 +203,12 @@ impl GPT {
             } else {
                 (None, None, None)
             };
+            // V4 对数放缩门控混合：每层一个可学习标量 raw_gate（非 mHC 路径）
+            let raw_gate = if config.use_lse_gate {
+                Some(vb.get_unchecked(&format!("{prefix}.raw_gate"))?)
+            } else {
+                None
+            };
             blocks.push(Block {
                 ln1,
                 attn,
@@ -172,6 +222,9 @@ impl GPT {
                 raw_A_ffn: raw_a_ffn,
                 raw_B_ffn: raw_b_ffn,
                 raw_C_ffn: raw_c_ffn,
+                use_lse_gate: config.use_lse_gate,
+                raw_gate,
+                block_order: config.block_order.clone(),
             });
         }
         let ln_f = Norm::new(&vb, "transformer.ln_f", config.use_rmsnorm)?;
@@ -287,6 +340,11 @@ struct Block {
     raw_A_ffn: Option<Tensor>,
     raw_B_ffn: Option<Tensor>,
     raw_C_ffn: Option<Tensor>,
+    // V4 对数放缩门控混合（非 mHC 路径）：α·x + (1-α)·LSE(x, F)
+    use_lse_gate: bool,
+    raw_gate: Option<Tensor>, // (1,) → sigmoid → α
+    // 计算图重排：attn_ffn（默认）| ffn_attn
+    block_order: String,
 }
 
 /// 前馈网络：MoE（V3）或单一 MLP/SwiGLU。
@@ -309,10 +367,27 @@ impl Block {
         if self.use_mhc {
             return self.forward_mhc(x);
         }
-        let h = self.attn.forward(&self.ln1.forward(x)?)?;
-        let x = x.add(&h)?;
-        let h = self.mlp.forward(&self.ln2.forward(&x)?)?;
-        Ok(x.add(&h)?)
+        // 残差合并：默认线性 x+F；use_lse_gate 时 α·x + (1-α)·LSE(x, F)，α=sigmoid(raw_gate)
+        let res = |a: &Tensor, b: &Tensor| -> Result<Tensor> {
+            if self.use_lse_gate {
+                let alpha = candle_nn::ops::sigmoid(
+                    self.raw_gate.as_ref().expect("use_lse_gate 缺 raw_gate"),
+                )?
+                .to_vec1::<f32>()?[0] as f64; // (1,) → 标量
+                let lse = logsumexp_residual(a, b)?;
+                Ok(a.affine(alpha, 0.0)?.add(&lse.affine(1.0 - alpha, 0.0)?)?)
+            } else {
+                Ok(a.add(b)?)
+            }
+        };
+        // 计算图重排：默认 attn→ffn；block_order="ffn_attn" 时对调
+        if self.block_order == "ffn_attn" {
+            let x = res(x, &self.mlp.forward(&self.ln2.forward(x)?)?)?;
+            res(&x, &self.attn.forward(&self.ln1.forward(&x)?)?)
+        } else {
+            let x = res(x, &self.attn.forward(&self.ln1.forward(x)?)?)?;
+            res(&x, &self.mlp.forward(&self.ln2.forward(&x)?)?)
+        }
     }
 
     /// mHC 4-copy 前向：X' = B·X + C·F(A·X)，逐位对齐 model.py 的 Block._mhc_forward。
@@ -468,10 +543,13 @@ impl Mlp {
 struct MoE {
     gate: Tensor,              // (n_experts, n_embd) 路由打分权重
     gate_slow: Option<Tensor>, // (n_experts, n_embd) 预判路由的 EMA 副本（buffer）
+    router_bias: Option<Tensor>, // (n_experts,) aux-free 负载均衡偏置（buffer，推理时固定）
     experts: Vec<Mlp>,         // n_experts 个完整 FFN（SwiGLU 或 GELU）
     shared_expert: Option<Mlp>, // V4：始终激活的共享专家（捕获共性特征）
     n_top_k: usize,
     use_anticipatory_routing: bool,
+    use_sqrtsoftplus: bool, // V4：√softplus(logits)×route_scale 打分替代 softmax
+    route_scale: f64,
     use_hash: bool, // V4：浅层用 hash(token 第一维) 确定性分配，不学习
 }
 
@@ -494,13 +572,23 @@ impl MoE {
         } else {
             None
         };
+        // V4 aux-free 负载均衡偏置（buffer）：加到路由 logits 影响 top-k 选择。
+        // 训练时按负载偏差更新（requires_grad=False），推理时是固定权重。
+        let router_bias = if config.use_aux_free_balance {
+            Some(vb.get_unchecked(&format!("{prefix}.router_bias"))?)
+        } else {
+            None
+        };
         Ok(Self {
             gate,
             gate_slow,
+            router_bias,
             experts,
             shared_expert,
             n_top_k: config.n_top_k,
             use_anticipatory_routing: config.use_anticipatory_routing,
+            use_sqrtsoftplus: config.use_sqrtsoftplus,
+            route_scale: config.route_scale,
             use_hash,
         })
     }
@@ -534,7 +622,11 @@ impl MoE {
             (probs_t, indices_t)
         } else {
             // 路由打分：softmax 得到每个 token 在每个专家上的概率
-            let gate_logits = linear(&x_flat, &self.gate, None)?; // (N, n_experts)
+            let mut gate_logits = linear(&x_flat, &self.gate, None)?; // (N, n_experts)
+            // V4 aux-free 偏置修正：bias 加到 logits 影响 top-k 选择（对应 model.py:102-103）
+            if let Some(bias) = &self.router_bias {
+                gate_logits = gate_logits.broadcast_add(&bias.unsqueeze(0)?)?;
+            }
             if self.use_anticipatory_routing {
                 // 预判路由（V4）：离散选择用慢路由（旧参数），门控用当前路由
                 let slow_logits =
@@ -544,6 +636,12 @@ impl MoE {
                 let probs = gather_last(&router_probs, &indices)?; // (N, k)
                 let denom = probs.sum_keepdim(1)?.affine(1.0, 1e-6)?; // +1e-6 防除零
                 (probs.broadcast_div(&denom)?, indices)
+            } else if self.use_sqrtsoftplus {
+                // V4 打分：√softplus(logits)×route_scale，topk + 归一化（对应 model.py:113-117）
+                let scores = softplus_last(&gate_logits)?.sqrt()?.affine(self.route_scale, 0.0)?;
+                let (vals, indices) = topk_last(&scores, self.n_top_k)?;
+                let denom = vals.sum_keepdim(1)?.affine(1.0, 1e-6)?; // +1e-6 防除零
+                (vals.broadcast_div(&denom)?, indices)
             } else {
                 let router_probs = softmax_last(&gate_logits)?;
                 let (vals, indices) = topk_last(&router_probs, self.n_top_k)?;
@@ -634,6 +732,25 @@ pub(crate) fn linear(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tenso
 /// 沿最后一维做 softmax。
 fn softmax_last(x: &Tensor) -> Result<Tensor> {
     Ok(candle_nn::ops::softmax(x, x.shape().rank() - 1)?)
+}
+
+/// 沿最后一维做 softplus（对应 torch.nn.functional.softplus，β=1）。
+/// 稳定式：softplus(x) = max(x,0) + log(1 + exp(-|x|))（candle 无 log1p，手动拆）。
+fn softplus_last(x: &Tensor) -> Result<Tensor> {
+    // affine(1.0, 1.0) = x*1 + 1（candle 标量加法要 Tensor，affine 更省事）
+    let log_term = x.abs()?.neg()?.exp()?.affine(1.0, 1.0)?.log()?;
+    let relu = x.clamp(0.0, f32::INFINITY)?;
+    Ok(relu.add(&log_term)?)
+}
+
+/// 对数域残差合并（对应 model/utils.py 的 logsumexp_residual）：
+/// LSE(x, y) = max(x,y) + log(exp(x-m) + exp(y-m))，有界于 [max, max+log2]。
+/// 逐元素运算，max-平移保证负值数值稳定。
+fn logsumexp_residual(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let m = a.maximum(b)?;
+    let ea = a.sub(&m)?.exp()?;
+    let eb = b.sub(&m)?.exp()?;
+    Ok(m.add(&ea.add(&eb)?.log()?)?)
 }
 
 /// 沿最后一维取 top-k，返回 (值, 下标)。candle 没有 topk，自己实现（张量都很小）。

@@ -43,6 +43,13 @@ class GPTConfig:
     use_muon: bool = False      # True：矩阵参数用 Muon，embedding/lm_head/norm 用 AdamW
     muon_momentum: float = 0.95 # Muon 动量系数
     muon_ns_steps: int = 10     # Newton-Schulz 迭代次数（默认 8 激进 + 2 经典）
+    muon_lr_scale: float = 0.2 # Muon 矩阵参数 lr 缩放（DeepSeek/Kimi 惯例：AdamW lr × 0.2）
+    # --- GLM-5 Muon Split（2026-02 GLM-5 技术报告）---
+    # 问题：Muon 配 MLA/注意力时，整块投影矩阵做 NS 正交化追不上简单方案（GLM-5 实测
+    # Muon+MLA 弱于 GQA-8）；解法：把注意力投影按「注意力头」分块，每头单独正交化。
+    # 附带收益：注意力分数在训练中自动保持稳定（GLM-5 实测不需要额外 clamp）。
+    # 只改优化器步进（零参数、零前向影响），checkpoint 兼容不破。
+    muon_split: bool = False    # True：注意力投影（q/k/v/o）按头分块做 NS 正交化
     # --- V4 核心：CSA/HCA 混合注意力（简化教育版）---
     # 块级 KV 压缩 + top-k 稀疏块选择 + 滑窗局部注意力 + HCA 重度压缩全局信号。
     # 核心收益：注意力开销从 O(T²) 降到 O(T·(nb + win))，这是 1M 上下文能跑起来的关键。

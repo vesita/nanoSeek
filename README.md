@@ -21,6 +21,31 @@ nanoSeek 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 
 ---
 
+## 🏗️ 框架升级（2026-08-20，向 DeepSeek-V3/V4 工程栈靠齐）
+
+纯框架工作（不训模型、不评效果），5 个 Phase 全部完成并提交：
+
+| Phase | 内容 | 状态 |
+|---|---|---|
+| **1 架构开关** | Python/Rust 双端 **MLA**、√softplus+route_scale 路由、aux-free MoE 平衡、lightning indexer 一等公民；全部路径 Python↔Rust **逐位对拍通过（max err=0.00000）** | ✅ |
+| **2 两阶段训练** | `prepare.py --pretrain`（原始文本 → pretrain.bin）+ `train.py --stage=pretrain\|sft\|full`（无掩码全 token vs 对话掩码）+ **WSD 调度**（warmup-stable-decay）；阶段衔接 init_from 验证跑通 | ✅ |
+| **3 Muon 正确化** | 矩阵参数 lr×`muon_lr_scale`(0.2)——DeepSeek/Kimi 惯例，修复上次 A/B 缺缩放的嫌疑 | ✅ |
+| **4 GRPO 骨架** | `training/rl/grpo.py`：采样 G 回复 → 规则奖励（EOS/rep3/长度/中文占比）→ 组内优势 → 策略梯度 + KL 惩罚回基座 | ✅ |
+| **5 量化骨架** | `convert.py --q8`（12.1MB→3.1MB）+ Rust U8 反量化，量化/非量化共用加载路径 | ✅ |
+| **6 默认栈** | `train_chinese.yaml` 重构为 **V4 全兼容栈**（MoE aux-free+√softplus、Muon+lr_scale、WSD、swiglu_clamp、stage）；Rust 补 **LSE gate + block_order**（对拍 0.00000）；已知负面特性保持开关可用但默认关并注明 | ✅ |
+| **7 GLM-5 Muon Split** | 注意力投影按「头」分块做 NS 正交化（替代整块）——A/B 实测 1500 步 **val 0.7776**（整块 1.6522 / AdamW 1.2700）→ **翻默认**；`indexer_warmup_steps`（GLM-5 DSA 冻结预热配方）加入框架，小模型 1500 步下仍净负保持关 | ✅ |
+
+**默认训练栈（train_chinese.yaml 现在开着的）**：
+CSA/HCA + 可学习池化 + Sink + QK-Norm + Z-Loss + MoE(shared+aux-free+√softplus) + MTP + mHC + Muon(lr_scale 0.2) + **Muon Split(GL-5)** + swiglu_clamp + WSD。
+
+**保持关但双端就绪**（dev-notes 有负面结论）：lightning indexer、hash 路由、ffn_attn、no_attn_layers、memory tokens、LSE gate（与 mHC 互斥）、einsum→bmm、MLA（默认用 CSA）。
+
+**框架验收标准**（本次全部满足）：代码能构造（V4 组合）、能切换（stage/schedule/q8）、能对拍（Python↔Rust 逐位一致）——效果一律不看，留给后续按此框架跑真实训练。
+
+**框架验收标准**（本次全部满足）：代码能构造（V4 组合）、能切换（stage/schedule/q8）、能对拍（Python↔Rust 逐位一致）——效果一律不看，留给后续按此框架跑真实训练。
+
+---
+
 ## 当前功能
 
 **固定架构**（`model.py` 硬编码，不可配置）：RMSNorm + SwiGLU。
@@ -61,6 +86,18 @@ nanoSeek 的极简设计（全部代码就 `model.py` + `train.py` 两个文件�
 | `mtp_weight` | `0.3` | MTP 损失权重 |
 | `use_muon` | `false` | **V4** Muon 优化器（矩阵参数正交化，embedding/lm_head/norm 用 AdamW 保护） |
 | `muon_ns_steps` | `10` | Newton-Schulz 迭代次数（系数 (2,-1.5,0.5)） |
+
+**训练循环**（2026-08-20 框架提速三件套，全部零模型参数）：
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `eval_train_split` | `true` | 评估是否重算 train loss；`false` 时用训练侧 EMA 代替（评估开销减半） |
+| `health_enabled` | `false` | 体检门控 best.pt：只有「val 创新低 且 体检合格」才更新 best.pt（防「val 骗低、采样坍缩」） |
+| `health_eval_interval` | `0` | 体检步频；0 = 跟随 `eval_interval` |
+| `health_prompts` | 你好/你是谁/你在哪 | 体检固定 prompt，`\|` 分隔多条 |
+| `health_seeds` / `health_max_new` | `5` / `120` | 每 prompt 采样数 / 单条生成上限 |
+| `health_temp` / `health_top_k` / `health_rep_penalty` | `0.8` / `200` / `1.2` | 体检采样参数（与你好体检同口径） |
+| `health_min_eos_rate` / `health_max_rep3` | `0.6` / `0.1` | 体检合格阈值（EOS 自吐率下限 / rep3 坍缩线） |
 
 **V4 结构设计升级**（连接方式，不增加规模；实验性，默认全关）：
 
@@ -429,6 +466,9 @@ Rust 端验证方法：用 `--print-logits` / `--dump-logits` 配合 `inference/
 
 **训练体验**（实验目录只留可读文件：`best.pt` / `results.csv` / `loss_curve.png`）：
 - **`results.csv`**（YOLO 式）：每个评估点一行 `step, train/loss, val/loss, lr, mfu, time`，纯文本、Excel 可直接打开、训练中断也能读到已落盘部分
+- **`health.csv`**（开启 `health_enabled: true` 时生成）：每个评估点的采样体检记录 `step, val/loss, eos_rate, avg_len, rep3, turns_rate, health_ok`——固定 prompt 采样（你好/你是谁/你在哪），口径与 `training/health_check_hello.py` 一致
+- **best.pt 防坍缩选点**（2026-08-20 框架提速三件套）：dev-notes/14 实证「val 继续降但采样崩」——`health_enabled: true` 后，best.pt 只在「val 创新低 **且** 体检合格」时更新；体检不合格时保持旧 best（防坍缩保护），原始 val 最优仍用于早停判断
+- **评估开销减半**：`eval_train_split: false` 时评估点不再重算 train loss（训练 loss 每 10 步已有记录），results.csv 的 train/loss 列改用训练侧 EMA 代替
 - **`loss_curve.png`**：训练结束自动生成 train/val 双曲线，不用开任何工具直接看图
 - **checkpoint 异步保存**（后台线程 + 原子改名），保存时训练不再卡顿
 - **TensorBoard 可选**：默认关闭（避免二进制事件文件）；需要多实验曲线叠加时用 `--tensorboard_log=True` 开启，事件写到 `out/<实验>/tensorboard/` 子目录，然后用 `uv run tensorboard --logdir out/` 查看

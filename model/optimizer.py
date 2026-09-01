@@ -1,7 +1,7 @@
 """Muon 优化器（DeepSeek-V4）与 MuonAdamW 组合。"""
 import torch
 
-from .utils import zeropower_via_newtonschulz
+from .utils import zeropower_via_newtonschulz, zeropower_via_newtonschulz_split
 
 
 class Muon(torch.optim.Optimizer):
@@ -15,13 +15,17 @@ class Muon(torch.optim.Optimizer):
 
     一维参数（bias、norm 权重）没有「方向」可言，退化为纯动量更新。
     使用标准的 state 机制，checkpoint 里能正常 save/load。
+
+    split_heads（GLM-5 Muon Split）：{id(p): (n_heads, head_first)} —— 命中的
+    注意力投影按「头」分块做 NS 正交化（每个头单独正交化），其余照旧整块正交化。
     """
 
     def __init__(self, params, lr, momentum=0.95, nesterov=True, ns_steps=10,
-                 orthogonalization_fn=None):
+                 orthogonalization_fn=None, split_heads=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         super().__init__(params, defaults)
         self.orthogonalization_fn = orthogonalization_fn or zeropower_via_newtonschulz
+        self.split_heads = split_heads or {}   # id(p) → (n_heads, head_first)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -50,8 +54,15 @@ class Muon(torch.optim.Optimizer):
                 else:
                     g = buf
                 if g.ndim >= 2:
-                    # Muon 的核心：只对矩阵参数做正交化
-                    g = self.orthogonalization_fn(g, steps=ns_steps)
+                    spec = self.split_heads.get(id(p))
+                    if spec is None:
+                        # Muon 的核心：只对矩阵参数做正交化（整块）
+                        g = self.orthogonalization_fn(g, steps=ns_steps)
+                    else:
+                        # GLM-5 Muon Split：按注意力头分块正交化
+                        n_heads, head_first = spec
+                        g = zeropower_via_newtonschulz_split(
+                            g, steps=ns_steps, n_heads=n_heads, head_first=head_first)
                     # 权重衰减：正交化的方向 + 掺一点原参数做收缩
                     g = (1 - wd) * g + wd * p.data
                 p.data.add_(g, alpha=-lr)
