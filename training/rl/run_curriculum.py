@@ -76,10 +76,12 @@ def run_stage(cfg, initial_ckpt, base_out="out/curriculum"):
     print(f"  • 学习率: {cfg['lr']} | 输出目录: {out_dir}")
     print("=" * 70)
 
+    root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     env = os.environ.copy()
     env["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"
+    env["PYTHONUNBUFFERED"] = "1"
     t0 = time.time()
-
+    sys.stdout.flush()
     if cfg["task"] == "grpo":
         cmd = [
             sys.executable, "training/rl/grpo_char.py",
@@ -111,16 +113,18 @@ def run_stage(cfg, initial_ckpt, base_out="out/curriculum"):
         ]
     else:
         raise ValueError(f"Unknown task: {cfg['task']}")
-
-    res = subprocess.run(cmd, env=env)
+    res = subprocess.run(cmd, env=env, cwd=root_dir)
+    sys.stdout.flush()
     dt = time.time() - t0
-    if res.returncode != 0:
-        print(f"❌ Stage {stage_id} 执行失败 (退出码 {res.returncode})")
+    
+    ckpt_out = os.path.join(out_dir, "best.pt")
+    if res.returncode != 0 or not os.path.exists(ckpt_out):
+        print(f"❌ Stage {stage_id} 执行未成功 (退出码 {res.returncode}, 检查点存在: {os.path.exists(ckpt_out)})")
         return False
 
-    print(f"✅ Stage {stage_id} 完成！耗时: {dt:.1f} 秒 | 检查点已保存至 {out_dir}/best.pt\n")
+    print(f"✅ Stage {stage_id} 完成！耗时: {dt:.1f} 秒 | 检查点已保存至 {ckpt_out}\n")
+    sys.stdout.flush()
     return True
-
 
 def main():
     ap = argparse.ArgumentParser(description="nanoSeek 1500 轮训练总控流水线")
