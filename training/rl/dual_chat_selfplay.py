@@ -35,12 +35,12 @@ from inference.scripts.sample_py import build_model_from_checkpoint, load_tokeni
 
 # 启发式开场白列表
 STARTER_TOPICS = [
-    "你好呀，今天工作挺忙碌的，不过终于把核心功能调通了。",
-    "我最近在思考，怎么才能让小模型拥有更长久的记忆能力呢？",
-    "今天天气真好，窗外的阳光很温暖，适合出去散散步。",
-    "有时候感觉每天的事情很多很杂，需要静下心来一件件梳理。",
-    "听说人工智能现在发展非常快，你觉得未来的交互会是什么样的？",
-    "我今天读了一本很有趣的书，里面讲了关于宇宙和时间的思考。",
+    "今天天气格外晴朗，阳光洒在身上暖洋洋的，感觉整个人充满干劲！",
+    "我最近在思考一个很酷的想法，怎么才能让小模型拥有更长久鲜活的记忆？",
+    "刚刚完成了一个令人兴奋的新功能，那种把想法变成现实的感觉太棒了！",
+    "今天学到了关于宇宙奇点和量子纠缠的新假说，真让人感叹科学的奇妙。",
+    "早安！今天又是崭新的一天，你有什么期待完成的目标吗？",
+    "生活里总有些不期而遇的美好，比如晨跑时吹过的微风和路边的花香。",
 ]
 
 COUNSELING_TEMPLATES = [
@@ -48,7 +48,7 @@ COUNSELING_TEMPLATES = [
     "特别耗神", "先不用把后面想完", "心里发慌", "最磨人的不是大事", "身体先绷住"
 ]
 
-
+ROBOTIC_TAGS = ["用户", "模型", "user", "assistant", "system", "Human:", "Assistant:"]
 def exponential_reward(score, tau=1.5):
     sign = 1.0 if score >= 0 else -1.0
     return sign * (math.exp(abs(score) / tau) - 1.0)
@@ -94,6 +94,10 @@ def evaluate_conversational_turn(speaker_text, speaker_ids, eos_id, listener_las
         s += 0.5  # 鼓励主动抛出话题延续对话
 
     # 6. 严厉惩罚单调的心理模板复读
+    # 7. 严厉惩罚吐出“用户/模型”等机械角色标签
+    if any(tag in speaker_text for tag in ROBOTIC_TAGS):
+        s -= 2.5
+
     if any(tpl in speaker_text for tpl in COUNSELING_TEMPLATES):
         s -= 2.0
 
@@ -248,7 +252,7 @@ def main():
     for turn in range(1, args.rounds + 1):
         if current_speaker == "A":
             # Alice 的回合：接收 Bob (或开场) 的单句输入
-            prompt_turn = f"用户：{current_msg}\n模型："
+            prompt_turn = f"{current_msg}\n"
             reply_ids, reply_text, mem_state_a = generate_turn(
                 model_a, tok, prompt_turn, eos_id, resume_state=mem_state_a, device=device
             )
@@ -270,7 +274,7 @@ def main():
 
         else:
             # Bob 的回合：接收 Alice 的单句输入
-            prompt_turn = f"用户：{current_msg}\n模型："
+            prompt_turn = f"{current_msg}\n"
             reply_ids, reply_text, mem_state_b = generate_turn(
                 model_b, tok, prompt_turn, eos_id, resume_state=mem_state_b, device=device
             )
