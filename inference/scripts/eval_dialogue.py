@@ -25,7 +25,7 @@ from collections import Counter
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import torch
-from inference.scripts.sample_py import build_model_from_checkpoint, generate
+from inference.scripts.sample_py import build_model_from_checkpoint, generate_ids, load_tokenizer
 
 # 统一评估用的一批对话 prompt（覆盖寒暄/问询/情绪/建议等不同对话意图，模拟真实对话开场）
 DIALOGUE_PROMPTS = [
@@ -110,11 +110,10 @@ def evaluate_one(model, tok, out_dir: str) -> dict:
     all_prompt_samples = []
     for p in DIALOGUE_PROMPTS:
         n_prompts += 1
-        gen = generate(model, tok, p, MAX_NEW_TOKENS, TEMPERATURE, TOP_K, REPEAT_PENALTY)
-        # generate 内部 tok.encode(prompt) → 生成 → tok.decode(全部)。剥离 prompt 本体：
-        # 先按相同方式 decode prompt，再按它的长度切掉 gen 前缀。
-        prompt_dec = tok.decode(tok.encode(p).ids)
-        text = gen[len(prompt_dec):] if gen.startswith(prompt_dec) else gen
+        # dev-notes/61：新字级模型支持 <cont> 待续停止，避免吐出 <cont> 后继续自说自话
+        gen_ids, _ = generate_ids(model, tok, p, MAX_NEW_TOKENS, TEMPERATURE, TOP_K,
+                                  REPEAT_PENALTY, stop_on_eos=True, stop_on_cont=True)
+        text = tok.decode(gen_ids[len(tok.encode(p).ids):])
         all_text += text
         tot_tokens += _encode_len(tok, text)
         reps2 += ngram_repetition(text, 2)
@@ -158,10 +157,6 @@ def main():
     historical = []
     dirs = a.dirs if a.dirs else (default_dirs + historical)
 
-    tok = None
-    from tokenizers import Tokenizer
-    tok = Tokenizer.from_file("data/chinese/tokenizer.json")
-
     results = []
     for d in dirs:
         if not (Path(d) / "best.pt").exists():
@@ -169,6 +164,8 @@ def main():
             continue
         try:
             model, ckpt = build_model_from_checkpoint(d)
+            # dev-notes/61：按 checkpoint 词表模式选 tokenizer（BPE/字级/字节）
+            tok = load_tokenizer(ckpt)
         except Exception as e:
             print(f"⚠ 跳过（checkpoint 加载失败，可能是旧拓扑实验存档不兼容）: {d}")
             print(f"   原因: {type(e).__name__}: {str(e)[:120]}")

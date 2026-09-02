@@ -83,6 +83,10 @@ def main():
 
     ctx = (a.system + "\n") if a.system else ""
     mem_state = None
+    # dev-notes/61：字级模型训练数据用 A：/B：（70% 说话人标注），其余模式保持旧 用户：/模型：
+    char_style = bool(ckpt["model_args"].get("char_level"))
+    user_prefix = "A：" if char_style else "用户："
+    model_prefix = "B：" if char_style else "模型："
     while True:
         try:
             user = input("🙂 用户：")
@@ -94,7 +98,7 @@ def main():
         if user.strip() in ("exit", "quit", "退出"):
             print("再见 👋")
             break
-        ctx += f"用户：{user}\n模型："
+        ctx += f"{user_prefix}{user}\n{model_prefix}"
 
         # 流式打字机：回调里全量 decode 求增量。回调载荷：BPE = 单个 token id；
         # 字节直入 = 一组 3 字节（list），统一按列表处理。
@@ -120,18 +124,25 @@ def main():
             printed = text
 
         print("🤖 模型：", end="", flush=True)
+        stop_kind_ref = [None]
         gen, _ = generate_ids(
             model, tok, ctx, a.max_new_tokens, a.temperature, a.top_k,
             a.repeat_penalty,
             stop_on_turn=True, stop_on_eos=True, clip_at_sentence=True,
-            window=a.window, resume_state=None if a.window is None else mem_state,
-            token_callback=cb)
+            stop_on_cont=True, window=a.window,
+            resume_state=None if a.window is None else mem_state,
+            token_callback=cb, stop_kind_ref=stop_kind_ref)
         if a.window is not None:
             mem_state = model.get_memory_state()      # 跨轮续传：存本轮末态
 
         # 更新上下文：回复 = 生成里 prompt 之后的部分
         reply = tok.decode(gen[len(tok.encode(ctx).ids):])
         ctx += reply + "\n"
+        # dev-notes/61 待续符自控：显示模型本轮以何种方式收尾
+        sk = stop_kind_ref[0] if stop_kind_ref else None
+        tag = {"eos": "🔴 说完收尾", "cont": "🔵 说完递回（期待你回应）",
+               "turn": "（自然收尾）", "maxlen": "（到生成上限）"}.get(sk, "")
+        print(f"  ↳ {tag}" if tag else "")
         print()
 
 

@@ -117,8 +117,12 @@ def _truncate_at_turn(gen_ids, tok, byte_mode=False):
 def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_penalty,
                  stop_on_turn=False, stop_on_eos=False, clip_at_sentence=False, window=None,
                  no_resume=False, resume_state=None, token_callback=None, context_ids=None,
-                 stop_on_cont=False):
+                 stop_on_cont=False, stop_kind_ref=None):
     """生成并返回 (完整 token 列表, eos_pos)。
+
+    stop_kind_ref（dev-notes/61，可选）：传入 list 时把停止原因写进 ref[0]——
+    "eos"（说完收尾）/ "cont"（说完递回，期待继续）/ "turn"（轮次截断）/
+    "maxlen"（到上限）/ None。默认 None = 不写回，完全向后兼容。
 
     与 generate() 逻辑完全一致，但返回 token 级结果：
     - 完整 token 列表（prompt + 生成，EOS 之前的所有 token）
@@ -248,6 +252,8 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
                     idx = torch.cat([idx[:, :new_start], keep], dim=1)
                     if eos_pos == -1:
                         eos_pos = step + 1    # 轮次截断 = 模型自然收尾的中止点
+                    if stop_kind is None:
+                        stop_kind = "turn"    # 模型自己开下一轮 = 自然收尾（dev-notes/61）
                     break
     gen = idx[0].tolist()
     if clip_at_sentence:
@@ -273,6 +279,17 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
                 break
     if byte_mode and pad:
         gen = gen[pad:]                     # 剥掉头部对齐补齐字节（返回=纯 prompt+生成）
+    if stop_kind_ref is not None:
+        # 回写停止原因（dev-notes/61）：循环内已记录的 eos/cont 优先；
+        # 其余情况由 eos_pos / 轮次截断 / 步数上限推断。
+        if stop_kind is None:
+            if eos_pos >= 0:
+                stop_kind = "eos"
+            elif stop_on_turn and eos_pos >= 0:
+                stop_kind = "turn"
+            else:
+                stop_kind = "maxlen"
+        stop_kind_ref[0] = stop_kind
     return gen, eos_pos
 
 
