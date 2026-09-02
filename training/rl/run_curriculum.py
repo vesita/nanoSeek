@@ -27,7 +27,7 @@ def run_stage(cfg, initial_ckpt, base_out="out/curriculum"):
                "--steps", str(cfg["rounds"]), "--lr", cfg["lr"], "--group_size", "4",
                "--tau", "1.5", "--beta_kl", "0.4",
                "--temperature", "1.0", "--repeat_penalty", "1.4", "--div_weight", "1.5",
-               "--shape", "tanh", "--winsorize", "3.0", "--dyn_tau"]
+               "--shape", "exp", "--winsorize", "3.0", "--dyn_tau"]
     elif cfg["task"] == "memory":
         cmd = [sys.executable, "training/rl/memory_rl.py", "--ckpt", ckpt_in, "--out", out_dir,
                "--steps", str(cfg["rounds"]), "--lr", cfg["lr"], "--group_size", "4",

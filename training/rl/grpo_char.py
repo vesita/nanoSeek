@@ -218,8 +218,10 @@ def main():
                          "防止单候选炸裂 std 归一化 (0=关闭)")
     ap.add_argument("--dyn_tau", action="store_true",
                     help="动态 tau: 用组内 exp 奖励的尺度 EMA 自适应缩放指数塑形温度, 防止尺度漂移")
-    ap.add_argument("--shape", default="tanh", choices=["exp", "log", "tanh"],
-                    help="奖励塑形形态: tanh(默认,有界防-300爆炸) / exp(指数,拉大头部分差) / log(对数压缩)")
+    ap.add_argument("--shape", default="exp", choices=["exp", "log", "tanh"],
+                    help="奖励塑形形态: exp(默认,指数拉大头部分差) / tanh(有界防-300爆炸) / log(对数压缩)。"
+                         "注意: tanh 单点(100步)指标好, 但完整12阶段课程会累积压制对裸prompt乱码/空回复的"
+                         "惩罚分辨率, 致裸prompt空率恶化(v7实测20-47%), 故默认用 exp + winsorize 防爆炸")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
