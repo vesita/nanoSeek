@@ -410,7 +410,7 @@ class CausalSelfAttention(nn.Module):
                 ).view(B, nh, T, d).permute(0, 2, 1, 3)               # (B,T,nh,d)
             else:
                 y_comp = torch.einsum('bthn,bnhd->bthd', a_blk, v_blocks)  # (B,T,nh,d)
-            y_comp = y_comp * has_prior.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).float()
+            y_comp = y_comp * has_prior.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).to(x.dtype)
 
         # --- 3) 滑窗：最近 win 个原始 token 的局部因果注意力 ---
         # 滑窗允许看自己（j ≤ i），保证每个位置至少有一个合法键，避免全 -inf。
@@ -620,7 +620,9 @@ class CausalSelfAttention(nn.Module):
             self._cap_mem_w = w[:, :T].detach().cpu()   # 写入门 (B,T,nh,1)
             self._cap_mem_A = A_hist                   # 每 chunk 后的联想状态快照
         self._last_mem_state = A_in.detach().clone()   # 续传：联想状态末态
-        return self.mem_up(o.reshape(B, T, nh * l)).to(x.dtype)
+        # bf16 兼容：内部状态有意保持 fp32（长序列累加丢精度），只在进 mem_up 前
+        # 对齐到投影权重 dtype（输出投影按 AMP 惯例在低精度下做，损失可忽略）。
+        return self.mem_up(o.reshape(B, T, nh * l).to(self.mem_up.weight.dtype))
 
     def _kv_memory_forward_delta(self, q_m, k_m, v_m, r, w, persist, B, T, nh, l):
         """P2 Delta 擦写（dev-notes/45）：S_t = r⊙S_{t-1} + w_t(v_t − S_{t-1}·k_t)k_tᵀ。"""
@@ -661,7 +663,7 @@ class CausalSelfAttention(nn.Module):
             self._cap_mem_w = w[:, :T].detach().cpu()
             self._cap_mem_A = A_hist
         self._last_mem_state = S.detach().clone()   # 续传：联想状态末态
-        return self.mem_up(o.reshape(B, T, nh * l)).to(q_m.dtype)
+        return self.mem_up(o.reshape(B, T, nh * l).to(self.mem_up.weight.dtype))
 
     @staticmethod
     def _mem_delta_chunk(S_in, qc, kc, vc, rc, wc, persist):
@@ -731,7 +733,7 @@ class CausalSelfAttention(nn.Module):
             self._cap_mem_w = w[:, :T].detach().cpu()     # 写入门（逐 token）
             self._cap_mem_A = A_hist                      # 块级状态快照
         self._last_mem_state = S.detach().clone()   # 续传：联想状态末态
-        return self.mem_up(o.reshape(B, T, nh * l)).to(x.dtype)
+        return self.mem_up(o.reshape(B, T, nh * l).to(self.mem_up.weight.dtype))
 
     @staticmethod
     def _mem_chunk_step(qc, kc, vc, wc, G, A_in, persist, tril):

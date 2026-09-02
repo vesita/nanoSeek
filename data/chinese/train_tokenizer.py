@@ -28,37 +28,62 @@ def collect_corpus_files():
     return paths
 
 
-def build_char_wordlevel(paths, out_json, n_chars=4500):
-    """字级词表（dev-notes/50，--char 模式）：WordLevel 每字一个词条。
+def build_char_wordlevel(paths, out_json, hanzi_top=4400, mech_slots=16):
+    """字级词表 v2（dev-notes/50 + 61 布局）：统一管理机制符区间。
 
-    词表：<eos>/<unk> + 换行 + ASCII（96，英文按字母级）+ 全角标点 + 常用汉字 top N。
-    未登录（生僻字）→ <unk>；对齐字符 + 无 BPE 话术固化。
+    三区布局（用户设计, dev-notes/61）：
+      1. 基础文本字符 121 个  (换行 + 空格 + ASCII 32-126 + 全角标点)
+      2. 机制词区间 16 位      (所有非 ASCII/非自然语言符号: <eos><unk><cont> + 预留,
+                                未来 <pad>/<bos>/<sep> 等都在这里扩充, 统一管理)
+      3. 汉字                (按治理后语料词频降序, top hanzi_top)
+
+    词表总量 = 121 + 16 + hanzi_top。重训后旧字级 checkpoint 的 id 错位作废（可接受）。
     """
     import collections
 
-    special = {"<eos>": 0, "<unk>": 1}
+    # ── 区 1: 基础文本字符（固定顺序）──
     fullwidth = "。！？，、；：\"\"''（）《》…—·～「」『』【】"
+    base = ["\n", " "] + [chr(c) for c in range(32, 127)] + list(fullwidth)
+    base = list(dict.fromkeys(base))   # 去重保序
+
+    # ── 区 2: 机制符区间（统一管理）──
+    # 16 位: eos/unk/cont + 预留。未来新增机制符占剩余预留位, 无需迁移。
+    mech_names = ["<eos>", "<unk>", "<cont>"]
+    mech_reserved = [f"<res{i}>" for i in range(mech_slots - len(mech_names))]
+    mec = mech_names + mech_reserved
+
+    # ── 区 3: 汉字（治理后语料词频降序）──
     counter = collections.Counter()
     for p in paths:
         with open(p, encoding="utf-8", errors="replace") as f:
             counter.update(f.read())
-    vocab = dict(special)
-    vocab.setdefault("\n", len(vocab))
-    for c in map(chr, range(32, 127)):
-        vocab.setdefault(c, len(vocab))
-    for c in fullwidth:
-        vocab.setdefault(c, len(vocab))
-    for c, _ in counter.most_common():
-        if c in vocab or c.isspace() or ord(c) < 128:
-            continue
-        vocab[c] = len(vocab)
-        if len(vocab) >= 2 + 1 + 95 + len(fullwidth) + n_chars:
-            break
+    hans = [(c, n) for c, n in counter.items()
+            if "\u4e00" <= c <= "\u9fff" and c not in base and c not in mec]
+    hans.sort(key=lambda x: -x[1])
+    han_toks = [c for c, _ in hans[:hanzi_top]]
+
+    # ── 拼装词表 ──
+    vocab: dict = {}
+    def _add(items):
+        for it in items:
+            if it not in vocab:
+                vocab[it] = len(vocab)
+    _add(base)          # 0..120   基础文本字符
+    _add(mec)           # 121..136 机制符区间 16 位
+    _add(han_toks)      # 137..    汉字词频降序
+
     tok = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
     tok.pre_tokenizer = pre_tokenizers.Split(Regex(r"[\s\S]"), behavior="isolated")
     tok.decoder = decoders.ByteLevel(add_prefix_space=False)
+    # WordLevel 需要特殊 token 声明(added_tokens)使 <eos>/<cont> 可被 encode/decode 完整保留
+    from tokenizers import AddedToken
+    for name in mech_names:
+        tok.add_special_tokens([AddedToken(name, special=True)])
     tok.save(out_json)
-    print(f"\n字级词表 {len(vocab)} 项 → {out_json}（WordLevel，tokenizers 标准格式）")
+    print(f"\n字级词表 v2 {len(vocab)} 项 → {out_json}（WordLevel, 三区布局）")
+    print(f"  基础字符 {len(base)} | 机制符区间 {len(mec)} (含预留) | 汉字 {len(han_toks)}")
+    for i, name in enumerate(mech_names):
+        print(f"    机制符 {name:>8} → id {i}")
     return tok
 
 
@@ -69,13 +94,16 @@ def main():
                     help='词表大小。默认 8000（日常中文）：嵌入表 8000×n_embd 很小，'
                          'transformer 参数占比高；词表越大压缩越好，但嵌入表越占参数。')
     ap.add_argument('--char', action='store_true',
-                    help='构建字级 WordLevel 词表（dev-notes/50）替代 BPE：汉字=1 token，'
-                         '对齐字符 + 无话术固化（产出 char_tokenizer.json）')
+                    help='构建字级 WordLevel 词表（dev-notes/50, 三区布局见 61）替代 BPE：'
+                         '汉字=1 token，对齐字符 + 无话术固化（产出 char_tokenizer.json）')
+    ap.add_argument('--hanzi-top', type=int, default=4400,
+                    help='字级词表汉字数（词频降序截断），基础字符121 + 机制符16 + 汉字n')
     args = ap.parse_args()
 
     if args.char:
         paths = collect_corpus_files()
-        build_char_wordlevel(paths, os.path.join(DATA_DIR, 'char_tokenizer.json'))
+        build_char_wordlevel(paths, os.path.join(DATA_DIR, 'char_tokenizer.json'),
+                             hanzi_top=args.hanzi_top)
         return
 
     tokenizer = Tokenizer(models.BPE(unk_token='<unk>'))

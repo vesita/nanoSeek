@@ -155,9 +155,10 @@ use_qk_norm = False          # QK-Norm：q/k L2 归一化 + 每头可学习 scal
 z_loss_weight = 0.0          # Router Z-Loss 权重；0 = 关闭，建议 1e-4 起步
 # --- loss masking（chat 微调惯例：只对 assistant 回复算 loss）---
 use_loss_masking = True      # False = 全部 token 参与训练（非对话语料）
-mask_model_ids = [306, 228]  # 「模型：」BPE id 对。换数据集/词表时务必同步改这里——
-mask_user_ids = [308, 228]   # 「用户：」匹配不到标记会把全部 token mask 掉 → loss 恒为
-mask_sep_ids = [177, 177]    # 「\n\n」nan（训练循环有 NaN 防护，会警告并跳过该步）
+# 去标签 masking（dev-notes/61）：按回复终止符 <eos>/<cont> 定位模型回复行。
+# 默认空 = 按模式分支（char/byte）解析；找不到标记会全部 mask → loss NaN（有防护）。
+mask_reply_ids = []
+mask_sep_ids = []
 # adamw 优化器
 learning_rate = 1e-3 # 最大学习率
 max_iters = 5000 # 训练总迭代次数
@@ -191,7 +192,7 @@ indexer_warmup_steps = 0       # >0：前 N 步只训练 idx_q/idx_k（主模型
 # 原始生成不截断），结果写 out/health.csv。纯框架改动，零模型参数。
 health_enabled = False       # True = 计算体检分并门控 best.pt 选点（train_chinese.yaml 开）
 health_eval_interval = 0     # 体检步频；0 = 跟随 eval_interval（推荐，避免体检结果过期）
-health_prompts = "用户：你好\n模型：|用户：你是谁\n模型：|用户：你在哪\n模型："  # '|' 分隔多条
+health_prompts = "你好|你是谁|你在哪|今天心情怎么样"  # '|' 分隔多条（去标签，dev-notes/61）
 health_seeds = 5             # 每 prompt 采样 seed 数（预算 = prompts×seeds×max_new 次前向）
 health_max_new = 120         # 单条生成上限（原始生成，不截断）
 health_temp = 0.8            # 采样温度（与你好体检同口径）
@@ -218,8 +219,9 @@ if char_level:
     block_size = 256
     from tokenizers import Tokenizer as _Tok
     _cv = _Tok.from_file(os.path.join('data', dataset, 'char_tokenizer.json')).get_vocab()
-    mask_model_ids = [_cv[c] for c in '模型：']   # 字级 id（长度 3，masking 通用版支持）
-    mask_user_ids = [_cv[c] for c in '用户：']
+    # 去标签 masking（dev-notes/61）：数据不再用「用户：/模型：」标签，改由每条模型回复
+    # 后的终止符 <eos>/<cont> 定位回复行（新三区词表：<eos>=117, <cont>=119）。
+    mask_reply_ids = [_cv['<eos>'], _cv['<cont>']]
     mask_sep_ids = [_cv['\n'], _cv['\n']]
 # 字节直入模式联动（--byte-level=true）：中文每字 3 字节 → block 放大保持有效上下文；
 # vocab_size 由 meta_byte.pkl（257）提供。CSA 参数作用于**聚合后**的 token（1 聚合=1 字），
@@ -229,10 +231,9 @@ elif byte_level:
     csa_compress = 16     # 块 16 聚合 token ≈ 16 字（与 BPE 一致）
     csa_window = 64       # 滑窗 64 聚合 token ≈ 64 字（与 BPE 一致）
     use_mtp = False       # MTP 依赖 wte 嵌入，字节模式关
-    # loss masking 标记改字节序列（全角冒号 9 字节 = 3 组，组边界对齐）
-    mask_model_ids = [0xe6, 0xa8, 0xa1, 0xe5, 0x9e, 0x8b, 0xef, 0xbc, 0x9a]  # 模型：
-    mask_user_ids = [0xe7, 0x94, 0xa8, 0xe6, 0x88, 0xb7, 0xef, 0xbc, 0x9a]   # 用户：
-    mask_sep_ids = [0x0a, 0x0a]                                                # \n\n
+    # loss masking 标记改字节序列（<eos>=256；字级 <cont> 在字节模式暂不启用，只用 eos 定位）
+    mask_reply_ids = [0x0100]                       # 256 = <eos>
+    mask_sep_ids = [0x0a, 0x0a]                     # \n\n
 # -----------------------------------------------------------------------------
 
 # 各种初始化、派生属性和 I/O 设置
@@ -289,8 +290,9 @@ except OSError:
     steps_per_epoch = None
 
 def build_assistant_mask(y):
-    """(B, T) bool mask 的薄包装：标记 id 来自配置，实现见 training/masking.py。"""
-    return _build_assistant_mask(y, mask_model_ids, mask_user_ids, mask_sep_ids)
+    """(B, T) bool mask 的薄包装：标记 id 来自配置，实现见 training/masking.py。
+    去标签版（dev-notes/61）：用 <eos>/<cont> 终止符定位模型回复行。"""
+    return _build_assistant_mask(y, mask_reply_ids, mask_sep_ids)
 
 
 def get_batch(split):
@@ -676,7 +678,11 @@ health_csv_writer = None
 if master_process and health_enabled:
     try:
         from tokenizers import Tokenizer
-        health_tok = Tokenizer.from_file(os.path.join(data_dir, 'tokenizer.json'))
+        # 与模型词表一致：字级/字节直入各有独立 tokenizer（dev-notes/50/61）
+        _tk_path = ('byte_tokenizer.json' if byte_level
+                    else 'char_tokenizer.json' if char_level
+                    else 'tokenizer.json')
+        health_tok = Tokenizer.from_file(os.path.join(data_dir, _tk_path))
         health_csv = open(os.path.join(out_dir, 'health.csv'), 'w', newline='', encoding='utf-8')
         health_csv_writer = csv.writer(health_csv)
         health_csv_writer.writerow(['step', 'val/loss', 'eos_rate', 'avg_len', 'rep3', 'turns_rate', 'health_ok'])

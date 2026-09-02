@@ -323,8 +323,12 @@ class GPT(nn.Module):
                     adamw_decay.append(p)   # 嵌入/输出头无矩阵结构，正交化无意义
                 elif p.dim() < 2:
                     adamw_nodecay.append(p) # norm/bias
+                elif p.dim() > 2:
+                    # 3D+ 参数（如 kv 记忆的 mem_persist (nh,l,l)）不是矩阵，整块
+                    # 正交化无意义且会触发 NS 的 ndim==2 断言 → 走 AdamW 带衰减。
+                    adamw_decay.append(p)
                 else:
-                    muon_params.append(p)   # 其余矩阵参数（attention/FFN/router）
+                    muon_params.append(p)   # 其余 2D 矩阵参数（attention/FFN/router）
                     if self.config.muon_split:
                         spec = _attn_head_spec(n, p, self.config.n_head)
                         if spec is not None:

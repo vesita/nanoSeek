@@ -60,60 +60,119 @@ def download_if_missing(local_name, book_name):
     print(f'警告：未能下载《{book_name}》，跳过。')
 
 
-def insert_eos_after_replies(block: str) -> str:
-    """在每条「模型：」回复结束后插入结束符 <eos>（字面量，编码时映射为 special token id 3）。
+# 追问/待续判定：回复"期待用户继续回应"→ 标注 <cont>；否则收尾 → <eos>。
+# 语义(dev-notes/61)：<eos> = 本轮话说完可以停；<cont> = 本轮说完但请对话继续(递回/追问)。
+CONTINUE_QUESTION = ["？", "?", "吧", "呢", "对不对", "是不是", "你觉得", "你说呢",
+                     "怎么样", "想不想", "要不要", "怎么样？", "如何", "们看"]
+CONTINUE_PHRASE = ["你觉", "你呢", "怎么样", "是不是", "想不想", "要不要",
+                   "你说呢", "对不对", "如何", "可以吗", "好吗", "吗?", "吗？"]
 
-    动机（2026-08-17，dev-notes/26）：训练分布里从来没有「结束」概念，小模型自回归只会
-    一直续写下一轮 → 喋喋不休。给每条回复补 <eos>（chat 微调的 turn-level 终止符惯例，
-    Llama-3 <|eot_id|> / Qwen <|im_end|> 同思路），模型才能学会「话说完 → 吐终止符」，
-    解码端遇 <eos> 即停（sample_py.generate_ids 的 stop_on_eos；Rust 端按 dev-notes/02）。
-    行级状态机处理多行回复：只在回复的最后一行后才插；用户轮次/空行不插。
+
+def _should_continue(reply: str) -> bool:
+    """回复是否属"待续/递回(期待用户继续)"类型。启发式: 含疑问标点或追问/递回短语。"""
+    r = reply.strip()
+    if not r:
+        return False                      # 空回复不标注(调用方兜底)
+    for q in ("？", "?"):
+        if q in r:
+            return True                   # 带问号 → 倾向于待续
+    for p in CONTINUE_PHRASE:
+        if p in r:
+            return True
+    return False
+
+
+def annotate_replies(block: str, ab_rate: float = 0.7, quote_rate: float = 0.8) -> str:
+    """样本级去开口标签 + 待续符标注（dev-notes/61）。
+
+    把「用户：/模型：」强标签对话转换成更自然的混合样式，并在每条模型回复后
+    插终止符 <eos>(收尾停) 或 <cont>(说完请继续/递回)：
+      - 说话人维度（样本级随机, 概率 ab_rate=0.7）:
+          70% → A：/B： 前缀 (A=对方/用户, B=模型)
+          30% → 无说话人前缀（纯文本, 换行分句, 上下文内一致）
+      - 引号维度（样本级随机, 概率 quote_rate=0.8, 与说话人正交）:
+          80% → 每句用 "..." 引号包裹
+          20% → 无引号
+      两种维度独立 → 四种组合: "A：..." / A：... / "..." / 裸文本
+    <eos>/<cont> 统一插在模型(B/偶数段)回复后：待续/追问 → <cont>, 收尾 → <eos>。
     """
+    import random
+    use_ab = random.random() < ab_rate
+    use_quote = random.random() < quote_rate
+
     lines = block.split("\n")
     out = []
-    in_reply = False
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("用户：") or stripped.startswith("模型："):
-            if in_reply:
-                out.append("<eos>")            # 上一个模型回复在此结束
-            in_reply = stripped.startswith("模型：")
-            out.append(line)
+            is_model = stripped.startswith("模型：")
+            body = stripped.split("：", 1)[1] if "：" in stripped else stripped
+            if use_ab:
+                speaker = "B" if is_model else "A"
+                text = f"{speaker}：{body}"
+            else:
+                text = body
+            # 引号维度（正交）；终止符紧随回复正文同行（引号外），不独立成行
+            if use_quote:
+                text = f'"{text}"'
+            if is_model:
+                ann = "<cont>" if _should_continue(body) else "<eos>"
+                text = text + ann
+            out.append(text)
         elif not stripped:
-            if in_reply:
-                out.append("<eos>")            # 回复被空行截断（兜底）
-                in_reply = False
             if line:
                 out.append(line)
         else:
-            out.append(line)                   # 回复续行（多行回复）
-    if in_reply:                               # 块尾仍是模型回复
-        out.append("<eos>")
+            out.append(line)               # 非对话行（备注/续行）原样保留
     return "\n".join(out)
+
+
+def insert_eos_after_replies(block: str) -> str:
+    """兼容旧名：一律插 <eos>（标注 <cont> 由 --no-annotate 关闭时使用）。"""
+    return annotate_replies(block)
 
 
 def encode_to_bin(text, tokenizer, out_path):
     """分块编码文本为 uint16 token ids，增量写入 bin 文件。
 
-    字面量 <eos> 映射为 tokenizer 的 EOS token id（而非逐字符编码），
-    与 encode_bytes_to_bin 逻辑一致——先按 <eos> 分割，各段独立编码，
-    段间插入 EOS id。分块 flush 控制内存。
+    字面量 <eos>/<cont> 映射为 tokenizer 的对应 special id（而非逐字符编码），
+    与 encode_bytes_to_bin 逻辑一致——先按特殊符分割，各段独立编码，
+    段间插入对应 id。分块 flush 控制内存。
     """
-    eos_id = tokenizer.token_to_id("<eos>")
+    # 特殊符字面量 → 目标 id 映射（只映射词表中存在且为特殊符的）
+    markers = {}
+    for sym in ("<eos>", "<cont>"):
+        sid = tokenizer.token_to_id(sym)
+        if sid is not None:
+            markers[sym] = sid
+    import re
+    # 通用分割：按任一特殊符字面量切分，并保留分隔物
+    pattern = re.compile("|".join(re.escape(m) for m in markers) or r"$^")
     with open(out_path, 'wb') as f:
         buf = []
-        parts = text.split('<eos>')
-        for i, part in enumerate(parts):
-            # 大段分块编码，控制内存
-            for j in range(0, max(len(part), 1), CHUNK):
-                chunk = part[j:j + CHUNK]
-                if chunk:
-                    buf.extend(tokenizer.encode(chunk).ids)
-            if i < len(parts) - 1 and eos_id is not None:
-                buf.append(eos_id)
+        prev_end = 0
+        for m in pattern.finditer(text):
+            seg = text[prev_end:m.end() - len(m.group())]
+            # 段前普通文本
+            if seg:
+                for j in range(0, max(len(seg), 1), CHUNK):
+                    chunk = seg[j:j + CHUNK]
+                    if chunk:
+                        buf.extend(tokenizer.encode(chunk).ids)
+            # 特殊符 id
+            if markers.get(m.group()) is not None:
+                buf.append(markers[m.group()])
+            prev_end = m.end()
             if len(buf) >= 1 << 20:
                 np.array(buf, dtype=np.uint16).tofile(f)
                 buf = []
+        # 结尾余段
+        seg = text[prev_end:]
+        if seg:
+            for j in range(0, max(len(seg), 1), CHUNK):
+                chunk = seg[j:j + CHUNK]
+                if chunk:
+                    buf.extend(tokenizer.encode(chunk).ids)
         if buf:
             np.array(buf, dtype=np.uint16).tofile(f)
 

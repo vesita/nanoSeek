@@ -116,7 +116,8 @@ def _truncate_at_turn(gen_ids, tok, byte_mode=False):
 @torch.no_grad()
 def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_penalty,
                  stop_on_turn=False, stop_on_eos=False, clip_at_sentence=False, window=None,
-                 no_resume=False, resume_state=None, token_callback=None, context_ids=None):
+                 no_resume=False, resume_state=None, token_callback=None, context_ids=None,
+                 stop_on_cont=False):
     """生成并返回 (完整 token 列表, eos_pos)。
 
     与 generate() 逻辑完全一致，但返回 token 级结果：
@@ -157,7 +158,9 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
     new_start = idx.shape[1]
     seen = list(idx[0].tolist())
     eos_id = tok.token_to_id("<eos>")
+    cont_id = tok.token_to_id("<cont>") if stop_on_cont else None
     eos_pos = -1
+    stop_kind = None           # None / "eos" / "cont"（该轮回复因何终止）
     mem_state = resume_state
     for step in range(max_new_tokens):
         if window is not None:
@@ -223,8 +226,10 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
             nxt_id = int(nxt.item())
             if token_callback is not None:
                 token_callback(nxt_id)             # 流式输出：每步回调（chat.py 打字机）
-            if stop_on_eos and nxt_id == eos_id:
-                eos_pos = step                     # 模型自己说"完了"：记录并停（EOS 不进输出）
+            # 终止符判定：<eos> 或 <cont>(待续) 都标记本轮回复结束点（cont 时 stop_on_cont 开启）
+            if (stop_on_eos and nxt_id == eos_id) or (stop_on_cont and cont_id is not None and nxt_id == cont_id):
+                eos_pos = step
+                stop_kind = "eos" if nxt_id == eos_id else "cont"
                 break
             seen.append(nxt_id)
             idx = torch.cat((idx, nxt.unsqueeze(0)), dim=1)
