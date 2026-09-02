@@ -85,12 +85,46 @@ ROBOTIC_TAGS = ["用户", "模型", "user", "assistant", "system", "Human:", "As
 # -----------------------------------------------------------------------------
 reward_engine = MultiDimensionalRewardEngine()
 
-def compute_raw_reward(prompt, reply_text, reply_ids, eos_id, kind, keywords):
-    """复用多维解耦奖励引擎"""
+def compute_raw_reward(prompt, reply_text, reply_ids, eos_id, kind, keywords, coherence=None):
+    """复用多维解耦奖励引擎 (coherence: 基座似然度 z 值, None 表示不启用)"""
     vec, score, exp_r = reward_engine.evaluate_reply(
-        prompt, reply_text, reply_ids, eos_id, kind=kind, keywords=keywords
+        prompt, reply_text, reply_ids, eos_id, kind=kind, keywords=keywords,
+        coherence=coherence,
     )
     return score
+
+
+# -----------------------------------------------------------------------------
+# r_anti_salad 门控校准常量 (来自基座 SFT 模型实测分布, .probe2.py):
+#   基座自采样 mean-logp: mean=-7.8 std=1.87; v6/v7 乱码沙拉: mean=-13.9
+# 结论: 基座似然度只能区分"乱码沙拉 vs 模型语感", 无法奖励流畅文本 (基座把
+# 流畅中文也判为低似然, 训练语料本身不通顺)。因此它只做**门控**: 组内最佳候选
+# 低于阈值 → 整组降级为退化, 跳过策略梯度 (只 KL 拉回基座), 防止"全组乱码
+# 仍被组内相对优势当正样本强化"的自增强循环 (v6/v7 实测坍缩路径)。不作为奖励
+# 项, 避免反向惩罚流畅表达。
+# -----------------------------------------------------------------------------
+COH_THETA = -7.8      # 基座自采样 mean-logp 中心
+COH_SIGMA = 2.0       # 分布宽度 (放宽到 2.0, 避免个体噪声误伤)
+COH_GATE_SIG = 2.2    # 阈值 = THETA - 2.2*SIGMA ≈ -12.2 (沙拉典型区间, 基座样本几乎不触)
+
+
+def mean_ref_reply_logprob(ref_model, prompt_ids, reply_ids, device):
+    """基座模型对"回复区域"的平均 token log-prob (无梯度, 语感一致性度量)。
+
+    乱码/口水串在这项上显著偏低 (汉字随机拼接的条件熵极高); 基座自采样回复
+    落在 theta±sigma 内。GRPO 用组内相对优势, 绝对刻度不重要, 排序对即可。
+    """
+    if not reply_ids:
+        return None
+    full = prompt_ids + reply_ids
+    x = torch.tensor([full[:-1]], dtype=torch.long, device=device)
+    y = torch.tensor([full[1:]], dtype=torch.long, device=device)
+    with torch.no_grad():
+        logits, _ = ref_model(x, targets=y)
+    lp = F.log_softmax(logits, dim=-1).gather(2, y.unsqueeze(-1)).squeeze(-1).squeeze(0)
+    pl = len(prompt_ids)
+    reply_lp = lp[pl:pl + len(reply_ids)]
+    return float(reply_lp.mean().item())
 
 
 def exponential_reward_shaping(score, tau=1.5):
@@ -202,6 +236,9 @@ def main():
     ap = argparse.ArgumentParser(description="nanoSeek 字级 GRPO 强化学习训练")
     ap.add_argument("--ckpt", default="out/eos_fix_1epoch/best.pt", help="基座模型路径")
     ap.add_argument("--out", default="out/rl_grpo_v1", help="RL 输出目录")
+    ap.add_argument("--ref_base", default=None,
+                    help="语感一致性/KL 锚点模型(基座 SFT)路径; 默认 = --ckpt 同目录 best.pt。"
+                         "课程串跑时必须固定传原始基座, 否则锚点随阶段漂移, 乱码会被渐强")
     ap.add_argument("--steps", type=int, default=100, help="RL 迭代步数")
     ap.add_argument("--group_size", type=int, default=4, help="每 Prompt 并行采样数 G")
     ap.add_argument("--lr", type=float, default=2e-5, help="RL 学习率 (较小学习率防策略坍缩)")
@@ -228,16 +265,18 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"▶ 设备: {device} | 基础模型: {args.ckpt}")
 
-    # 1. 加载训练模型 (Policy) 与冻结基座模型 (Ref Model 用于 KL 约束)
+    # 1. 加载训练模型 (Policy) 与冻结基座模型 (Ref Model 用于 KL 约束 + r_coherence)
     model, ckpt = build_model_from_checkpoint(os.path.dirname(args.ckpt))
     model.to(device)
     model.train()
 
-    ref_model, _ = build_model_from_checkpoint(os.path.dirname(args.ckpt))
+    ref_dir = os.path.dirname(args.ref_base) if args.ref_base else os.path.dirname(args.ckpt)
+    ref_model, _ = build_model_from_checkpoint(ref_dir)
     ref_model.to(device)
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad = False
+    print(f"  🔗 锚点(ref) 模型: {ref_dir} (KL 约束 + r_coherence 语感)")
 
     tok = load_tokenizer(ckpt)
     eos_id = tok.token_to_id("<eos>")
@@ -286,12 +325,16 @@ def main():
             temperature=args.temperature, top_k=200, repeat_penalty=args.repeat_penalty, device=device
         )
 
-        # 先收集全部候选与原始分
+        # 先收集全部候选与原始分 + 基座似然度 (anti-salad 门控用)
         candidates = []
         raw_scores = []
+        mlp_vals = []
         for reply_ids in batch_reply_ids:
             reply_text = tok.decode(reply_ids).replace("<eos>", "").strip()
-            score = compute_raw_reward(prompt_text, reply_text, reply_ids, eos_id, kind, keywords)
+            mlp = mean_ref_reply_logprob(ref_model, prompt_ids, reply_ids, device)
+            mlp_vals.append(mlp)
+            score = compute_raw_reward(prompt_text, reply_text, reply_ids, eos_id, kind, keywords,
+                                       coherence=None)  # 基座似然只做门控, 不做奖励(避免惩罚流畅文本)
             candidates.append((reply_ids, reply_text))
             raw_scores.append(score)
 
@@ -353,9 +396,17 @@ def main():
         # 若整组最佳候选的原始分都 < 0, 说明本组没有任何像样的回答 (空回复/<eos>/乱码扎堆)。
         # 此时组内归一化会把"最不烂的垃圾"当正样本, 反着强化坍缩方向。
         # 因此跳过策略梯度, 只保留 KL(拉回基座) + EOS 静默, 等下次采样回到正常区。
-        degenerate = bool(max(raw_scores) < 0)
+        # anti-salad 门控 (v6/v7 实测核心崩因): "全组乱码但 raw>0" 时旧逻辑不拦,
+        # 组内相对优势把乱码当正样本自增强。基座似然度 (mean-logp) 是乱码最好判据
+        # (基座自采样 ≈ -7.8±2, 乱码 ≈ -13.9): 组内最佳候选低于阈值 → 也判退化。
+        max_raw = max(raw_scores)
+        best_mlp = max((m for m in mlp_vals if m is not None), default=None)
+        salad_degen = best_mlp is not None and best_mlp < (COH_THETA - COH_GATE_SIG * COH_SIGMA)
+        degenerate = bool(max_raw < 0) or salad_degen
         if degenerate:
-            print(f"  ⚠ 组退化 (组最高分 {max(raw_scores):6.2f} < 0) → 跳过策略梯度, 仅 KL/EOS 静默")
+            reason = (f"组最高分 {max_raw:6.2f} < 0" if max_raw < 0
+                      else f"组最佳基座似然 {best_mlp:.2f} 过低(乱码)")
+            print(f"  ⚠ 组退化 ({reason}) → 跳过策略梯度, 仅 KL/EOS 静默")
 
         # 3. 计算策略梯度 + KL 惩罚 + EOS 神经元静默损失
         model.train()

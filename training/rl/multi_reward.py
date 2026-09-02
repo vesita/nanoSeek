@@ -71,6 +71,7 @@ class RewardDimensionWeights:
     w_quiet_eos: float = 1.0     # EOS 收尾与静默
     w_sentiment: float = 0.8     # 积极阳光与互动好奇
     w_semantic: float = 0.6      # 语义相关命中 (轻量 n-gram 特征向量相似度)
+    w_coherence: float = 2.0     # 语感一致性 (基座模型对回复的似然度; 防乱码/口水奖励作弊)
 
 
 @dataclass
@@ -83,6 +84,7 @@ class RewardVector:
     r_quiet_eos: float = 0.0
     r_sentiment: float = 0.0
     r_semantic: float = 0.0
+    r_coherence: float = 0.0
 
     def compute_weighted_total(self, weights: RewardDimensionWeights) -> float:
         return (
@@ -92,7 +94,8 @@ class RewardVector:
             weights.w_anti_robotic * self.r_anti_robotic +
             weights.w_quiet_eos * self.r_quiet_eos +
             weights.w_sentiment * self.r_sentiment +
-            weights.w_semantic * self.r_semantic
+            weights.w_semantic * self.r_semantic +
+            weights.w_coherence * self.r_coherence
         )
 
     def to_dict(self) -> Dict[str, float]:
@@ -104,6 +107,7 @@ class RewardVector:
             "quiet_eos": round(self.r_quiet_eos, 3),
             "sentiment": round(self.r_sentiment, 3),
             "semantic": round(self.r_semantic, 3),
+            "coherence": round(self.r_coherence, 3),
         }
 
 
@@ -126,9 +130,17 @@ class MultiDimensionalRewardEngine:
         reply_ids: List[int],
         eos_id: int,
         kind: str = "general",
-        keywords: List[str] = None
+        keywords: List[str] = None,
+        coherence: float = None
     ) -> Tuple[RewardVector, float, float]:
-        """评估单条回复，返回 (多维奖励向量, 综合加权总分 s, 指数塑形奖励 R)"""
+        """评估单条回复，返回 (多维奖励向量, 综合加权总分 s, 指数塑形奖励 R)
+
+        coherence: 由调用方提供的"语感一致性"得分 (基座/SFT 模型对回复区域的平均
+        token log-prob 标准化后的 z 值)。这是对抗乱码/口水奖励作弊的关键维度——
+        随机汉字串可以满足长度/熵/无标签/EOS 全部表面条件 (实测 raw_s≈+4 → 塑形
+        ≈+14 被当正样本强化), 但基座模型对其似然度极低, coherence 会把它压成负分。
+        None = 不启用该维度 (向后兼容 memory/selfplay 等未接入基座似然的引擎)。
+        """
         keywords = keywords or []
         vec = RewardVector()
         char_len = len(reply_text.strip())
@@ -144,6 +156,13 @@ class MultiDimensionalRewardEngine:
             vec.r_natural = -3.5
             total_s = -3.5
             return vec, total_s, self.exponential_shaping(total_s)
+
+        # ── 维度 -1: r_coherence (语感一致性, 基座似然度) ──
+        # 反向饱和: 负分强力钳到 -2.5 (乘权重 2.0 → 一次扣 5.0 raw, 让乱码总分转负,
+        # 被组退化门控拦截并触发 KL 拉回基座), 正分温和封顶 +1.0 (避免过度奖励"照抄
+        # 基座", 保留 GRPO 组相对优势的探索空间)。
+        if coherence is not None:
+            vec.r_coherence = max(-2.5, min(1.0, coherence))
 
         # ── 维度 1: r_natural (日常自然度与长度) ──
         # 长度软奖励曲线 (Soft Length Curve): 不再"8-65 全 +1.0"一刀切, 而是按接近黄金中段的程度给连续分。

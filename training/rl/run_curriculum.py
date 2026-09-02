@@ -27,7 +27,9 @@ def run_stage(cfg, initial_ckpt, base_out="out/curriculum"):
                "--steps", str(cfg["rounds"]), "--lr", cfg["lr"], "--group_size", "4",
                "--tau", "1.5", "--beta_kl", "0.4",
                "--temperature", "1.0", "--repeat_penalty", "1.4", "--div_weight", "1.5",
-               "--shape", "exp", "--winsorize", "3.0", "--dyn_tau"]
+               "--shape", "exp", "--winsorize", "3.0", "--dyn_tau",
+               # 语感一致性锚点: 固定传原始 SFT 基座, 防止锚点随阶段漂移导致乱码渐强
+               "--ref_base", initial_ckpt]
     elif cfg["task"] == "memory":
         cmd = [sys.executable, "training/rl/memory_rl.py", "--ckpt", ckpt_in, "--out", out_dir,
                "--steps", str(cfg["rounds"]), "--lr", cfg["lr"], "--group_size", "4",
