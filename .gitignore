@@ -24,6 +24,9 @@ data/*/char_tokenizer.json
 # 数据备份/中间产物（如 train.bin.bak-*）
 data/*/*.bak*
 *.bak*
+# 数据治理快照（govern_dialogue_data.py 产出：治理前备份 + 被剔除源，本地可回滚、不进库）
+data/*/_backup_*/
+data/*/_discarded/
 
 # Rust 推理框架转换产物（由 inference/runtime/scripts/convert.py 重新生成）
 inference/runtime/target/
