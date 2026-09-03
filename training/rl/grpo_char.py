@@ -7,9 +7,16 @@
    - 事实/技术问答：精准事实 (+3.0) > 坦诚承认“不知道” (+1.5) >> 泛化心理套话惩罚 (-2.5)
    - 情感/倾听场景：温柔共情 (+2.5) > 普通倾听 (+1.0) >> 机械复读 (-2.0)
    - 格式与终止：自吐 <eos> (+1.0)、无 3-gram 复读 (+0.5)、长度适中 (+0.5)
+   - 数学：100 以内加减乘除，空格切分首个数字 = 答案 (+2.5)；多余数字扣分；
+     顺序列举 (+1 连续 ≥3) 豁免多余数字并给少许奖励 (全局规则)
 3. 终止符神经元静默正则 (Quiet-State Loss on EOS)：
    - 当生成 <eos> 时，对深层隐藏状态施加 L1 能量惩罚，促使模型“收力静默”，抑制越界自说自话
 4. GRPO 算法：零 Critic 网络，组内采样 G 个候选，组相对优势归一化 + SFT 基座 KL 约束
+
+架构 (dev-notes/63, 奖励引擎解耦为三模块)：
+  - Sampler   : training.rl.sampler  —— 组采样 + logprob/hidden + 静默损失 + 塑形
+  - RewardEngine : training.rl.reward —— 插件式奖励维度注册 + 加权合成
+  - Updater   : training.rl.updater  —— 组相对优势 + winsorize + PPO-clip/KL/quiet 更新
 
 用法：
     .venv/bin/python training/rl/grpo_char.py --ckpt out/eos_fix_1epoch/best.pt --steps 50
@@ -25,11 +32,16 @@ from copy import deepcopy
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from model import GPTConfig, GPT
 from inference.scripts.sample_py import build_model_from_checkpoint, load_tokenizer
-from training.rl.multi_reward import MultiDimensionalRewardEngine, RewardDimensionWeights
+from training.rl.sampler import (
+    sample_candidates_batch, get_token_logprobs_and_hidden,
+    compute_quiet_loss_from_hidden, reward_shaping,
+)
+from training.rl.updater import GrpoUpdater
+from training.rl.reward import RewardEngine, _ngram_set
+from training.rl.reward import arith_gen  # 配置驱动数学题 (arith_rules.toml)
 # 人格化与无前缀自然提示词库 (彻底移除 "用户：" / "模型：" 机械标签)
 # -----------------------------------------------------------------------------
 # 1. 自发涌现自我命名与身份认同 (Emergent Self-Naming & Identity)
@@ -80,16 +92,21 @@ COUNSELING_KEYWORDS = [
 ]
 
 ROBOTIC_TAGS = ["用户", "模型", "user", "assistant", "system", "Human:", "Assistant:"]
-# -----------------------------------------------------------------------------
-# 多维解耦奖励引擎实例化
-# -----------------------------------------------------------------------------
-reward_engine = MultiDimensionalRewardEngine()
 
-def compute_raw_reward(prompt, reply_text, reply_ids, eos_id, kind, keywords, coherence=None):
+# 6. 数学题 (100 以内加减乘除, warm-start)。奖励引擎按算式自动取答案 (全局规则 R1/R2)。
+#    提示词不再硬编码: 由 arith_rules.toml 基础规则 + 代码格式化噪音生成
+#    (运算符写法 +/＋/加/加上…、问句模板随机组合), 奖励识别与生成共用同一份配置。
+ARITH_PROMPTS = arith_gen.gen_prompts(count=30, seed=20260903)
+# -----------------------------------------------------------------------------
+# 多维解耦奖励引擎实例化 (插件式)
+# -----------------------------------------------------------------------------
+reward_engine = RewardEngine()
+
+def compute_raw_reward(prompt, reply_text, reply_ids, eos_id, kind, keywords, coherence=None, cont_id=None):
     """复用多维解耦奖励引擎 (coherence: 基座似然度 z 值, None 表示不启用)"""
     vec, score, exp_r = reward_engine.evaluate_reply(
         prompt, reply_text, reply_ids, eos_id, kind=kind, keywords=keywords,
-        coherence=coherence,
+        coherence=coherence, cont_id=cont_id,
     )
     return score
 
@@ -127,111 +144,6 @@ def mean_ref_reply_logprob(ref_model, prompt_ids, reply_ids, device):
     return float(reply_lp.mean().item())
 
 
-def exponential_reward_shaping(score, tau=1.5):
-    """指数分布奖励塑形：R = sign(s) * (exp(|s| / tau) - 1)
-    
-    在保持符号方向的同时，利用指数曲率强烈拉大头部优质回答与中低分回答的梯度差。
-    """
-    sign = 1.0 if score >= 0 else -1.0
-    return sign * (math.exp(abs(score) / tau) - 1.0)
-
-
-def log_reward_shaping(score, c=4.0):
-    """对数压缩奖励塑形：R = sign(s) * log1p(|s| / c)  (替代指数, 缓解 -300 爆炸)
-    
-    指数塑形 R=sign*(exp(|s|/tau)-1) 在 |s| 大时趋近无穷 → 单条烂样本(乱码/超大负分)
-    可炸出 R≈-300, 再被组内 std 归一化彻底放大, 压垮同组正常候选的优势。
-    对数压缩把 |s| 的边际增益压成 O(1/|s|): 高分区间梯度平缓, 不再无界爆炸。
-    系数 c 控制压缩强度: c 越小压缩越强(更平), 越大越接近线性。
-    """
-    sign = 1.0 if score >= 0 else -1.0
-    return sign * math.log1p(abs(score) / c)
-
-
-def reward_shaping(score, shape="exp", tau=1.5, c=4.0):
-    """按 --shape 分派奖励塑形形态 (统一入口)"""
-    if shape == "log":
-        return log_reward_shaping(score, c=c)
-    elif shape == "tanh":
-        return math.tanh(score / c) * c  # 有界到 ±c, 避免任何爆炸
-    else:
-        return exponential_reward_shaping(score, tau=tau)
-
-# -----------------------------------------------------------------------------
-# 高性能全并行向量化组采样 (Vectorized Group Batch Sampling)
-# -----------------------------------------------------------------------------
-
-@torch.no_grad()
-def sample_candidates_batch(model, tok, prompt_ids, eos_id, group_size=4,
-                            max_new_tokens=55, temperature=1.0, top_k=200, repeat_penalty=1.4, device='cuda'):
-    """组内 G 个候选回复全并行 GPU 批处理采样 (速度提升 3~5 倍)"""
-    prompt_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
-    prompt_len = len(prompt_ids)
-    
-    idx = prompt_t.unsqueeze(0).expand(group_size, -1).clone()
-    finished = torch.zeros(group_size, dtype=torch.bool, device=device)
-    
-    for _ in range(max_new_tokens):
-        idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
-        logits, _ = model(idx_cond)
-        v = logits[:, -1, :].clone() / temperature
-        
-        if repeat_penalty > 1.0:
-            seen_mask = torch.zeros_like(v, dtype=torch.bool)
-            seen_mask.scatter_(1, idx, True)
-            v = torch.where(seen_mask, torch.where(v >= 0, v / repeat_penalty, v * repeat_penalty), v)
-            
-        if top_k is not None:
-            topv, _ = torch.topk(v, top_k, dim=-1)
-            v[v < topv[:, -1:]] = -float("Inf")
-            
-        probs = F.softmax(v, dim=-1)
-        nxt = torch.multinomial(probs, 1)  # GPU 原生并发采样，零 CPU 同步
-        
-        nxt = torch.where(finished.unsqueeze(1), torch.full_like(nxt, eos_id), nxt)
-        idx = torch.cat((idx, nxt), dim=1)
-        
-        finished = finished | (nxt.squeeze(1) == eos_id)
-        if finished.all():
-            break
-            
-    results = []
-    for b in range(group_size):
-        gen = idx[b, prompt_len:].tolist()
-        if eos_id in gen:
-            gen = gen[:gen.index(eos_id)+1]
-        results.append(gen)
-    return results
-
-def get_token_logprobs_and_hidden(model, full_ids, device):
-    """计算全序列 token 的 log-probabilities 并捕获最终归一化隐藏状态"""
-    x = torch.tensor([full_ids[:-1]], dtype=torch.long, device=device)
-    y = torch.tensor([full_ids[1:]], dtype=torch.long, device=device)
-    
-    captured_h = []
-    def hook_fn(module, inp, out):
-        captured_h.append(out)
-        
-    handle = model.transformer.ln_f.register_forward_hook(hook_fn)
-    logits, _ = model(x, targets=y)
-    handle.remove()
-    
-    log_probs = F.log_softmax(logits, dim=-1)
-    target_logprobs = log_probs.gather(2, y.unsqueeze(-1)).squeeze(-1).squeeze(0)
-    h_f = captured_h[0] if captured_h else None
-    return target_logprobs, h_f
-
-
-def compute_quiet_loss_from_hidden(h_f, eos_idx_in_reply, prompt_len):
-    """从捕获的隐藏状态中提取 EOS 位置的 L1 能量范数"""
-    if h_f is None or eos_idx_in_reply < 0:
-        return torch.tensor(0.0)
-    eos_pos = prompt_len - 1 + eos_idx_in_reply
-    if eos_pos < h_f.size(1):
-        eos_vec = h_f[0, eos_pos, :]
-        return torch.mean(torch.abs(eos_vec))
-    return torch.tensor(0.0)
-
 def main():
     ap = argparse.ArgumentParser(description="nanoSeek 字级 GRPO 强化学习训练")
     ap.add_argument("--ckpt", default="out/eos_fix_1epoch/best.pt", help="基座模型路径")
@@ -243,7 +155,7 @@ def main():
     ap.add_argument("--group_size", type=int, default=4, help="每 Prompt 并行采样数 G")
     ap.add_argument("--lr", type=float, default=2e-5, help="RL 学习率 (较小学习率防策略坍缩)")
     ap.add_argument("--tau", type=float, default=1.5, help="指数奖励塑形温度")
-    ap.add_argument("--beta_kl", type=float, default=0.4, help="SFT 基座 KL 散度惩罚系数 (需足够强, 防策略漂移坍缩)")
+    ap.add_argument("--beta_kl", type=float, default=0.6, help="SFT 基座 KL 散度惩罚系数 (需足够强, 防策略漂移坍缩)")
     ap.add_argument("--lambda_quiet", type=float, default=0.02, help="EOS 神经元静默损失权重")
     ap.add_argument("--temperature", type=float, default=1.0, help="采样温度 (防模式坍缩需偏高)")
     ap.add_argument("--repeat_penalty", type=float, default=1.4, help="repeat penalty (压固定短语回环)")
@@ -259,6 +171,13 @@ def main():
                     help="奖励塑形形态: exp(默认,指数拉大头部分差) / tanh(有界防-300爆炸) / log(对数压缩)。"
                          "注意: tanh 单点(100步)指标好, 但完整12阶段课程会累积压制对裸prompt乱码/空回复的"
                          "惩罚分辨率, 致裸prompt空率恶化(v7实测20-47%), 故默认用 exp + winsorize 防爆炸")
+    ap.add_argument("--arith_ratio", type=float, default=0.35,
+                    help="数学题提示词在候选池中的出现比例 (warm-start 用, 其余配比由池大小决定)")
+    ap.add_argument("--coherence_w", type=float, default=0.0,
+                    help="语感一致性作为正向奖励的权重开关 (0=沿用旧行为 coherence 仅门控)。"
+                         ">0 时把候选回复的基座 mean-logp 转成 z-score 传入 r_coherence, "
+                         "低似然(乱码沙拉)被惩罚、正常中文≈0 (dev-notes/66: 需 z-score 化, "
+                         "原始 mean-logp ~-8 直接传会把所有回复拉成 -5)。")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -280,12 +199,14 @@ def main():
 
     tok = load_tokenizer(ckpt)
     eos_id = tok.token_to_id("<eos>")
-    print(f"  词表模式: 字级 WordLevel ({tok.get_vocab_size()} 词) | EOS ID = {eos_id}")
+    cont_id = tok.token_to_id("<cont>")
+    print(f"  词表模式: 字级 WordLevel ({tok.get_vocab_size()} 词) | EOS ID = {eos_id} | CONT ID = {cont_id}"
+          f"  (双停止符 + 完整 r_control 自控奖励)")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
 
-    # 构造候选池 [(prompt_str, kind, keywords)]
-    # 构造全量人格化与积极提示词池 [(prompt_str, kind, keywords)]
+    # 构造候选池 [(prompt_str, kind, keywords)]。数学题独立成池, 按 --arith_ratio
+    # 控制出现频率 (配置驱动的提示词池可达 30 条, 若混在一起会失衡到 ~62%)。
     pool = []
     for p, kw in IDENTITY_PROMPTS:
         pool.append((p, "identity", kw))
@@ -297,65 +218,73 @@ def main():
         pool.append((p, "heuristic", kw))
     for p, kw in FACT_PROMPTS:
         pool.append((p, "fact", kw))
+    arith_pool = [(p, "arith", kw) for p, kw in ARITH_PROMPTS]
 
-    print(f"  提示词池: {len(pool)} 条 (涵盖 身份认知、旅行向往、日常心情、启发探索、科学常识)")
+    print(f"  提示词池: 常规 {len(pool)} 条 + 数学 {len(arith_pool)} 条 (arith_ratio={args.arith_ratio:.2f})")
     print("=" * 65)
 
     # 动态 tau: EMA 跟踪组内 raw_score 绝对尺度, 缩放指数塑形温度, 防尺度漂移
-    # 当奖励幅度整体偏低(如退化期), 缩小 tau 让正负对比更锐利; 偏高时放大 tau 防爆炸。
-    ema_abs_scale = 1.0  # 起点 = 组内 raw_s 绝对值的平滑
-    dyn_tau_ema = 0.9    # EMA 系数
+    ema_abs_scale = 1.0
+    dyn_tau_ema = 0.9
+
+    updater = GrpoUpdater(
+        model, eos_id, cont_id=cont_id,
+        beta_kl=args.beta_kl, clip_eps=0.2, quiet_scale=args.lambda_quiet,
+    )
+
+    def pick_prompt():
+        """按 arith_ratio 从常规池 / 数学池抽样 (数学题频率受 --arith_ratio 控制)。"""
+        if arith_pool and random.random() < args.arith_ratio:
+            return random.choice(arith_pool)
+        return random.choice(pool)
 
     for step in range(1, args.steps + 1):
-        prompt_text, kind, keywords = random.choice(pool)
-        # 朝"无标签自然对话"渐进: 73% 概率带 用户：/模型： 标签, 27% 概率裸 prompt
-        # (标签给模型稳定的对话锚点, 裸 prompt 训练泛化到无前缀自然输入)
+        prompt_text, kind, keywords = pick_prompt()
         if random.random() >= 0.27:
             prompt_text = f"用户：{prompt_text}\n模型："
         prompt_ids = tok.encode(prompt_text).ids
+        prompt_len = len(prompt_ids)
 
-        # 1. 对该 Prompt 全并行采样 G 个候选回复
+        # 1. 采样 + 原始奖励 + 基座似然门控
         model.eval()
-        candidates = []
-        raw_scores = []
-        exp_rewards = []
-
         batch_reply_ids = sample_candidates_batch(
             model, tok, prompt_ids, eos_id, group_size=args.group_size, max_new_tokens=55,
-            temperature=args.temperature, top_k=200, repeat_penalty=args.repeat_penalty, device=device
+            temperature=args.temperature, top_k=200, repeat_penalty=args.repeat_penalty, device=device,
+            cont_id=cont_id,
         )
 
-        # 先收集全部候选与原始分 + 基座似然度 (anti-salad 门控用)
         candidates = []
         raw_scores = []
         mlp_vals = []
         for reply_ids in batch_reply_ids:
-            reply_text = tok.decode(reply_ids).replace("<eos>", "").strip()
+            reply_text = tok.decode(reply_ids).replace("<eos>", "").replace("<cont>", "").strip()
             mlp = mean_ref_reply_logprob(ref_model, prompt_ids, reply_ids, device)
             mlp_vals.append(mlp)
+            # 语感一致性: 仅当 --coherence_w>0 时把 mean-logp 转 z-score 传入奖励维度
+            # (r_coherence 内部按 z 给分, 乱码 z≪0 → 负, 正常中文 z≈0)。原始 logp 不能
+            # 直接传 (dev-notes/66: ~-8 会把所有回复拉成 -5, 抹平信号)。权重 w_coherence=2,
+            # 缩放系数使最终贡献 ≈ coherence_w * clamp(z)。
+            if args.coherence_w > 0 and mlp is not None:
+                z = (mlp - COH_THETA) / COH_SIGMA
+                coherence_eff = z * (args.coherence_w / 2.0)
+            else:
+                coherence_eff = None
             score = compute_raw_reward(prompt_text, reply_text, reply_ids, eos_id, kind, keywords,
-                                       coherence=None)  # 基座似然只做门控, 不做奖励(避免惩罚流畅文本)
+                                       coherence=coherence_eff, cont_id=cont_id)
             candidates.append((reply_ids, reply_text))
             raw_scores.append(score)
 
-        # 动态 tau: 用本组 raw_scores 的绝对均值更新 EMA 尺度, 据此缩放 tau
+        # 2. 奖励塑形 + 组内多样性惩罚 → exp 奖励
         if args.dyn_tau:
             import numpy as _np
             batch_abs = float(_np.mean([abs(s) for s in raw_scores])) if raw_scores else 1.0
             ema_abs_scale = dyn_tau_ema * ema_abs_scale + (1.0 - dyn_tau_ema) * max(batch_abs, 0.2)
-            # 尺度越大 tau 越大(更平缓), 尺度越小 tau 越小(对比更锐利); 以 1.0 为参考基线
             tau_eff = args.tau * max(0.7, min(1.4, ema_abs_scale / 1.0))
         else:
             tau_eff = args.tau
 
-        # 组内多样性惩罚 (Anti-Mode-Collapse): 候选与组内"最像的其他候选"重叠越多扣分越多。
-        # 作用: 当某一短语在组内重复出现(模式坍缩雪球期), 它的相对优势被压下去,
-        #       反而鼓励组内其他"不同但还行"的表达 → 打破"单一短语越滚越大"的正反馈。
-        # 注意: 全组同分时 std≈0 → advantage≈0 已天然防更新; 这里解决的是"主流短语
-        #       混杂在多样候选里、持续拿正优势"的阶段。
         exp_rewards = []
         if args.div_weight > 0:
-            from training.rl.multi_reward import _ngram_set
             ngrams = [_ngram_set(t.strip()) for _, t in candidates]
             for i in range(len(candidates)):
                 a = ngrams[i]
@@ -367,109 +296,138 @@ def main():
                     if not a or not b:
                         continue
                     inter = len(a & b)
-                    overlap = 2.0 * inter / (len(a) + len(b))
-                    best_overlap = max(best_overlap, overlap)
-                # 重叠越高扣分越多; 权重 1.5, 完全重复(~1.0)扣 ~1.5
+                    best_overlap = max(best_overlap, 2.0 * inter / (len(a) + len(b)))
                 penalty = args.div_weight * best_overlap
                 exp_rewards.append(reward_shaping(raw_scores[i] - penalty, shape=args.shape, tau=tau_eff, c=4.0))
         else:
             exp_rewards = [reward_shaping(s, shape=args.shape, tau=tau_eff, c=4.0) for s in raw_scores]
-        # 2. 计算组相对优势 (Group Relative Advantages) —— 鲁棒化 (winsorize 裁剪)
-        # 指数塑形对极端烂样本(乱码/超大负分)会爆炸出 R≈-300; 组内 std 归一化会被单
-        # 个异常值彻底炸裂, 让同组其余正常候选的优势全部失真。先在组内对 exp_rewards
-        # 做 winsorize 裁剪 (以组内 median ± k*MAD 收窄), 再去 std 归一化。
-        rewards_t = torch.tensor(exp_rewards, dtype=torch.float32, device=device)
-        if args.winsorize > 0 and rewards_t.numel() >= 3:
-            med = torch.median(rewards_t)
-            mad = (rewards_t - med).abs().median() + 1e-6
-            lo = med - args.winsorize * mad
-            hi = med + args.winsorize * mad
-            clipped = rewards_t.clamp(lo, hi)
-        else:
-            clipped = rewards_t
-        mean_r = clipped.mean()
-        std_r = clipped.std() + 1e-6
-        advantages = (clipped - mean_r) / std_r
 
-        # 3. 整组退化保护 (Anti-Collapse Gate)
-        # 用"组内最高原始分"判断 (scale 无关, 不受奖励塑形尺度影响)：
-        # 若整组最佳候选的原始分都 < 0, 说明本组没有任何像样的回答 (空回复/<eos>/乱码扎堆)。
-        # 此时组内归一化会把"最不烂的垃圾"当正样本, 反着强化坍缩方向。
-        # 因此跳过策略梯度, 只保留 KL(拉回基座) + EOS 静默, 等下次采样回到正常区。
-        # anti-salad 门控 (v6/v7 实测核心崩因): "全组乱码但 raw>0" 时旧逻辑不拦,
-        # 组内相对优势把乱码当正样本自增强。基座似然度 (mean-logp) 是乱码最好判据
-        # (基座自采样 ≈ -7.8±2, 乱码 ≈ -13.9): 组内最佳候选低于阈值 → 也判退化。
+        # 3. 优势归一化 + winsorize (GrpoUpdater)
+        advantages = GrpoUpdater.normalize_advantages(exp_rewards).to(device)
+        if args.winsorize > 0 and advantages.numel() >= 3:
+            med = torch.median(advantages)
+            mad = (advantages - med).abs().median() + 1e-6
+            advantages = advantages.clamp(med - args.winsorize * mad, med + args.winsorize * mad)
+
+        # 3.5 逐候选"短空壳"硬压制 (Anti-Dwarf): 混合组里单个 `"` 空壳不能在组内
+        #    归一化下拿到不偏/正优势 —— 否则它与稍微更烂的候选互相掩护、被逐步强化
+        #    (rl_cont_v5 20 步健康→150 步 90% 单引号的根源)。把"单字/空/二字非数字"
+        #    的候选优势直接压到该组最负, 让它永远只能被压制、绝不被强化。
+        _adv_bottom = float(advantages.min().item()) - 1.0
+        for i, (rid, rt) in enumerate(candidates):
+            _t = rt.strip()
+            if not _t:                                              # 空回复
+                advantages[i] = _adv_bottom
+            elif len(_t) <= 2 and not bool(re.fullmatch(r"\d{1,3}", _t)):  # `"` / 二字残壳
+                advantages[i] = _adv_bottom
+            # 注意: 单数字回复 (如 "7") 保留正常优势, 仍算数学努力。
+
+        # 4. 整组退化保护 (Anti-Collapse Gate): 只在"全组都无可训练候选"时才归零优势。
+        #    NOTE(Fix): 旧版用 max_raw < 0 或 best_mlp 过低 → 一旦整组碰巧全负就归零,
+        #    导致模型一坍缩就彻底失去策略梯度 (仅剩 KL 拉回 → 坍缩自我强化, 实测根因)。
+        #    现在改为:
+        #      - 只要组里有**任一**非退化候选 (raw >= 0, 即至少一个可强化对象),
+        #        就保留优势 (负项交给 winsorize 钳制, 不让极端负值主导)。
+        #      - 仅当"全部 raw < 0 **且** 组最佳基座似然也过低(乱码)"才归零。
         max_raw = max(raw_scores)
         best_mlp = max((m for m in mlp_vals if m is not None), default=None)
         salad_degen = best_mlp is not None and best_mlp < (COH_THETA - COH_GATE_SIG * COH_SIGMA)
-        degenerate = bool(max_raw < 0) or salad_degen
+
+        # ── 内容式坍缩检测 (Anti-Collapse Gate 补强) ─────────────────────────
+        # 旧门只认"基座似然过低(乱码)" + 组最佳 len<=1, 对 len 2~4 的"短空壳"
+        # (如 `可以10"` / `不我,"`) 完全失明: 它们长度>1 逃过旧门, 又被组内相对
+        # 归一化当成"最不烂"给正优势强化 → 组均长被一步步拖向 1 (rl_cont_v4 实测
+        # 路径: 均长 16→4→2→1)。补两点:
+        #   (a) 组平均长度坍缩: 整组均长 < 门限 → 无可强化对象, 归零优势。
+        #   (b) 组最佳极短空壳 (len<=2 非单数字) 依然判死。
+        _group_avg_len = float(sum(len(t) for _, t in candidates)) / max(len(candidates), 1)
+        threshold_ix = int(torch.argmax(torch.tensor(exp_rewards)).item())
+        best_text = candidates[threshold_ix][1].strip()
+        _best_len = len(best_text)
+        _best_is_digit_only = bool(re.fullmatch(r"\d{1,3}", best_text))
+        content_collapse = (
+            max_raw < 0
+            and (
+                _best_len <= 1                        # 组最佳单字空壳
+                or _group_avg_len <= 4                # 整组被拖成短空壳 (均长≤4)
+            )
+            and not _best_is_digit_only  # 单数字回复仍可算数学努力, 不按坍缩判死
+        )
+        degenerate = (max_raw < 0 and salad_degen) or content_collapse
         if degenerate:
-            reason = (f"组最高分 {max_raw:6.2f} < 0" if max_raw < 0
-                      else f"组最佳基座似然 {best_mlp:.2f} 过低(乱码)")
-            print(f"  ⚠ 组退化 ({reason}) → 跳过策略梯度, 仅 KL/EOS 静默")
+            reason = ("组最佳基座似然过低/乱码" if salad_degen else
+                       f"组最佳候选为空壳 len={_best_len} {best_text!r}")
+            print(f"  ⚠ 组退化 ({reason}) → 归零优势, 仅 KL/EOS 静默拉回")
+            advantages = torch.zeros_like(advantages)
+        elif max_raw < 0:
+            # 全组偶然全负但并非乱码/空壳: 不归零, 用 winsorize 已钳制的优势继续学 (明辨相对高低)。
+            print(f"  · 组最高分 {max_raw:6.2f} < 0 (全负但非空壳) → 保留优势, winsorize 已钳极端负值")
 
-        # 3. 计算策略梯度 + KL 惩罚 + EOS 神经元静默损失
+        # 5. 收集各候选 logprob + quiet (带梯度), 交给 Updater 批量更新
         model.train()
-        total_loss = 0.0
-        policy_loss_sum = 0.0
-        kl_loss_sum = 0.0
-        quiet_loss_sum = 0.0
+        G = len(candidates)
+        max_rl = max((len(r) for r, _ in candidates if r), default=1)
+        new_lp = torch.zeros(G, max_rl, device=device)
+        ref_lp = torch.zeros(G, max_rl, device=device)
+        mask = torch.zeros(G, max_rl, dtype=torch.bool, device=device)
+        quiet_losses = []
 
-        for i in range(args.group_size):
-            reply_ids, reply_text = candidates[i]
+        for i in range(G):
+            reply_ids, _ = candidates[i]
             if not reply_ids:
+                quiet_losses.append(torch.tensor(0.0, device=device))
                 continue
-            adv = advantages[i]
-            full_ids = prompt_ids + reply_ids
-            prompt_len = len(prompt_ids)
             reply_len = len(reply_ids)
-
-            # 当前 Policy 的 logprobs 与隐藏状态 (带梯度)
+            full_ids = prompt_ids + reply_ids
+            # 当前 Policy logprobs + hidden (带梯度)
             curr_logprobs, h_f = get_token_logprobs_and_hidden(model, full_ids, device)
-            # 基座 Ref 的 logprobs (无梯度)
             with torch.no_grad():
                 ref_logprobs, _ = get_token_logprobs_and_hidden(ref_model, full_ids, device)
+            # logprobs 数组索引 i 对应 full_ids[i+1] 的预测概率, 回复位在 [prompt_len, prompt_len+reply_len)
+            new_lp[i, :reply_len] = curr_logprobs[prompt_len - 1:prompt_len - 1 + reply_len]
+            ref_lp[i, :reply_len] = ref_logprobs[prompt_len - 1:prompt_len - 1 + reply_len]
+            mask[i, :reply_len] = True
+            # 终止符 (eos 或 cont) 位置的静默能量
+            term_idx = -1
+            for _sid in (eos_id, cont_id):
+                if _sid in reply_ids:
+                    term_idx = reply_ids.index(_sid)
+                    break
+            quiet_losses.append(compute_quiet_loss_from_hidden(h_f, term_idx, prompt_len))
 
-            # 只对生成区域 (回复区域) 计算 Loss —— 注意起点是 prompt_len (第 0 个回复 token)
-            curr_reply_lp = curr_logprobs[prompt_len : prompt_len+reply_len]
-            ref_reply_lp = ref_logprobs[prompt_len : prompt_len+reply_len]
+        # 6. 单步更新 (GrpoUpdater 负责 优势加权/PPO-clip/KL/静默 合成)
+        #    优先权: 退化时 advantages 已全 0 → 策略项≈0, 仅 KL/静默拉回基座。
+        pol_loss, kl_loss, quiet_l = updater.update_step(
+            advantages, new_lp, ref_lp, mask, quiet_losses, optimizer,
+        )
+        total_loss = pol_loss + args.beta_kl * kl_loss + args.lambda_quiet * quiet_l
 
-            # 策略梯度损失 (优势加权; 整组退化时跳过, 避免反着强化垃圾)
-            if degenerate:
-                policy_loss = torch.tensor(0.0, device=device)
-            else:
-                policy_loss = -adv * curr_reply_lp.sum()
-
-            # KL 散度约束 (防策略漂移坍缩) —— 退化时这条是拉回基座的主力
-            kl = F.kl_div(curr_reply_lp, ref_reply_lp, log_target=True, reduction='sum')
-
-            # 终止符 EOS 静默约束 (L1 能量惩罚)
-            eos_idx_in_reply = reply_ids.index(eos_id) if eos_id in reply_ids else -1
-            quiet_l = compute_quiet_loss_from_hidden(h_f, eos_idx_in_reply, prompt_len)
-
-            cand_loss = (policy_loss + args.beta_kl * kl + args.lambda_quiet * quiet_l) / args.group_size
-            cand_loss.backward()
-
-            policy_loss_sum += policy_loss.item() / args.group_size
-            kl_loss_sum += kl.item() / args.group_size
-            quiet_loss_sum += quiet_l.item() / args.group_size
-            total_loss += cand_loss.item()
-
-        # 梯度裁剪与优化器单步更新
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        optimizer.zero_grad()
-
-        # 日志输出
+        # 7. 日志
         if step % 10 == 0 or step == 1:
+            rewards_t = torch.tensor(exp_rewards, device=device)
             best_idx = torch.argmax(rewards_t).item()
             best_reply = candidates[best_idx][1].strip()
-            print(f"Step [{step:3d}/{args.steps}] | Loss: {total_loss:7.4f} (Pol: {policy_loss_sum:6.2f}, KL: {kl_loss_sum:5.2f}, Quiet: {quiet_loss_sum:5.3f}) | 组均分: {mean_r.item():5.2f}")
-            print(f"  Q ({kind}): {prompt_text.strip().replace('\n', ' ')}")
-            print(f"  A (Top-1, raw_s={raw_scores[best_idx]:.2f}, exp_R={exp_rewards[best_idx]:.2f}): {best_reply[:60]}")
+            n_eos = sum(1 for rid, _ in candidates if eos_id in rid)
+            n_cont = sum(1 for rid, _ in candidates if cont_id in rid)
+            n_term = n_eos + n_cont
+            avg_len = float(sum(len(t) for _, t in candidates)) / max(len(candidates), 1)
+            # 数学正确率: 该步若是 arith 题, 统计组内"答案数字命中"比例
+            # (extract_answer_number 与奖励引擎同逻辑: 优先取等于/答案标记后的数字)
+            arith_acc = "-"
+            if kind == "arith":
+                hits = 0
+                ar = arith_gen.extract_arith(prompt_text)  # 与奖励引擎同一配置
+                for _, t in candidates:
+                    if ar and arith_gen.extract_answer_number(t.strip()) == ar[3]:
+                        hits += 1
+                arith_acc = f"{hits}/{G}"
+            print(f"Step [{step:3d}/{args.steps}] | Loss: {total_loss:7.4f} (Pol: {pol_loss:6.2f}, KL: {kl_loss:5.2f}, Quiet: {quiet_l:5.3f}) | 组均分: {exp_rewards[0]:5.2f}")
+            print(f"  Term: eos={n_eos}/{G} cont={n_cont}/{G} 未终止={G-n_term}/{G} | 均长 {avg_len:.1f} | 数学命中(arith): {arith_acc}")
+            print(f"  Q ({kind}): {prompt_text.strip().replace(chr(10), ' ')}")
+            print(f"  A (Top-1, raw_s={raw_scores[best_idx]:.2f}, exp_R={rewards_t[best_idx].item():.2f}): {best_reply[:60]}")
             print("─" * 65)
 
-    # 保存 RL 强化后模型 (强校验并自动创建父目录)
+    # 保存 RL 强化后模型
     ckpt_out = os.path.join(args.out, "best.pt")
     os.makedirs(os.path.dirname(os.path.abspath(ckpt_out)), exist_ok=True)
     save_dict = deepcopy(ckpt)
