@@ -34,20 +34,6 @@ def make_example(tok, a, b, s, nl_id):
         if i >= idx and i + 1 < len(ids):
             mask[i] = True   # 预测 ids[i+1], 当其在 '\n' 之后(含 eos 前)
     return x, y, mask
-    # 找 '\n' 位置, 答案区 = 其后第一个 token 直到 eos
-    try:
-        idx = ids.index(nl_id)
-    except ValueError:
-        idx = -1
-    # x 预测 y; x[i] -> y[i] = ids[i+1]
-    x = ids[:-1]
-    y = ids[1:]
-    mask = [False] * len(y)
-    for i in range(len(y)):
-        # 该位置预测的是 ids[i+1]; 当 i >= idx 时预测的是答案区
-        if i >= idx and i + 1 < len(ids):
-            mask[i] = True
-    return x, y, mask
 
 
 def build_batch(tok, pairs, dev, nl_id):
