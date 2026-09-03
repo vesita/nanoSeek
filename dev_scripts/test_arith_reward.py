@@ -72,5 +72,21 @@ for s in ["3加上4等于多少？", "15减去7等于？", "12×9等于几？", 
         ok = check(f"variant[{ar[3]}]", s, f"{ar[3]}", True)
         fails += 0 if ok else 1
 
+# 6. 三态判定 (dev-notes/66 拒答惩罚修复): 答对 / 答错(attempted) / 拒答废话(not attempted)
+#    拒答惩罚力度应显著重于答错, 且答对 > 答错 > 拒答(废话流).
+def r_arith_of(reply):
+    v, _, _ = evaluate("3加4等于几？", reply)
+    return v.r_arith
+
+fails += 0 if r_arith_of("答案是7") > 0 else 1          # 答对 → 正分
+fails += 0 if r_arith_of("答案是8") < r_arith_of("答案是7") else 1  # 答错 < 答对
+# 废话流/答非所问 → 拒答重罚, 应显著负于答错(避难所剔除)
+fails += 0 if r_arith_of("我觉得慢慢来总会好起来的吧") < r_arith_of("答案是8") else 1
+fails += 0 if r_arith_of("有点先让自己起来的那个冒出来") < 0 else 1  # 废话流净负
+# has_answer_intent: 废话流汉字"一/一起"不应误判成作答
+fails += 0 if arith_gen.has_answer_intent("有点先让自己起来的那个冒出来") is False else 1
+fails += 0 if arith_gen.has_answer_intent("答案是35") is True else 1
+fails += 0 if arith_gen.has_answer_intent("二十四") is True else 1
+
 print(f"\n=== 结果: {'全部通过' if fails == 0 else f'{fails} 项失败'} ===")
 sys.exit(1 if fails else 0)
