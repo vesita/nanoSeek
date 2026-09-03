@@ -1,7 +1,7 @@
 # 醒来看这里 —— 2026-09-04 夜间 RL 迭代速览
 
 > 详细见 dev-notes/66(根因) 67(判死链+成果) 68(能力边界+方向建议)。
-> 全部改动已 commit (5ee106e → 76e8ca2, 6个)。无残留训练进程。
+> 全部代码/笔记改动已 commit (5ee106e → e2a5fce, 7个)。无残留训练进程。
 
 ## 一句话结论
 你要的"数学 RL"经 4 套独立实验证明：**2.7M 模型学不会算术是容量天花板，不是奖励/步数问题**。
@@ -32,3 +32,24 @@ out/rl_coh_dialog/best.pt    # 300步 coherence RL 对话增强
 1. 目标=稳定对话小模型 → 用 rl_coh_dialog, 已是实践边界
 2. 目标=真理解/数学/多轮 → 需换更大模型, 2.7M 上调参无突破(4套铁证)
 3. 数学硬目标 → 走工具化/格式化(模型输出算式, 外部算), 不追求真算
+
+## 一键复现 / 验证（醒来可直接跑）
+```bash
+cd /home/vesita/coding/my/nanoSeek
+export HSA_ENABLE_SDMA=0 HSA_OVERRIDE_GFX_VERSION=10.3.0 TMPDIR=/home/vesita/AI/scratch
+
+# 1) 对话验证推荐模型 (A:/B: 前缀, Ctrl+C 或空行退出)
+.venv/bin/python inference/scripts/chat.py --out_dir out/rl_coh_dialog
+
+# 2) 标准健康体检 (多prompt, EOS/均长/乱码)
+.venv/bin/python -c \
+  "from training.rl.curriculum_lib import checkpoint_healthy; print(checkpoint_healthy('out/rl_coh_dialog/best.pt'))"
+
+# 3) 复现最佳模型训练 (300步 coherence 对话 RL)
+.venv/bin/python training/rl/grpo_char.py --ckpt out/cont_v1_1epoch/best.pt \
+  --out out/rl_coh_dialog_repro --ref_base out/cont_v1_1epoch/best.pt \
+  --steps 300 --coherence_w 0.5 --arith_ratio 0.0
+
+# 4) 数学容量判死复核 (基座 argmax 对个位数加法 1/36 命中 → 容量证据)
+.venv/bin/python dev_scripts/probe_capacity.py
+```
