@@ -84,6 +84,7 @@ class GPTConfig:
     kv_memory_delta: bool = False  # P2：Delta 擦写律——S←r⊙S+w(v−S·k)kᵀ 先擦后写，消除键冲突混叠（dev-notes/45）
     kv_memory_output_gate: bool = False  # KV 记忆输出门控 (Output Gate) + 状态 RMSNorm（GLA/RetNet 思想）
     sample_boundary_reset: bool = True   # 样本边界重置与因果阻断：遇到 <eos> 时清空记忆黑板并阻断滑窗跨样本注意
+    eos_token_id: int = 0                # <eos> 的 token id（样本边界重置/终止检测用）。字级 v3 词表=128、字节模式=256
     byte_level: bool = False  # 字节直入+3:1聚合（dev-notes/48）：输入 UTF-8 字节流，聚合层学"字节→语义单位"，无 BPE 分词
     char_level: bool = False  # 字级（dev-notes/50）：汉字=1 token，标准 GPT + WordLevel 词表（对齐字符、无话术固化）
     factorized_emb_dim: int = 0  # 因式分解嵌入维度：>0 时启用低秩嵌入（ALBERT 思想），wte 降至 E 维 + 升降维投影，省参数加深网络
@@ -134,3 +135,5 @@ class GPTConfig:
     # 惩罚 z² 的平均，防止路由 logits 数值过大导致训练波动 / 专家崩溃。
     # 权重 0 = 关闭；建议从 1e-4 起步。
     z_loss_weight: float = 0.0
+    # --- 100M 大模型与长上下文基建：梯度检查点 (Activation Checkpointing) ---
+    gradient_checkpointing: bool = False  # True: 对 Transformer Block 开启重算，压降 65%~75% 显存

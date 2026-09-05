@@ -28,16 +28,21 @@ def collect_corpus_files():
     return paths
 
 
-def build_char_wordlevel(paths, out_json, hanzi_top=4400, mech_slots=16):
-    """字级词表 v2（dev-notes/50 + 61 布局）：统一管理机制符区间。
+def build_char_wordlevel(paths, out_json, hanzi_top=4400, mech_slots=16,
+                         base_slots=128, mech_zone_slots=256, hanzi_zone_slots=7808):
+    """字级词表 v3（dev-notes/50 + 61 + 76 稀疏分区布局）。
 
-    三区布局（用户设计, dev-notes/61）：
-      1. 基础文本字符 121 个  (换行 + 空格 + ASCII 32-126 + 全角标点)
-      2. 机制词区间 16 位      (所有非 ASCII/非自然语言符号: <eos><unk><cont> + 预留,
-                                未来 <pad>/<bos>/<sep> 等都在这里扩充, 统一管理)
-      3. 汉字                (按治理后语料词频降序, top hanzi_top)
+    四区稀疏布局（改良自 v2，为未来扩充预留稀疏空间，新增机制符/汉字不再错位）：
+      1. 基础文本字符区 (base_slots=128)   : 换行 + 空格 + ASCII 32-126 + 全角标点
+          实际占用 ~117 位，其余填 <reserved_base_i> 稀疏占位（对齐 128 边界）。
+      2. 机制符区间 (mech_zone_slots=256)  : <eos>/<unk>/<cont> + 命名机制符
+          (<pad>/<bos>/<sep>/<call>/<result>/<think>/<answer>...) + <res_i> 稀疏占位。
+          预留充足，未来 Agent/RL 新增机制符直接占空位，汉字区 id 零错位。
+      3. 汉字区 (hanzi_zone_slots=7808)   : 按治理后语料词频降序，top hanzi_top 个常用字，
+          其余 <res_han_i> 稀疏占位，未来语料出现新低频字可无缝追加。
 
-    词表总量 = 121 + 16 + hanzi_top。重训后旧字级 checkpoint 的 id 错位作废（可接受）。
+    总词表 = 128 + 256 + 7808 = 8192 (2^13，对齐硬件 GEMM 高效边界)。
+    稀疏空间总预留 ≈ (128-117) + (256-命名符) + (7808-hanzi_top) 位。
     """
     import collections
 
@@ -45,14 +50,18 @@ def build_char_wordlevel(paths, out_json, hanzi_top=4400, mech_slots=16):
     fullwidth = "。！？，、；：\"\"''（）《》…—·～「」『』【】"
     base = ["\n", " "] + [chr(c) for c in range(32, 127)] + list(fullwidth)
     base = list(dict.fromkeys(base))   # 去重保序
+    # 稀疏占位：不足 base_slots 的用 <reserved_base_i> 填充
+    base += [f"<reserved_base{i}>" for i in range(max(0, base_slots - len(base)))]
 
-    # ── 区 2: 机制符区间（统一管理）──
-    # 16 位: eos/unk/cont + 预留。未来新增机制符占剩余预留位, 无需迁移。
-    mech_names = ["<eos>", "<unk>", "<cont>"]
-    mech_reserved = [f"<res{i}>" for i in range(mech_slots - len(mech_names))]
+    # ── 区 2: 机制符区间（统一管理 + 稀疏预留）──
+    # 命名机制符（前几个固定语义，顺序即 id，绝不更改）：
+    mech_names = ["<eos>", "<unk>", "<cont>", "<pad>", "<bos>", "<sep>",
+                  "<call>", "<result>", "<think>", "<answer>", "<tool>", "<search>"]
+    # 剩余稀疏占位：未来机制符扩展区
+    mech_reserved = [f"<res{i}>" for i in range(max(0, mech_zone_slots - len(mech_names)))]
     mec = mech_names + mech_reserved
 
-    # ── 区 3: 汉字（治理后语料词频降序）──
+    # ── 区 3: 汉字（治理后语料词频降序，稀疏尾预留）──
     counter = collections.Counter()
     for p in paths:
         with open(p, encoding="utf-8", errors="replace") as f:
@@ -61,6 +70,8 @@ def build_char_wordlevel(paths, out_json, hanzi_top=4400, mech_slots=16):
             if "\u4e00" <= c <= "\u9fff" and c not in base and c not in mec]
     hans.sort(key=lambda x: -x[1])
     han_toks = [c for c, _ in hans[:hanzi_top]]
+    # 稀疏占位：不足 hanzi_zone_slots 的用 <res_han_i> 填充（未来追加低频字）
+    han_toks += [f"<res_han{i}>" for i in range(max(0, hanzi_zone_slots - len(han_toks)))]
 
     # ── 拼装词表 ──
     vocab: dict = {}
@@ -68,9 +79,9 @@ def build_char_wordlevel(paths, out_json, hanzi_top=4400, mech_slots=16):
         for it in items:
             if it not in vocab:
                 vocab[it] = len(vocab)
-    _add(base)          # 0..120   基础文本字符
-    _add(mec)           # 121..136 机制符区间 16 位
-    _add(han_toks)      # 137..    汉字词频降序
+    _add(base)          # 0..127       基础文本字符区（128 位，稀疏对齐）
+    _add(mec)           # 128..383     机制符区间（256 位，含命名符 + 稀疏预留）
+    _add(han_toks)      # 384..8191    汉字区（7808 位，词频降序 + 稀疏尾）
 
     tok = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
     tok.pre_tokenizer = pre_tokenizers.Split(Regex(r"[\s\S]"), behavior="isolated")
@@ -80,12 +91,11 @@ def build_char_wordlevel(paths, out_json, hanzi_top=4400, mech_slots=16):
     for name in mech_names:
         tok.add_special_tokens([AddedToken(name, special=True)])
     tok.save(out_json)
-    print(f"\n字级词表 v2 {len(vocab)} 项 → {out_json}（WordLevel, 三区布局）")
-    print(f"  基础字符 {len(base)} | 机制符区间 {len(mec)} (含预留) | 汉字 {len(han_toks)}")
+    print(f"\n字级词表 v3 {len(vocab)} 项 → {out_json}（WordLevel, 四区稀疏布局）")
+    print(f"  基础字符区 {len(base)} | 机制符区间 {len(mec)} (命名{len(mech_names)}+预留{len(mech_reserved)}) | 汉字区 {len(han_toks)} (实际{hanzi_top}+稀疏{max(0, hanzi_zone_slots-hanzi_top)})")
     for i, name in enumerate(mech_names):
-        print(f"    机制符 {name:>8} → id {i}")
+        print(f"    机制符 {name:>10} → id {base_slots + i}")
     return tok
-
 
 def main():
     import argparse

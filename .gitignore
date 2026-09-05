@@ -28,6 +28,12 @@ data/*/*.bak*
 data/*/_backup_*/
 data/*/_discarded/
 
+# 外部克隆的开源数据仓库（TheAlgorithms/doocs/chinese-poetry，第三方代码不进库）
+data/external/
+# 纯文本预训练语料（parse_external_pretrain.py 从外部仓库生成，可重建）
+data/chinese/pretrain/
+data/paper/
+
 # Rust 推理框架转换产物（由 inference/runtime/scripts/convert.py 重新生成）
 inference/runtime/target/
 inference/runtime/model.safetensors

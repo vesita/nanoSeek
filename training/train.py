@@ -30,6 +30,13 @@ import re
 from collections import Counter
 from contextlib import nullcontext
 
+# --- 基础设施规范（ROCm / AMD GPU 运行规约）---
+# 必须在 import torch 之前注入，防止 gfx1032/gfx1030 指令集报错与 SDMA 异步拷贝引发的 PCIe 假死
+os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
+os.environ.setdefault("HSA_ENABLE_SDMA", "0")
+# PyTorch 2.9+ 用 PYTORCH_ALLOC_CONF（旧 PYTORCH_HIP_ALLOC_CONF 已 deprecated，会刷警告）
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 # 脚本在 training/ 子目录，Python 默认不会把项目根目录加进模块搜索路径。
 # 这里把根目录插到 sys.path 开头，才能 `from model import ...`。
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -153,6 +160,7 @@ use_lse_residual = False     # 对数放缩残差：对数域 soft-max 合并替
 use_lse_gate = False         # 对数放缩门控混合：α·x+(1-α)·LSE(x,F)，α 可学习（每层标量）
 use_qk_norm = False          # QK-Norm：q/k L2 归一化 + 每头可学习 scale（近零参数，压重复坍缩）
 z_loss_weight = 0.0          # Router Z-Loss 权重；0 = 关闭，建议 1e-4 起步
+gradient_checkpointing = False  # 梯度检查点：block 级重算，压降 65%~75% 激活显存（100M 模型 8GB 卡必开）
 # --- loss masking（chat 微调惯例：只对 assistant 回复算 loss）---
 use_loss_masking = True      # False = 全部 token 参与训练（非对话语料）
 # 去标签 masking（dev-notes/61）：按回复终止符 <eos>/<cont> 定位模型回复行。
@@ -366,10 +374,17 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   n_memory_tokens=n_memory_tokens,
                   use_lse_residual=use_lse_residual,
                   use_lse_gate=use_lse_gate,
-                    use_qk_norm=use_qk_norm,
-                    z_loss_weight=z_loss_weight,
+                  use_qk_norm=use_qk_norm,
+                  z_loss_weight=z_loss_weight,
+                  gradient_checkpointing=gradient_checkpointing,
                   byte_level=byte_level, char_level=char_level,
                   factorized_emb_dim=factorized_emb_dim)
+# 字级/字节模式下，把 <eos> 的真实 token id 注入 config，供样本边界重置/终止检测使用
+# （v3 稀疏词表 <eos>=128；字节模式 <eos>=256；旧字级 <eos>=117/121 等自动对齐）
+if char_level:
+    model_args['eos_token_id'] = _cv['<eos>']
+elif byte_level:
+    model_args['eos_token_id'] = 0x0100  # 256 = <eos>
 def _build_model_from_checkpoint(checkpoint):
     """按 checkpoint 里的 model_args 构建模型并加载权重（供 resume / 后训练复用）。"""
     checkpoint_model_args = checkpoint['model_args']
@@ -414,17 +429,32 @@ if init_from == 'scratch':
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
-    print(f"正在从 {out_dir} 恢复训练（YOLO 式：自动加载 best.pt）")
-    # 从 checkpoint 恢复训练。续训会连同优化器、学习率计划、迭代计数一起恢复。
-    ckpt_path = os.path.join(out_dir, 'best.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    # 从 checkpoint 恢复训练：优先 last.pt（最新进度，防止意外中断丢进度），
+    # last.pt 缺失时回退 best.pt（兼容旧版只有 best.pt 的情况）。
+    last_path = os.path.join(out_dir, 'last.pt')
+    best_path = os.path.join(out_dir, 'best.pt')
+    ckpt_path = last_path if os.path.exists(last_path) else best_path
+    print(f"正在从 {os.path.basename(ckpt_path)} 恢复训练（断点续训：iter/优化器/学习率/RNG 全量恢复）")
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     model = _build_model_from_checkpoint(checkpoint)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+    raw_best_val = checkpoint.get('raw_best_val', best_val_loss)  # 早停基准（旧 ckpt 无此字段则用 best_val_loss）
+    # 确定性续训：恢复全部随机源状态（缺省字段时静默跳过，兼容旧 checkpoint）。
+    # 数据加载是随机采样（无顺序进度指针），靠这四路 RNG 复现采样序列。
+    if checkpoint.get('rng_state') is not None:
+        torch.set_rng_state(checkpoint['rng_state'])
+    if checkpoint.get('cuda_rng_state') is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])
+    if checkpoint.get('python_rng_state') is not None:
+        random.setstate(checkpoint['python_rng_state'])
+    if checkpoint.get('numpy_rng_state') is not None:
+        np.random.set_state(checkpoint['numpy_rng_state'])
+    resume_scaler_state = checkpoint.get('scaler_state')
 elif init_from.endswith('.pt'):
     # 在已有模型上做后训练：加载权重，但从头开始新的优化器/学习率计划
     print(f"正在从 {init_from} 加载已有模型权重（后训练，优化器/学习率重置）")
-    checkpoint = torch.load(init_from, map_location=device)
+    checkpoint = torch.load(init_from, map_location=device, weights_only=False)
     model = _build_model_from_checkpoint(checkpoint)
     # iter_num / best_val_loss 保持初始值（0 / 1e9），全新训练
 else:
@@ -433,6 +463,9 @@ model.to(device)
 
 # 初始化 GradScaler。如果 enabled=False，scaler 是空操作
 scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
+# resume 时恢复 GradScaler 的 scale 状态（float16 训练中断恢复不丢失 scale）
+if init_from == 'resume' and locals().get('resume_scaler_state') is not None:
+    scaler.load_state_dict(resume_scaler_state)
 
 # 优化器
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -496,13 +529,16 @@ def estimate_loss(splits=('train', 'val')):
     out = {}
     model.eval()
     for split in splits:
-        losses = torch.zeros(eval_iters)
+        losses = []
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+            # NaN 防护：train 数据某些窗口无 <eos>/<cont> → mask 全 -100 → loss 为 nan。
+            # 跳过这些无效 batch，只对有限 loss 求均值（与训练循环的 step_nan 防护对齐）。
+            if torch.isfinite(loss):
+                losses.append(loss.item())
+        out[split] = torch.tensor(losses).mean() if losses else float('nan')
     model.train()
     return out
 
@@ -804,9 +840,11 @@ if indexer_warmup_steps > 0:
 while True:
 
     # 确定并设置本次迭代的学习率
+    # 按各参数组各自的 lr_ratio 缩放（Muon=0.2×、AdamW=1.0×），修复此前粗暴覆写导致
+    # Muon 实际用 5 倍学习率的 bug（100M 训练 NaN 的根因之一）。
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        param_group['lr'] = lr * param_group.get('lr_ratio', 1.0)
 
     # 在 train/val 集合上评估损失并保存 checkpoint
     if iter_num % eval_interval == 0 and master_process:
@@ -876,8 +914,16 @@ while True:
                 'model_args': model_args,
                 'iter_num': iter_num,
                 'best_val_loss': best_val_loss,
+                'raw_best_val': raw_best_val,   # 原始 val 最优（早停判断用，resume 时恢复避免早停计数重置）
                 'config': config,
                 'epoch': iter_num / steps_per_epoch if steps_per_epoch else None,
+                # 确定性续训：保存全部随机源状态，resume 时精确复现数据采样/dropout 顺序
+                'rng_state': torch.get_rng_state(),
+                'cuda_rng_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                'python_rng_state': random.getstate(),
+                'numpy_rng_state': np.random.get_state(),
+                # float16 训练时 GradScaler 的 scale 状态（bf16 下为 no-op，仍存以保证兼容）
+                'scaler_state': scaler.state_dict(),
             }
             save_checkpoint_async(checkpoint, os.path.join(out_dir, 'last.pt'))
             if is_best:
@@ -944,7 +990,9 @@ while True:
         # 裁剪梯度
         if grad_clip != 0.0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip).item()
+        else:
+            grad_norm = 0.0
         # 如果以 fp16 训练，则更新优化器和 scaler
         scaler.step(optimizer)
         scaler.update()
@@ -966,7 +1014,10 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         epoch_str = f"{iter_num/steps_per_epoch:.2f}" if steps_per_epoch else "-"
-        pbar.set_postfix(轮次=f"{epoch_str}", 损失=f"{lossf:.4f}", MFU=f"{max(running_mfu, 0.0)*100:.1f}%")
+        # 显存监控与实时吞吐追踪
+        mem_gb = torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
+        tps = (tokens_per_iter) / max(dt, 1e-4)
+        pbar.set_postfix(轮次=f"{epoch_str}", 损失=f"{lossf:.4f}", 梯范=f"{grad_norm:.2f}", 显存=f"{mem_gb:.1f}G", 吞吐=f"{tps:.0f}t/s")
     iter_num += 1
     local_iter_num += 1
     if pbar is not None:

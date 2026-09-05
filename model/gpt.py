@@ -158,9 +158,19 @@ class GPT(nn.Module):
         if self.config.use_mhc:
             # mHC：4 个残差流从同一个嵌入出发（在流维扩展）
             x = x.unsqueeze(2).expand(b, x.size(1), self.config.hc_mult, self.config.n_embd)
-        is_eos = (idx == 0) if (not self.config.byte_level and getattr(self.config, 'sample_boundary_reset', True)) else None
+        is_eos = (idx == getattr(self.config, 'eos_token_id', 0)) if (not self.config.byte_level and getattr(self.config, 'sample_boundary_reset', True)) else None
+        # 梯度检查点：aux-free MoE 的 router_bias 在 forward 内就地更新（no_grad 副作用），
+        # 与 checkpoint 的 recompute 重算不兼容（重算时 bias 已变 → 路由结果不一致 → CheckpointError）。
+        # 因此 use_moe + use_aux_free_balance 时自动降级为不检查点（MoE 稀疏激活显存本就不高，
+        # 100M 模型在 8GB 卡上靠 batch_size 控制即可，无需强制检查点）。
+        use_ckpt = getattr(self.config, 'gradient_checkpointing', False) and self.training
+        if use_ckpt and self.config.use_moe and getattr(self.config, 'use_aux_free_balance', False):
+            use_ckpt = False
         for block in self.transformer.h:
-            x = block(x, rope_offset=rope_offset, is_eos=is_eos)
+            if use_ckpt:
+                x = torch.utils.checkpoint.checkpoint(block, x, rope_offset, is_eos, use_reentrant=False)
+            else:
+                x = block(x, rope_offset=rope_offset, is_eos=is_eos)
         if self.config.use_mhc:
             # 4 流均值回到 1 流，再给 ln_f / lm_head（V4 用可学习合并，这里用均值简化）
             x = x.mean(dim=2)
@@ -333,7 +343,8 @@ class GPT(nn.Module):
                         spec = _attn_head_spec(n, p, self.config.n_head)
                         if spec is not None:
                             split_heads[id(p)] = spec
-            muon = Muon([{'params': muon_params, 'weight_decay': weight_decay}],
+            muon = Muon([{'params': muon_params, 'weight_decay': weight_decay,
+                          'lr_ratio': self.config.muon_lr_scale}],
                         lr=learning_rate * self.config.muon_lr_scale,
                         momentum=self.config.muon_momentum,
                         ns_steps=self.config.muon_ns_steps,
@@ -341,8 +352,8 @@ class GPT(nn.Module):
             fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
             extra_args = dict(fused=True) if fused_available and device_type == 'cuda' else {}
             adamw = torch.optim.AdamW(
-                [{'params': adamw_decay, 'weight_decay': weight_decay},
-                 {'params': adamw_nodecay, 'weight_decay': 0.0}],
+                [{'params': adamw_decay, 'weight_decay': weight_decay, 'lr_ratio': 1.0},
+                 {'params': adamw_nodecay, 'weight_decay': 0.0, 'lr_ratio': 1.0}],
                 lr=learning_rate, betas=betas, **extra_args)
             return MuonAdamW(muon, adamw)
 
@@ -363,7 +374,7 @@ class GPT(nn.Module):
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ 估算模型算力利用率（MFU），以 A100 bfloat16 峰值 FLOPS 为单位 """
+        """ 估算模型算力利用率（MFU），按实际设备的 bf16 峰值 FLOPS 计算 """
         # 首先估算每次迭代我们要做的 flops 数。
         # 参考 PaLM 论文附录 B：https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
@@ -372,9 +383,19 @@ class GPT(nn.Module):
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # 用 A100 bfloat16 峰值 flops 的比例来表示我们的 flops 吞吐量
-        flops_achieved = flops_per_iter * (1.0/dt) # 每秒
-        flops_promised = 312e12 # A100 GPU bfloat16 峰值 flops 是 312 TFLOPS
+        flops_achieved = flops_per_iter * (1.0/dt)  # 每秒
+        # 动态取当前设备峰值算力：无法从 torch 直接读时回退 A100 312 TFLOPS。
+        # 消费级显卡（如 RX 6600 ~22 TFLOPS fp32 / 加倍 fp16）下，硬编码 A100 会把 MFU
+        # 算成几个百分点、失去参考意义——这里按设备属性估算（AMD 无官方 bf16 峰值时按 fp32×2）。
+        try:
+            import torch
+            props = torch.cuda.get_device_properties(0)
+            # 优先用设备上报的 fp32 峰值（tensor core bf16 通常约为 fp32 的 2~4 倍，取 2 保守）
+            # AMD ROCm 下可用 props 无直接 bf16 峰值，故用 fp32×2 近似。
+            fp32_tflops = getattr(props, 'multi_processor_count', 0) * getattr(props, 'clock_rate', 0) * 2 / 1e6
+            flops_promised = fp32_tflops * 2 * 1e12 if fp32_tflops > 0 else 312e12
+        except Exception:
+            flops_promised = 312e12
         mfu = flops_achieved / flops_promised
         return mfu
 

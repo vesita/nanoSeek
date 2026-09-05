@@ -14,22 +14,22 @@ class CausalSelfAttention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         assert config.n_embd % config.n_head == 0
-        # 所有 head 的 key、query、value 投影，但放在同一个 batch 里计算
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # 输出投影
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # 正则化
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
         self.dropout = config.dropout
         self.use_rope = config.use_rope
-        # MLA（DeepSeek-V2）：Q 独立投影；KV 先压缩到低秩潜在、再展开成 K 和 V。
-        # RoPE 只作用于每个 head 的前 qk_rope_head_dim 维，其余是"无位置"的内容维。
         self.use_mla = config.use_mla
         self.use_csa = config.use_csa
+
+        # 注意力投影：MLA/CSA/标准 MHA 互斥初始化，避免冗余参数浪费
+        if not (self.use_mla or self.use_csa):
+            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # 输出投影
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # 正则化
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
         # QK-Norm：对 q/k 做 L2 归一化 + 每头可学习 scale。
         # scale 初始 = sqrt(head_dim)，forward 里再乘 1/sqrt(head_dim)，起点等价于原始 q·k/d。
         self.use_qk_norm = config.use_qk_norm
@@ -100,6 +100,8 @@ class CausalSelfAttention(nn.Module):
             self.kv_act  = nn.SiLU()
             self.k_up    = nn.Linear(config.kv_lora_rank, config.n_embd, bias=config.bias)
             self.v_up    = nn.Linear(config.kv_lora_rank, config.n_embd, bias=config.bias)
+        else:
+            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # V4 Attention Sinks：每头一个可学习标量偏置，作为 softmax 的"垃圾桶"。
         # 追加一列 sink[h] 到分数末尾（对应零 value 向量），模型借此丢掉无关注意力预算。
         # flash attention 不支持追加 softmax 列，启用 sink 时回退到手动注意力。
