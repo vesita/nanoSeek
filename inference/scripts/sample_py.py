@@ -39,7 +39,7 @@ def build_model_from_checkpoint(out_dir, device=None, rope_len=None):
     rope_len（dev-notes/46 窗口续传）：扩展 RoPE 表到指定长度（窗口截断推理需要
     绝对位置偏移，表要覆盖整个对话；None = 保持训练长度）。buffer 加载后替换，不影响权重。
     """
-    ckpt = torch.load(Path(out_dir) / "best.pt", map_location="cpu")
+    ckpt = torch.load(Path(out_dir) / "best.pt", map_location="cpu", weights_only=False)
     args = dict(ckpt["model_args"])
     conf = GPTConfig(**args)
     # 推理无反向传播：梯度检查点纯浪费（profile：每步 414 次 checkpoint 调用）

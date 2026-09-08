@@ -265,6 +265,12 @@ def main():
                     help='顺带下载四大名著补充语料（默认只用手头已有的 txt）')
     ap.add_argument('--task-ratio', type=float, default=1.0,
                     help='非对话(任务/指令)样本保留比例：1.0=全保留(默认,所有数据)，0=剔除，0.1=留10%%')
+    ap.add_argument('--val-ratio', type=float, default=0.1,
+                    help='每个来源抽到验证集的样本比例（默认0.1=10%）。'
+                         '默认只对对话源(DIALOGUE_FILES)抽 val；设为非 None 时所有来源统一按此比例抽，'
+                         '让 val 分布匹配 train 的各来源占比。')
+    ap.add_argument('--val-all', action='store_true',
+                    help='让所有来源(含百科/网页/指令)都参与验证集抽样，val 分布匹配 train。')
     ap.add_argument('--source-ratio', action='append', default=[], metavar='NAME=RATIO',
                     help='按文件名前缀降采样某源（仅 train 侧，val 不变保持可比）。'
                          '可重复：--source-ratio multi_turn=0.15 --source-ratio zhuangxialie=0.2')
@@ -357,6 +363,19 @@ def main():
             random.shuffle(blocks)
             n = int(len(blocks) * 0.9)
             train_blocks, val_blocks = blocks[:n], blocks[n:]
+            if src_ratio is not None and src_ratio < 1.0:
+                random.seed(1337 + sum(ord(c) for c in fn) + 1)
+                random.shuffle(train_blocks)
+                train_blocks = train_blocks[:max(1, int(len(train_blocks) * src_ratio))]
+            train_samples += train_blocks
+            val_samples += val_blocks
+        elif args.val_all:
+            # 分布匹配：所有来源统一 90/10 抽 val（val_ratio 可调），train 降采样仍在 train 侧生效
+            random.seed(1337 + sum(ord(c) for c in fn) + 7)
+            random.shuffle(blocks)
+            n_val = max(1, int(len(blocks) * args.val_ratio))
+            val_blocks = blocks[:n_val]
+            train_blocks = blocks[n_val:]
             if src_ratio is not None and src_ratio < 1.0:
                 random.seed(1337 + sum(ord(c) for c in fn) + 1)
                 random.shuffle(train_blocks)

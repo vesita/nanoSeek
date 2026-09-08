@@ -23,7 +23,7 @@ SEEDS = range(10)
 
 
 def load(dirpath):
-    ck = torch.load(f"{dirpath}/best.pt", map_location="cpu")
+    ck = torch.load(f"{dirpath}/best.pt", map_location="cpu", weights_only=False)
     args = dict(ck["model_args"])
     if "use_csa_fused_qkv" not in args:   # 旧 checkpoint → 独立 QKV 布局
         args["use_csa_fused_qkv"] = False

@@ -36,6 +36,20 @@ class Block(nn.Module):
         self.mlp = MoE(config, use_hash=layer_idx < config.num_hash_layers) \
             if config.use_moe else SwiGLU(config)
 
+        # 神经网络数据库挂载 (PK-NDB)：若开启且为指定挂载层（默认第 6 层）
+        self.has_neural_db = getattr(config, 'use_neural_db', False) and (
+            layer_idx == getattr(config, 'neural_db_layer', 6)
+        )
+        if self.has_neural_db:
+            from .neural_db import ProductKeyNeuralDB
+            self.neural_db = ProductKeyNeuralDB(
+                config,
+                sub_keys=getattr(config, 'neural_db_sub_keys', 512),
+                top_k=getattr(config, 'neural_db_top_k', 32),
+            )
+        else:
+            self.neural_db = None
+
         if self.use_mhc:
             # mHC 超连接：4 流并行残差。每流宽度仍为 n_embd，子层 F 只跑 1 次。
             # 两组 A/B/C（attn 子层 + FFN 子层），见 _mhc_forward。
@@ -73,14 +87,21 @@ class Block(nn.Module):
             res = lambda a, b: alpha * a + (1.0 - alpha) * logsumexp_residual(a, b)
         else:
             res = lambda a, b: a + b
+        
+        def _call_ffn(h):
+            out = self.mlp(self.ln_2(h))
+            if self.has_neural_db and self.neural_db is not None:
+                out = out + self.neural_db(h)
+            return out
+
         if self.config.block_order == "ffn_attn":
-            x = res(x, self.mlp(self.ln_2(x)))
+            x = res(x, _call_ffn(x))
             x = res(x, self.attn(self.ln_1(x)) if self.skip_attn
                     else self.attn(self.ln_1(x), rope_offset=rope_offset, is_eos=is_eos))
         else:
             x = res(x, self.attn(self.ln_1(x)) if self.skip_attn
                     else self.attn(self.ln_1(x), rope_offset=rope_offset, is_eos=is_eos))
-            x = res(x, self.mlp(self.ln_2(x)))
+            x = res(x, _call_ffn(x))
         return x
 
     def _mhc_forward(self, x, rope_offset=0, is_eos=None):
@@ -109,8 +130,13 @@ class Block(nn.Module):
         """
         A = torch.sigmoid(self.raw_A_attn if is_attn else self.raw_A_ffn)
         h_in = (x * A.view(1, 1, hc, 1)).sum(dim=2)            # (B, T, d)
-        h_out = (self.attn(self.ln_1(h_in), rope_offset=rope_offset, is_eos=is_eos) if is_attn
-                 else self.mlp(self.ln_2(h_in)))               # 子层只跑 1 次
+        if is_attn:
+            h_out = self.attn(self.ln_1(h_in), rope_offset=rope_offset, is_eos=is_eos)
+        else:
+            h_out = self.mlp(self.ln_2(h_in))
+            # 神经网络数据库并联分支 (仅在挂载层的 FFN 子层生效)
+            if self.has_neural_db and self.neural_db is not None:
+                h_out = h_out + self.neural_db(h_in)
         C = torch.sigmoid(self.raw_C_attn if is_attn else self.raw_C_ffn)
         delta = h_out.unsqueeze(2) * C.view(1, 1, hc, 1)       # (B, T, hc, d)
         B_ds = sinkhorn_knopp(F.softplus(

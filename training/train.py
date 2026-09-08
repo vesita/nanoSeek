@@ -47,6 +47,16 @@ from tqdm import tqdm
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
+# --- 在 Inductor / Dynamo 首次初始化之前，提前锁定浮点精度模式 ---
+# 必须在任何 .compile() 或首个 matmul 前设置，否则 torch/_inductor 会在编译时刷
+# "TensorFloat32 tensor cores ... not enabled" 的 UserWarning（compile_fx.py:312）
+torch.backends.cuda.matmul.allow_tf32 = True   # matmul 允许 tf32
+torch.backends.cudnn.allow_tf32 = True         # cudnn 允许 tf32
+try:
+    torch.set_float32_matmul_precision('high')
+except Exception:
+    pass
+
 from model import GPTConfig, GPT
 from model.config_loader import load_config
 from training.masking import build_assistant_mask as _build_assistant_mask
@@ -149,6 +159,11 @@ kv_memory_output_gate = False         # KV 记忆输出门控 (Output Gate) + �
 sample_boundary_reset = True          # 样本边界重置与因果阻断：遇到 <eos> 时清空记忆黑板并阻断滑窗跨样本注意
 # --- V4 结构设计升级（实验性，默认全关）---
 use_attn_sink = True         # Attention Sinks：打破重复坍缩的必要条件（三重 A/B 验证）
+use_neural_db = False        # 神经网络数据库全局开关 (PK-NDB)
+neural_db_layer = 6          # 挂载层数：默认第 6 层（中枢语义层）
+neural_db_sub_keys = 512     # 子空间键数量：512*512 = 262,144 槽位
+neural_db_top_k = 32         # 稀疏检索 Top-K
+neural_db_gc_interval = 200  # 自动淘汰与复活周期步数
 use_mhc = False              # mHC 超连接：4 流并行残差
 hc_mult = 4                  # mHC 残差流数（V4 原版 = 4）
 use_lightning_indexer = False   # 学习型块选择替代 CSA raw top-k
@@ -269,8 +284,12 @@ tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * bl
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.allow_tf32 = True # 在 matmul 上允许 tf32
-torch.backends.cudnn.allow_tf32 = True # 在 cudnn 上允许 tf32
+
+# 抑制 Inductor / Dynamo 重复编译告警，放宽重编译上限
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.recompile_limit = 32
+
 device_type = 'cuda' if 'cuda' in device else 'cpu' # 供后面 torch.autocast 使用
 # 注意：float16 数据类型会自动使用 GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
@@ -368,7 +387,11 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   kv_memory_block=kv_memory_block, kv_memory_delta=kv_memory_delta,
                   kv_memory_output_gate=kv_memory_output_gate, sample_boundary_reset=sample_boundary_reset,
                   use_csa_fused_qkv=use_csa_fused_qkv, use_csa_bmm=use_csa_bmm,
-                  use_attn_sink=use_attn_sink, use_mhc=use_mhc, hc_mult=hc_mult,
+                  use_attn_sink=use_attn_sink,
+                  use_neural_db=use_neural_db, neural_db_layer=neural_db_layer,
+                  neural_db_sub_keys=neural_db_sub_keys, neural_db_top_k=neural_db_top_k,
+                  neural_db_gc_interval=neural_db_gc_interval,
+                  use_mhc=use_mhc, hc_mult=hc_mult,
                   use_lightning_indexer=use_lightning_indexer, num_hash_layers=num_hash_layers,
                   block_order=block_order, no_attn_layers=no_attn_layers,
                   n_memory_tokens=n_memory_tokens,
@@ -442,10 +465,14 @@ elif init_from == 'resume':
     raw_best_val = checkpoint.get('raw_best_val', best_val_loss)  # 早停基准（旧 ckpt 无此字段则用 best_val_loss）
     # 确定性续训：恢复全部随机源状态（缺省字段时静默跳过，兼容旧 checkpoint）。
     # 数据加载是随机采样（无顺序进度指针），靠这四路 RNG 复现采样序列。
+    # 注：torch.set_rng_state 严格要求 CPU ByteTensor；torch.load(..., map_location=device) 会将其迁到 GPU，需转回 CPU。
     if checkpoint.get('rng_state') is not None:
-        torch.set_rng_state(checkpoint['rng_state'])
+        torch.set_rng_state(checkpoint['rng_state'].cpu())
     if checkpoint.get('cuda_rng_state') is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])
+        cuda_rng = checkpoint['cuda_rng_state']
+        if isinstance(cuda_rng, list):
+            cuda_rng = [s.cpu() if hasattr(s, 'cpu') else s for s in cuda_rng]
+        torch.cuda.set_rng_state_all(cuda_rng)
     if checkpoint.get('python_rng_state') is not None:
         random.setstate(checkpoint['python_rng_state'])
     if checkpoint.get('numpy_rng_state') is not None:
@@ -926,6 +953,22 @@ while True:
                 'scaler_state': scaler.state_dict(),
             }
             save_checkpoint_async(checkpoint, os.path.join(out_dir, 'last.pt'))
+            # 逢 1000 步归档独立检查点，防止被后续最优覆盖，方便阶段性回溯审查
+            if iter_num > 0 and iter_num % 1000 == 0:
+                step_ckpt = os.path.join(out_dir, f'ckpt_step_{iter_num}.pt')
+                save_checkpoint_async(checkpoint, step_ckpt)
+                pbar.write(f"💾 归档检查点 → {step_ckpt}")
+
+            # 神经网络数据库 GC 例程：逢 gc_interval（默认 200 步）触发一次僵尸槽位清理与变异复活
+            if getattr(config, 'use_neural_db', False) and iter_num > 0:
+                gc_int = getattr(config, 'neural_db_gc_interval', 200)
+                if iter_num % gc_int == 0:
+                    for block in getattr(raw_model.transformer, 'h', []):
+                        if getattr(block, 'has_neural_db', False) and block.neural_db is not None:
+                            gc_stats = block.neural_db.purge_and_revive()
+                            pbar.write(f"  🧹 神经数据库 GC: 活跃槽位 {gc_stats['total_slots'] - gc_stats['dead_slots']}/{gc_stats['total_slots']} | "
+                                       f"重置僵尸槽位 {gc_stats['dead_slots']} (均值使用率 {gc_stats['avg_usage']:.5f})")
+
             if is_best:
                 save_checkpoint_async(checkpoint, os.path.join(out_dir, 'best.pt'))
                 pbar.write(f"✓ 新最佳 val {best_val_loss:.4f} → best.pt（并已更新 last.pt）")
@@ -1035,6 +1078,19 @@ if master_process:
         print(f"训练完成：{iter_num} 步（达 max_iters {max_iters}）")
     print(f"  最终 best_val_loss {best_val_loss:.4f} · 总耗时 {time.time()-train_start:.1f}s")
 join_save_threads()
+# 神经网络数据库：训练结束导出独立 db.pt（可移植模块，供跨 checkpoint/跨模型迁移）
+if master_process and getattr(config, 'use_neural_db', False):
+    _exported = False
+    for _block in getattr(raw_model.transformer, 'h', []):
+        if getattr(_block, 'has_neural_db', False) and _block.neural_db is not None:
+            try:
+                _db_path = os.path.join(out_dir, 'neural_db.pt')
+                _block.neural_db.save_db(_db_path)
+                if not _exported:
+                    print(f"  神经数据库已导出（可移植）→ {_db_path}")
+                _exported = True
+            except Exception as _e:
+                print(f"  ⚠ 神经数据库导出失败（不影响主训练）: {type(_e).__name__}: {str(_e)[:80]}")
 if results_csv is not None:
     results_csv.close()
 if health_csv is not None:

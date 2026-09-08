@@ -90,6 +90,13 @@ class GPTConfig:
     factorized_emb_dim: int = 0  # 因式分解嵌入维度：>0 时启用低秩嵌入（ALBERT 思想），wte 降至 E 维 + 升降维投影，省参数加深网络
     # Attention Sinks：每头一个可学习标量偏置，作为 softmax 的"垃圾桶"吸收无关注意力。
     use_attn_sink: bool = False
+    # --- 神经网络数据库 (Neural Database / PK-NDB) ---
+    use_neural_db: bool = False             # 全局开关：是否挂载神经网络知识库
+    neural_db_layer: int = 6                # 挂载层数：默认第 6 层（中枢语义层，帕累托最优位）
+    neural_db_sub_keys: int = 512           # 每个子空间键数量：512*512 = 262,144 槽位（第 2 档黄金规格）
+    neural_db_top_k: int = 32               # 稀疏检索槽位数：每次仅激活 Top-32 槽位
+    neural_db_gc_interval: int = 200        # 自淘汰与复活周期：每 200 步执行一次 GC 垃圾回收
+    neural_db_usage_aux_scale: float = 0.1  # 非 top-1 槽位的 usage 权重（制造命中方差，供 GC 识别死槽）
     # mHC 超连接：4 流并行残差（X_{l+1} = B·X_l + C·F(A·X_l)，A/C sigmoid 有界、B 双重随机）。
     use_mhc: bool = False
     hc_mult: int = 4            # 残差流数（V4 原版 = 4）
