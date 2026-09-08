@@ -16,6 +16,18 @@
   P7' (inject_mode="knn")      读改成 kNN-LM 分布插值：λ·p_LM + (1−λ)·p_kNN（更稳、更可解释）。
   P4'                           冻结基座对照由训练脚本 `--freeze_base` 实现。
 
+第二轮框架改进（默认等价旧版，需显式开启）:
+
+  P8'  values_init="zeros"      未写入槽返回 0（旧版 randn → 稀疏检索退化为噪声平均）。
+  P9'  write_mode="delta"       软 top-m delta 规则：v_i += η·w_i·(target − Σ_j w_j v_j)，
+                                邻近槽共同承担误差，值场平滑可泛化（旧版 top-1 EMA 覆盖）。
+  P10' diff_addr=True           读聚合权重对 query 可微 → key 投影真正被训练
+                                （旧版 retrieve 整体 no_grad，寻址永远是随机投影）。
+  P11' surprise_quantile>0      自适应惊讶分位：只写 batch 内 top-q% 的 CE token
+                                （字级绝对阈值 3.0 会命中 ~56% token，等于不筛）。
+  P13' conf_mode="coverage"     覆盖率置信 = Σw·1[support>0]，替代熵门控
+                                （τ=0.1 下 softmax 熵恒近 0，熵门控无信息）。
+
 默认参数等价于早期版本（value_dim=None→key_dim, share_io_proj=False, entropy_gate=False,
 require_support=False, value_type="argmax", inject_mode="residual"）。
 """
@@ -56,6 +68,18 @@ class ResidualNeuralDB(nn.Module):
         value_type="argmax",
         # --- P7': 注入模式（residual 残差偏置 | knn 分布插值）---
         inject_mode="residual",
+        # --- 第二轮框架改进（P8'/P9'/P10'/P11'/P12'/P13'）---
+        values_init="randn",          # P8': randn | zeros
+        write_mode="ema",             # P9': ema | delta
+        write_top_m=1,                # P9': 写入扩散的近邻槽数
+        err_clip=0.0,                 # P9': 单条误差范数上限
+        value_clip=0.0,               # P9': 槽值范数上限
+        usage_init="ones",            # P12': ones | zeros
+        diff_addr=False,              # P10': 可微寻址
+        surprise_quantile=0.0,        # P11': >0 时按 batch 内分位筛选惊讶 token
+        conf_mode="entropy",          # P13': entropy | coverage
+        renorm_written=False,         # P8'': 零初始化下权重只在已写槽重归一化
+        trainable_codebook=False,     # P15': 码本可训练
     ):
         super().__init__()
         self.n_embd = n_embd
@@ -71,6 +95,16 @@ class ResidualNeuralDB(nn.Module):
         self.entropy_exp = entropy_exp
         self.value_type = value_type
         self.inject_mode = inject_mode
+        self.values_init = values_init
+        self.write_mode = write_mode
+        self.write_top_m = int(write_top_m)
+        self.err_clip = err_clip
+        self.value_clip = value_clip
+        self.usage_init = usage_init
+        self.diff_addr = diff_addr
+        self.surprise_quantile = surprise_quantile
+        self.conf_mode = conf_mode
+        self.renorm_written = renorm_written
 
         # 1. 外部 no_grad 记忆库
         self.memory = ProductKeyMemory(
@@ -86,6 +120,13 @@ class ResidualNeuralDB(nn.Module):
             support_floor=support_floor,
             support_scale=support_scale,
             support_cap=support_cap,
+            values_init=values_init,       # P8'
+            write_mode=write_mode,         # P9'
+            write_top_m=write_top_m,       # P9'
+            err_clip=err_clip,             # P9'
+            value_clip=value_clip,         # P9'
+            usage_init=usage_init,         # P12'
+            trainable_codebook=trainable_codebook,   # P15'
         )
 
         # 2. 读/写接口（可共享，P2'）
@@ -120,6 +161,9 @@ class ResidualNeuralDB(nn.Module):
         self.ignorable_ids = frozenset({128, 129, 130, -100})
 
         self.to(self.device).to(dtype)
+        # 统计缓冲保持 f32：bf16 累加精度不足（support 步进 0.2~1.0，上限 20）
+        self.memory.slot_usage = self.memory.slot_usage.float()
+        self.memory.slot_support = self.memory.slot_support.float()
 
     # ------------------------------------------------------------------ 读写投影一致
     def _query(self, h_flat):
@@ -139,9 +183,14 @@ class ResidualNeuralDB(nn.Module):
         B, T, _ = h.shape
         h_flat = h.reshape(B * T, self.n_embd)
         q = self._query(h_flat)
-        mem_vals, slot_ids, weights = self.memory.retrieve(q)  # (N,value_dim),(N,k),(N,k)
+        mem_vals, slot_ids, weights, support, coverage = self.memory.retrieve(
+            q, return_support=True, diff_addr=self.diff_addr,
+            renorm_written=self.renorm_written)   # (N,value_dim),(N,k),(N,k),(N,k),(N,1)
         gate_conf = torch.ones(weights.size(0), 1, device=weights.device)
-        if conf and self.entropy_gate:
+        if conf and self.conf_mode == "coverage":
+            # P13': 覆盖率置信（已写槽权重质量）——零初始化下这是有信息的信任信号
+            gate_conf = coverage
+        elif conf and self.entropy_gate:
             # 检索熵 → 置信：低熵(锐利) → 置信高；高熵(模糊) → 置信低
             H = -(weights * torch.log(weights + 1e-12)).sum(-1)
             H_norm = H / math.log(weights.size(-1))
@@ -194,12 +243,19 @@ class ResidualNeuralDB(nn.Module):
             B, T = h.shape[0], h.shape[1]
             losses = F.cross_entropy(
                 logits.reshape(-1, self.vocab_size), targets.reshape(-1), reduction="none"
-            ).reshape(B, T)
-            surprise_mask = losses > self.surprise_threshold
+            ).reshape(B, T).float()
             # P2: 排除无信息目标
             ignorable = sorted(self.ignorable_ids)
             is_info = ~torch.isin(targets, torch.tensor(ignorable, device=targets.device))
-            surprise_mask = surprise_mask & is_info
+            # P11': 自适应惊讶分位（>0 时只写 batch 内最惊讶的 q 比例）；否则退回绝对阈值
+            if self.surprise_quantile > 0:
+                lv = losses[is_info]
+                if lv.numel() == 0:
+                    return 0, {"surprise_written": 0}
+                thr = float(torch.quantile(lv, 1.0 - self.surprise_quantile))
+            else:
+                thr = self.surprise_threshold
+            surprise_mask = (losses > thr) & is_info
             n_surprises = int(surprise_mask.sum().item())
             if n_surprises == 0:
                 return n_surprises, {"surprise_written": 0}
@@ -224,12 +280,13 @@ class ResidualNeuralDB(nn.Module):
             else:
                 val = residual.to(self.memory.values.dtype)
 
-            sw = torch.clamp((losses[surprise_mask] - self.surprise_threshold) / 2.0, 0.2, 1.0)
-            if self.inject_mode == "knn":
-                # 存 token id（供 p_knn）+ 存 value（兜底）
-                self.memory.write(k_surp, val, weight=sw, token_ids=toks)
-            else:
-                self.memory.write(k_surp, val, weight=sw)
+            sw = torch.clamp((losses[surprise_mask] - thr) / 2.0, 0.2, 1.0)
+            # P9'/P7': 写入模式(delta/ema)与目标槽数(top_m)由 memory 决定
+            self.memory.write(
+                k_surp, val, weight=sw,
+                top_m=self.write_top_m, mode=self.write_mode,
+                token_ids=(toks if self.inject_mode == "knn" else None),
+            )
             return n_surprises, {"surprise_written": n_surprises}
 
     # ------------------------------------------------------------------ 主入口：logits 层前向纠偏
