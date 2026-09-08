@@ -31,7 +31,8 @@ import torch.nn.functional as F
 class ProductKeyMemory(nn.Module):
     def __init__(self, key_dim, sub_keys=1024, top_k=32, value_dim=None,
                  write_lr=0.2, temperature=0.1, device=None,
-                 usage_decay=0.99, dead_threshold=0.05, dtype=torch.bfloat16):
+                 usage_decay=0.99, dead_threshold=0.05, dtype=torch.bfloat16,
+                 use_support=False, support_floor=1.0, support_scale=2.0, support_cap=20.0):
         super().__init__()
         assert key_dim % 2 == 0, "key_dim 必须为偶数以切分双子空间"
         self.key_dim = key_dim
@@ -60,6 +61,15 @@ class ProductKeyMemory(nn.Module):
         self.usage_aux_scale = 0.1
         self.usage_decay = usage_decay
         self.dead_threshold = dead_threshold
+
+        # P5: 支持度（可复制性）——写时累加、读时低支持槽置信缩压，压制一次性/随机写入
+        self.use_support = use_support
+        self.support_floor = support_floor
+        self.support_scale = support_scale
+        self.support_cap = support_cap
+        self.register_buffer("slot_support", torch.zeros(self.total_slots, device=self.device))
+        # P7: kNN-LM—槽位最后写入的 token id（未写=-1），读时据此构建 p_kNN
+        self.register_buffer("token_ids", torch.full((self.total_slots,), -1, dtype=torch.long, device=self.device))
 
     # ------------------------------------------------------------------ 检索
     def retrieve(self, query_f32, top_k=None):
@@ -91,6 +101,12 @@ class ProductKeyMemory(nn.Module):
             slot_ids = id1 * self.sub_keys + id2         # (N, k_eff)
             # 温度软化加权聚合（温度小→检索锐利，避免 top-k 平均池化）
             w = F.softmax(fs / self.temperature, dim=-1)  # (N, k_eff)
+            # P5: 支持度置信缩压——低支持(不可靠/一次性)槽被压制，再归一化
+            if self.use_support:
+                sup = self.slot_support[slot_ids]        # (N, k_eff)
+                sup_conf = torch.sigmoid((sup - self.support_floor) / self.support_scale)
+                w = w * sup_conf
+                w = w / (w.sum(dim=-1, keepdim=True) + 1e-9)
             vals = self.values[slot_ids]                  # (N, k_eff, value_dim) bf16
             out = (vals.float() * w.unsqueeze(-1)).sum(dim=1).to(self.dtype)
 
@@ -107,11 +123,12 @@ class ProductKeyMemory(nn.Module):
         return out.to(query_f32.device), slot_ids, w
 
     # ------------------------------------------------------------------ 写入
-    def write(self, query_f32, value, weight=None, top_m=1):
+    def write(self, query_f32, value, weight=None, top_m=1, token_ids=None):
         """规则写入：EMA 覆盖 query 命中的 top_m 个槽（no_grad）。
 
         query_f32: (N, key_dim) f32；value: (N, value_dim) bf16/f32；
-        weight: (N,) 写门控（0-1，WriteInterface.gate）；top_m: 写入前 m 个命中槽。
+        weight: (N,) 写门控（0-1，WriteInterface.gate）；top_m: 写入前 m 个命中槽；
+        token_ids: (N,) 可选，P7 kNN 用——存到命中槽，读时据此构建 p_kNN。
         """
         q = query_f32.to(self.device)
         v = value.to(self.device).to(self.dtype)
@@ -129,11 +146,20 @@ class ProductKeyMemory(nn.Module):
             id1 = t1i.gather(1, i1); id2 = t2i.gather(1, i2)
             slot_ids = (id1 * self.sub_keys + id2).reshape(-1)   # (N*m,)
             v_flat = v.unsqueeze(1).expand(N, m, self.value_dim).reshape(-1, self.value_dim)
+            w_flat = None
             if weight is not None:
                 w_flat = weight.to(self.device).reshape(-1, 1).expand(N, m).reshape(-1, 1)
                 v_flat = v_flat * w_flat.to(self.dtype)
             old = self.values.data[slot_ids]
             self.values.data[slot_ids] = (1 - self.write_lr) * old + self.write_lr * v_flat
+
+            # P5: 支持度累加（用写强度或 1.0）
+            inc = (w_flat if w_flat is not None else torch.ones_like(slot_ids, dtype=self.values.dtype).unsqueeze(1))
+            self.slot_support[slot_ids] = (self.slot_support[slot_ids] + inc.squeeze(1)).clamp_max(self.support_cap)
+            # P7: 存 token id（按 query / 槽位展开）
+            if token_ids is not None:
+                tok_flat = token_ids.to(self.device).unsqueeze(1).expand(N, m).reshape(-1)
+                self.token_ids[slot_ids] = tok_flat
 
     # ------------------------------------------------------------------ GC
     def gc(self):
