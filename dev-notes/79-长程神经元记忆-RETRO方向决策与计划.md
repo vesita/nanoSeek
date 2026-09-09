@@ -4,7 +4,33 @@
 前置：dev-notes/78（神经元级 NDB v5/v6 全记录）
 关键词：no_grad store / 长程记忆 / chunk KV / cross-attention / RETRO / Memorizing Transformers
 
-## 0. 决策（用户 2026-09-10）
+## 0. 速览（当前状态）
+
+**一句话**：NDB 已从「后缀+梯度」范式转向 **RETRO-lite**（no_grad chunk 库 + cross-attention），
+并在**同预算同窗口**下以 **2.8×** 超过 token 级数据库（TDB）——三个伪影检查全部通过。
+
+**关键数字**（128 窗，seed 1234，10M token 随机采样预算，Δ<0 有益）：
+
+| 方案 | Δ | 相对 TDB |
+|---|---|---|
+| **RETRO-lite（本方案）** | **−0.0213** | **2.8×** |
+| TDB（n-gram L=8 soft） | −0.0077 | 1.0× |
+| 旧「后缀+梯度」NDB（§78） | −0.0046 | 0.6× |
+
+**伪影检查（全部通过）**：
+
+| 检查 | 结果 |
+|---|---|
+| 近似重复泄漏 | cos>0.99 = **0%**；增益反而在**最低**相似度桶最大 |
+| 随机检索对照 | Δ_rand = −0.006（相似检索 −0.030）→ ~80% 来自内容 |
+| 长程代理（按 base loss 分桶） | **76.7%** 增益来自最高 loss 的 10% 位置 |
+| 同协议 TDB 头对头 | 同预算 10M：**−0.0213 vs −0.0077** |
+
+**下一步**：B3 放大（per-token KV / 更大库 / 不确定性门控 / 共训）。
+
+---
+
+## 1. 决策（用户 2026-09-10）
 
 > "如果不能超越 tdb，那么 ndb 其实就没什么意义。直接朝着可能超越 tdb 的方向前进，不然就放弃这个方向。"
 
@@ -12,7 +38,7 @@
 - **保留** no_grad store 这一核心约束；
 - **转向**唯一可能携带 TDB 拿不到信息的形态：**长程 chunk KV + cross-attention 读取**。
 
-## 1. 成功判据（先定义再动手）
+## 2. 成功判据（先定义再动手）
 
 ⚠ 在**聚合 val loss** 上，长程记忆几乎不可能超过 TDB——该指标由局部位置主导，而 TDB 正是为局部优化的。所以判据分层：
 
@@ -24,7 +50,11 @@
 
 **关键**：TDB 在长程子集上≈0（后缀看不到窗外），所以这不是"同一把尺子上比高低"，而是"比 TDB 结构上做不到的事"。
 
-## 2. 架构（RETRO-lite）
+**事后更正（B2-c）**：上面"聚合指标上不可能超过 TDB"的担心**被证伪了**——RETRO 在聚合 val loss 上
+也超过了 TDB（2.8×）。原因：检索到的"语义相关但不同"的 chunk 对**聚合**指标同样有帮助，
+不只是集中在少数长程位置。所以主判据其实比预想的更容易满足。
+
+## 3. 架构（RETRO-lite）
 
 ```
 每个 Transformer block:
@@ -40,7 +70,7 @@
 - **检索粒度**：按 chunk（每 64 token 查一次），chunk 内 cross-attend（RETRO 的省算力技巧）；
 - **键/值来源**：**当前窗口之外**的 chunk（同文档前文 / 语料其他位置）——这是与 TDB 的本质区别。
 
-## 3. 分阶段
+## 4. 分阶段计划
 
 | 阶段 | 内容 | 判据 | 成本 |
 |---|---|---|---|
@@ -50,6 +80,8 @@
 | **B3** | 巩固（蒸馏回权重）+ 运行时写入 | — | — |
 
 **B0 是 go/no-go 闸门**：如果连"窗外信息能降低 loss"都测不出来，后面不用做。
+
+## 5. 实验结果
 
 ### B0 结果（2026-09-10）：headroom 存在且很大 ✅
 
@@ -173,21 +205,60 @@ cross-attention @ 第 -6 层、冻结基座、1.05M 可训参数、2000 步、ex
 ⇒ 三个检查（近似重复 / 长程代理 / 同协议 TDB）**全部通过**。
 **NDB（RETRO-lite）在同等或更小预算下确实超越了 TDB。**
 
-## 4. 风险
+## 6. 风险
 
 1. **吸收**：键/值若在窗口内可算 → 共训必被吸收（**必须长程**）；
 2. **检索 recall** 决定上限（需要 product-key / FAISS）；
 3. **容量**：chunk KV 很大（64×512/块），要压缩（潜码）或分层；
 4. **共训不稳定**：小模型 + 新模块容易塌，要 KL 锚定 + 分阶段解冻。
 
-## 5. 与 TDB 的关系
+## 7. 与 TDB 的关系
 
 不是替代，是**互补**：TDB 管局部续写，长程 NDB 管跨窗依赖。
 主判据成立 → 两者叠加；长程子集上 NDB 无增益 → 整个 NDB 方向放弃。
 
-## 6. 待办
+## 8. 待办
 
 - [x] B0：长程 headroom 诊断（`local/longrange_probe.py`）→ **通过，Δ=−0.0655 @ L=384**
 - [x] B1：chunk KV store + cross-attention 模块 → **通过，Δ=−0.0298（2× TDB），随机对照 −0.006**
 - [x] B2：三个检查全部通过（近似重复 0% / 长程代理 76.7% / 同协议 TDB 2.8×）
 - [ ] B3：放大（per-token KV / 更大库 / 不确定性门控 / 共训）
+
+---
+
+## 附录 A：复现命令与产物
+
+**主流程**（三步，~15 min）：
+
+```bash
+# 1) 建 chunk 库（10M token 随机采样 → 156,248 chunks × 512d，160MB，~7.6min）
+.venv/bin/python -u local/build_chunk_store.py --limit_m 10 --batch 32 --layer -6 \
+    --store out/mem_store/store10m.pt
+
+# 2) 训读取接口（冻结基座，2000 步，~7min，可训 1.05M 参数）
+.venv/bin/python -u local/train_mem.py --store out/mem_store/store10m.pt \
+    --steps 2000 --eval_windows 256 --eval_bs 32 --exclude_radius 512 \
+    --save out/mem_store/iface10m.pt
+
+# 3) 三个检查
+.venv/bin/python -u local/check_neardup.py   --windows 512                          # 近似重复
+.venv/bin/python -u local/quick_longrange.py --windows 128                          # 长程代理
+.venv/bin/python -u local/ngram_sample_capacity.py --sample_m 10 --orders 8 \
+    --windows 128 --caps 999                                                        # 同协议 TDB
+```
+
+**脚本 / 产物**：
+
+| 路径 | 内容 |
+|---|---|
+| `model/memory_cross_attn.py` | RETRO-lite 读取模块（`wo` 零初始化 + 逐 token 门控） |
+| `local/build_chunk_store.py` | chunk 库构建器（no_grad，mean-pooled hidden） |
+| `local/train_mem.py` | 接口训练 + 配对 Δ + 随机检索对照 + 存接口 |
+| `local/check_neardup.py` | 近似重复检查（相似度分布 + 分桶 Δ） |
+| `local/quick_longrange.py` | Δ 按 base loss 分桶（长程/不确定代理） |
+| `local/longrange_probe.py` | B0 headroom 诊断（context-length ablation） |
+| `out/mem_store/store10m.pt` | 10M 库：156,248 chunks × 512d，160MB |
+| `out/mem_store/iface10m.pt` | 训练后接口（标量 gate 版，1.05M 参数） |
+
+**评测口径**：配对 Δ = loss(mem on) − loss(mem off)，同一批窗口（seed 1234/1337），Δ<0 有益；
+随机检索对照 = 同接口但检索随机 chunk。
