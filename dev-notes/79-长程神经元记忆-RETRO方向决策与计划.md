@@ -279,6 +279,7 @@ cross-attention @ 第 -6 层、冻结基座、1.05M 可训参数、2000 步、ex
 | `local/longrange_probe.py` | B0 headroom 诊断（context-length ablation） |
 | `out/mem_store/store10m.pt` | 10M 库：156,248 chunks × 512d，160MB |
 | `out/mem_store/iface10m.pt` | 训练后接口（标量 gate 版，1.05M 参数） |
+| `out/mem_store/iface10m_tokgate.pt` | 训练后接口（逐 token 门控版，Δ=−0.0348） |
 
 **评测口径**：配对 Δ = loss(mem on) − loss(mem off)，同一批窗口（seed 1234/1337），Δ<0 有益；
 随机检索对照 = 同接口但检索随机 chunk。
