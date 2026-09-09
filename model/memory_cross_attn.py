@@ -29,6 +29,9 @@ class MemoryCrossAttention(nn.Module):
         self.wv = nn.Linear(n_embd, n_embd, bias=False)
         self.wo = nn.Linear(n_embd, n_embd, bias=False)
         nn.init.zeros_(self.wo.weight)  # 零初始化输出：记忆起点是 no-op，只在有用时才被学起来
+        # 逐 token 门控：g_t = σ(w·h_t + b)，让模型自己决定哪些位置注入
+        self.gate_proj = nn.Linear(n_embd, 1, bias=False)
+        nn.init.zeros_(self.gate_proj.weight)
         self.gate = nn.Parameter(torch.tensor(float(gate_init)))
         # store：no_grad，永不被优化器触碰
         store = store_keys.detach().clone()
@@ -73,7 +76,9 @@ class MemoryCrossAttention(nn.Module):
         att = (Q @ K) / (self.head_dim ** 0.5)   # (B,C,H,chunk,k)
         att = att.softmax(dim=-1)
         out = (att @ V).permute(0, 1, 3, 2, 4).reshape(B, C, self.chunk, D)
-        out = self.wo(out).reshape(B, Tc, D)
+        out = self.wo(out)  # (B,C,chunk,D)
+        g = torch.sigmoid(self.gate_proj(hc) + self.gate)  # (B,C,chunk,1) 逐 token 门控
+        out = (g * out).reshape(B, Tc, D)
         delta = torch.zeros(B, T, D, dtype=h.dtype, device=h.device)
         delta[:, :Tc] = out.to(h.dtype)
-        return self.gate * delta
+        return delta
