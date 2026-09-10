@@ -349,6 +349,7 @@ class GPT(nn.Module):
                         lr=learning_rate * self.config.muon_lr_scale,
                         momentum=self.config.muon_momentum,
                         ns_steps=self.config.muon_ns_steps,
+                        ns_aggressive=getattr(self.config, 'muon_ns_aggressive', 0),
                         split_heads=split_heads)
             fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
             extra_args = dict(fused=True) if fused_available and device_type == 'cuda' else {}

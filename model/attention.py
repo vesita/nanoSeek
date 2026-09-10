@@ -484,16 +484,14 @@ class CausalSelfAttention(nn.Module):
             # 只用真实块：sink 模式下 v_blocks 末尾多了一个占位零块，切掉它
             v_blocks_real = v_blocks[:, :nb] if self.use_attn_sink else v_blocks
             n_allowed = causal_block.float().sum(dim=-1).clamp(min=1)  # (T,)
+            # 只要全局 value 摘要：单个全局 key 的 softmax 恒为 1，所以 k 的全局
+            # 聚合结果没有任何用处（此前算了却从不使用，纯浪费一次 bmm/einsum）。
             if getattr(self.config, 'use_csa_bmm', False):
                 # HCA 全局聚合：显式批量 matmul（等价 einsum 'tn,bnhd->bthd'）
                 cb = causal_block.float().unsqueeze(0).expand(B, -1, -1)      # (B,T,nb)
-                k_glob = torch.bmm(cb, k_blocks.reshape(B, nb, nh * d)).view(B, T, nh, d) / \
-                         n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
                 v_glob = torch.bmm(cb, v_blocks_real.reshape(B, nb, nh * d)).view(B, T, nh, d) / \
                          n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
             else:
-                k_glob = torch.einsum('tn,bnhd->bthd', causal_block.float(), k_blocks) / \
-                         n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
                 v_glob = torch.einsum('tn,bnhd->bthd', causal_block.float(), v_blocks_real) / \
                          n_allowed.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
             # 单个全局 key 的 softmax 恒为 1，等价于直接加上这份全局摘要

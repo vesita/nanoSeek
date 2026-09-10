@@ -27,6 +27,7 @@ import random
 import threading
 import hashlib
 import re
+import traceback
 from collections import Counter
 from contextlib import nullcontext
 
@@ -60,6 +61,12 @@ except Exception:
 from model import GPTConfig, GPT
 from model.config_loader import load_config
 from training.masking import build_assistant_mask as _build_assistant_mask
+# 纯函数抽到 training/schedules.py：本文件是模块级脚本（import 即开训），
+# 写在里面的函数无法被 pytest 覆盖。这里只做「读全局 → 转调纯函数」。
+from training.schedules import lr_at as _lr_at, pick_bin_names
+# 诊断用的纯函数（显存调试行 / 快照触发 / OOM 现场）：抽出来是为了能在 CPU 上
+# 单测 —— 诊断代码自己不能变成新的故障源（见 training/diag.py 的说明）。
+from training.diag import mem_debug_line, should_dump_snapshot
 
 # -----------------------------------------------------------------------------
 # 默认配置：small 模型在字符级莎士比亚上训练（与 config/train_shakespeare_char.yaml 一致）。
@@ -134,7 +141,11 @@ mtp_weight = 0.3       # MTP 损失权重（DeepSeek-V3 建议 0.3）
 # --- V4 优化器：Muon（可选）替代 AdamW ---
 use_muon = False       # 矩阵参数用 Muon，embedding/lm_head/norm 用 AdamW
 muon_momentum = 0.95   # Muon 动量系数
-muon_ns_steps = 10     # Newton-Schulz 迭代次数（默认 8 激进 + 2 经典）
+muon_ns_steps = 10     # Newton-Schulz 迭代总次数
+# 前 muon_ns_aggressive 步用「激进系数」，其余用「经典系数」（混相）。
+# 实测（259 个真实动量矩阵、配对检验）：经典10步中位残差 4.53e-05；
+# 激进4+经典3=7步 8.79e-06（t=−10.5，显著更好，且 NS 计算省 30%）。0=纯经典=旧行为。
+muon_ns_aggressive = 0
 muon_lr_scale = 0.2   # Muon 矩阵参数 lr 缩放（DeepSeek/Kimi 惯例：AdamW lr × 0.2）
 muon_split = False     # GLM-5 Muon Split：注意力投影按「头」分块做 NS 正交化（修 Muon 短预算收敛差）
 # --- V4 核心：CSA/HCA 压缩稀疏注意力 ---
@@ -171,6 +182,22 @@ num_hash_layers = 0          # 前 N 层用 hash 路由（0 = 禁用）
 block_order = "attn_ffn"     # 计算图重排：块内子层顺序（attn_ffn | ffn_attn）
 no_attn_layers = []          # 稀疏注意力布线：跳过注意力的层索引（0-based，空=所有层都有）
 n_memory_tokens = 0          # 显式记忆 token：序列前插入 K 个可学习嵌入（0=关闭，实验性）
+# --- NDB（神经元数据库 / RETRO-lite 记忆）共训（dev-notes/79）---
+# ndb_store 为空 = 完全不启用，训练流程与本文件原行为逐位一致。
+ndb_store = ''               # 记忆库路径（out/mem_store/store*.pt）；非空即启用
+ndb_heldout = ''             # 可选「未见」库：仅用于监控 Δ_held（读策略可迁移性）
+ndb_layer = -6               # 挂载层（支持负数）
+ndb_chunk = 64               # chunk 大小（需与建库一致）
+ndb_top_k = 4                # 检索 top-k
+ndb_exclude_radius = 512     # 屏蔽与查询位置过近的库条目（防自匹配）
+ndb_gate_init = 0.1
+ndb_dropout = 0.1            # 记忆 dropout：以概率把 Δ 整批置零，逼基座「有无记忆都能跑」
+ndb_retr_noise = 0.0         # 训练期检索噪声：每个槽以该概率换成随机条目（0 = 关闭，旧行为）
+ndb_att_sim = 0.0            # 检索相关性加进注意力 logit 的初始增益 λ（0 = 旧行为）
+ndb_lr = 3e-4                # 读取接口学习率（固定，不随基座调度衰减）
+ndb_eval_iters = 64          # NDB 监控 eval 的 batch 数
+ndb_debug_mem = False        # 诊断：每步打印显存（allocated/peak/reserved/OOM 计数）
+mem_snapshot_gb = 0.0        # 诊断：峰值显存超过该值(GB)时 dump 一次显存分配历史快照（0=关）
 use_lse_residual = False     # 对数放缩残差：对数域 soft-max 合并替代线性相加（零参数，实验性）
 use_lse_gate = False         # 对数放缩门控混合：α·x+(1-α)·LSE(x,F)，α 可学习（每层标量）
 use_qk_norm = False          # QK-Norm：q/k L2 归一化 + 每头可学习 scale（近零参数，压重复坍缩）
@@ -182,6 +209,12 @@ use_loss_masking = True      # False = 全部 token 参与训练（非对话语�
 # 默认空 = 按模式分支（char/byte）解析；找不到标记会全部 mask → loss NaN（有防护）。
 mask_reply_ids = []
 mask_sep_ids = []
+# 打包非空窗口（2026-09-10）：loss masking 下 ~83% 的 256 窗口整窗全 mask，前向白跑。
+# 终止符 <eos>/<cont> 自身必然是有效 token（见 training/masking.py：next_term=自身 < next_nl），
+# 所以「窗口内含终止符」⟺「该窗口有 ≥1 个有效 token」。抽样时只抽这种窗口：
+# 目标函数逐位不变（有效 token 的集合与权重都不变），只把空窗口的算力还回来。
+# 实测：有效 token/步 548 → ~3200（×5.8），eval 有效 token 2.8 万 → 16 万（噪声 ÷2.4）。
+pack_nonempty = False
 # adamw 优化器
 learning_rate = 1e-3 # 最大学习率
 max_iters = 5000 # 训练总迭代次数
@@ -233,6 +266,10 @@ byte_level = False      # 字节直入模式（dev-notes/48，Mamba-Byte 思想�
                         # 词表 0-255 字节+<eos>=256，读 train_byte.bin/val_byte.bin
 char_level = False      # 字级模式（dev-notes/50）：汉字=1 token，读 train_char.bin/val_char.bin
 factorized_emb_dim = 0  # 因式分解嵌入维度：>0 启用低秩嵌入（ALBERT 思想），wte 降至 E 维，省参数加深网络
+# 数据集文件名后缀：'' = 旧文件（train_char.bin）；'v2' = train_char_v2.bin（prepare.py --out-prefix v2）。
+# ★ 必须定义在下面 config_keys 快照**之前**：load_config 只覆盖已存在的全局，
+#   定义在它之后会被这里的赋值静默改回默认值（本项目已经栽过一次同类坑）。
+data_prefix = ''
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 load_config(globals()) # 从 YAML 配置文件或命令行覆盖
 config = {k: globals()[k] for k in config_keys} # 对日志记录很有用
@@ -257,6 +294,10 @@ elif byte_level:
     # loss masking 标记改字节序列（<eos>=256；字级 <cont> 在字节模式暂不启用，只用 eos 定位）
     mask_reply_ids = [0x0100]                       # 256 = <eos>
     mask_sep_ids = [0x0a, 0x0a]                     # \n\n
+# 打包非空窗口：终止符 id 列表（空 = 不启用，见 get_batch / _sample_nonempty_ix）
+_pack_terms = []
+if pack_nonempty and use_loss_masking and ('stage' not in globals() or stage != 'pretrain'):
+    _pack_terms = [int(t) for t in mask_reply_ids if t is not None]
 # -----------------------------------------------------------------------------
 
 # 各种初始化、派生属性和 I/O 设置
@@ -307,10 +348,13 @@ if os.path.exists(data_manifest_path):
     except OSError as _e:
         print(f'warning: 读取数据清单 {data_manifest_path} 失败：{_e}')
 
-# 每个 epoch 的步数（YOLO 式进度条显示轮次用）
-_bin_name = ('train_char.bin' if char_level else 'train_byte.bin' if byte_level else 'train.bin')
+# 数据集文件名统一解析：train / val / meta 三个名字只在这里算一次，
+# 下游（get_batch / meta 加载 / summary 打印）一律复用，杜绝"改一处漏一处"。
+# data_prefix 已在上面 config_keys 之前定义（见那里的注释）。
+_train_bin, _val_bin, _meta_bin = pick_bin_names(
+    char_level=char_level, byte_level=byte_level, prefix=data_prefix,
+    stage=globals().get('stage'))
 try:
-    _train_bin = 'pretrain.bin' if ('stage' in globals() and stage == 'pretrain') else _bin_name
     _train_tokens = os.path.getsize(os.path.join(data_dir, _train_bin)) // 2  # uint16
     steps_per_epoch = max(1, _train_tokens // tokens_per_iter)
 except OSError:
@@ -322,21 +366,50 @@ def build_assistant_mask(y):
     return _build_assistant_mask(y, mask_reply_ids, mask_sep_ids)
 
 
+def _sample_nonempty_ix(data):
+    """拒绝采样窗口起点，只保留 y 窗口内含回复终止符的（= 该窗口有有效 token）。
+
+    与「均匀抽窗口」在分布上等价：空窗口本来就不贡献任何 loss（训练时整批 continue，
+    评估时整批 skip），只是白跑一次前向。只抽非空窗口后，同样算力下拿到 ~5.8× 有效 token。
+    用 torch.randint 保持随机流在 torch RNG 里，续训的 RNG 恢复逻辑不用改。
+    """
+    hi = len(data) - block_size
+    out, tries = [], 0
+    limit = 200 * batch_size
+    while len(out) < batch_size and tries < limit:
+        k = max((batch_size - len(out)) * 8, 32)
+        for i in torch.randint(hi, (k,)).tolist():
+            tries += 1
+            w = data[i + 1: i + 1 + block_size]      # 判据看 y（+1 之后）那个窗口
+            if any((w == t).any() for t in _pack_terms):
+                out.append(i)
+                if len(out) == batch_size:
+                    break
+    if len(out) < batch_size:
+        # 兜底：语料里几乎没有终止符时退回均匀采样，绝不死循环
+        out = torch.randint(hi, (batch_size,)).tolist()
+    return torch.tensor(out, dtype=torch.long)
+
+
 def get_batch(split):
     # 我们每个 batch 都重新创建 np.memmap，以避免内存泄漏，参见
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
         # 预算中性混合：以概率 p_distill 从蒸馏数据切块；distill.bin 太短（< 2*block_size
         # 个字节，即不足一个窗口）时退回主数据，避免 randint 越界。
-        main_bin = 'pretrain.bin' if stage == 'pretrain' else 'train.bin'
+        # 主数据路径来自 _train_bin（已在上面用 pick_bin_names 统一解析）。
         use_distill = (distill_bin and p_distill > 0 and random.random() < p_distill
                        and os.path.exists(distill_bin)
                        and os.path.getsize(distill_bin) > 2 * block_size)
         path = distill_bin if use_distill else os.path.join(data_dir, _train_bin)
     else:
-        path = os.path.join(data_dir, 'val_char.bin' if char_level else 'val_byte.bin' if byte_level else 'val.bin')
+        path = os.path.join(data_dir, _val_bin)
     data = np.memmap(path, dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    ix = _sample_nonempty_ix(data) if _pack_terms else torch.randint(len(data) - block_size, (batch_size,))
+    if ndb_store:
+        # NDB：记录本 batch 每个窗口的 chunk 起始位置，供 hook 做「排除自匹配」检索
+        _cs = torch.arange(0, block_size, ndb_chunk)
+        _ndb_state['q_pos'] = (ix[:, None] + _cs[None, :]).to(torch.int32).to(device)
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     # loss masking：两阶段框架——pretrain 无掩码全 token 语言建模（DeepSeek 路线）；
@@ -358,9 +431,12 @@ def get_batch(split):
 iter_num = 0
 best_val_loss = 1e9
 raw_best_val = 1e9      # 原始 val 最优（不受体检门控，早停/日志用）
+_ndb_resume = None      # NDB 接口参数（若 checkpoint 里存了）
+_ndb_opt_resume = None  # NDB 接口优化器状态
+_resume_iter = -1       # 续训载入时的 iter_num：跳过该步的评估/存档（否则每次续训都白写 2GB 检查点，且评估会消耗 RNG 打乱数据流）
 
 # 尝试从数据集推导 vocab_size（字节直入模式用 meta_byte.pkl，vocab 257）
-meta_path = os.path.join(data_dir, 'meta_char.pkl' if char_level else 'meta_byte.pkl' if byte_level else 'meta.pkl')
+meta_path = os.path.join(data_dir, _meta_bin)
 meta_vocab_size = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
@@ -378,6 +454,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_mla=use_mla, kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim,
                   use_mtp=use_mtp, n_mtp=n_mtp, mtp_weight=mtp_weight,
                   use_muon=use_muon, muon_momentum=muon_momentum, muon_ns_steps=muon_ns_steps,
+                  muon_ns_aggressive=muon_ns_aggressive,
                   muon_lr_scale=muon_lr_scale, muon_split=muon_split,
                   use_csa=use_csa, csa_compress=csa_compress, csa_topk=csa_topk,
                   csa_window=csa_window, use_hca=use_hca, use_csa_learnable=use_csa_learnable,
@@ -421,7 +498,8 @@ def _build_model_from_checkpoint(checkpoint):
               'use_sqrtsoftplus', 'route_scale', 'moe_hidden_scale',
               'use_mla', 'kv_lora_rank', 'qk_rope_head_dim',
               'use_mtp', 'n_mtp', 'mtp_weight',
-              'use_muon', 'muon_momentum', 'muon_ns_steps', 'muon_lr_scale', 'muon_split',
+              'use_muon', 'muon_momentum', 'muon_ns_steps', 'muon_ns_aggressive',
+              'muon_lr_scale', 'muon_split',
               'use_csa', 'csa_compress', 'csa_topk', 'csa_window',
               'use_hca', 'use_csa_learnable', 'use_csa_fused_qkv', 'use_csa_bmm',
               'use_kv_memory', 'kv_memory_latent', 'kv_memory_chunk', 'kv_memory_checkpoint',
@@ -461,6 +539,7 @@ elif init_from == 'resume':
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     model = _build_model_from_checkpoint(checkpoint)
     iter_num = checkpoint['iter_num']
+    _resume_iter = iter_num  # 该步不重复评估/存档（见评估块的条件）
     best_val_loss = checkpoint['best_val_loss']
     raw_best_val = checkpoint.get('raw_best_val', best_val_loss)  # 早停基准（旧 ckpt 无此字段则用 best_val_loss）
     # 确定性续训：恢复全部随机源状态（缺省字段时静默跳过，兼容旧 checkpoint）。
@@ -478,6 +557,8 @@ elif init_from == 'resume':
     if checkpoint.get('numpy_rng_state') is not None:
         np.random.set_state(checkpoint['numpy_rng_state'])
     resume_scaler_state = checkpoint.get('scaler_state')
+    _ndb_resume = checkpoint.get('ndb')  # NDB 接口参数（旧 checkpoint 无此字段则为 None）
+    _ndb_opt_resume = checkpoint.get('ndb_opt')
 elif init_from.endswith('.pt'):
     # 在已有模型上做后训练：加载权重，但从头开始新的优化器/学习率计划
     print(f"正在从 {init_from} 加载已有模型权重（后训练，优化器/学习率重置）")
@@ -509,7 +590,11 @@ def print_summary():
     print(border)
     print("  训练摘要")
     print(border)
+    # 把**实际读的文件名**打出来：data_prefix 配错时（例如忘了设就从旧数据开跑 2.7 天）
+    # 只看 "数据集 chinese" 是发现不了的 —— 必须是那个真实的文件名。
+    _tok_note = f"{_train_tokens/1e6:.1f}M token" if steps_per_epoch else "文件缺失"
     print(f"  数据集    {dataset} · {model.config.vocab_size} 词表 · 上下文 {block_size}")
+    print(f"  数据文件  train={_train_bin}（{_tok_note}）  val={_val_bin}")
     print(f"  模型      {n_layer} 层 · {n_head} 头 · {n_embd} 维 · {attn} · {ffn}")
     opt_name = 'Muon' if use_muon else 'AdamW'
     print(f"  优化器    {opt_name} · lr {learning_rate:g} · wd {weight_decay:g} · betas ({beta1:g}, {beta2:g})")
@@ -529,6 +614,65 @@ def print_summary():
 
 if master_process:
     print_summary()
+
+# --- NDB 挂载（ndb_store='' 时完全跳过；基座与接口联合训练）---
+ndb = None
+_ndb_state = {"on": True, "q_pos": None, "delta_norm": 0.0, "drop": False}
+_ndb_held = None
+if ndb_store:
+    from model.memory_cross_attn import MemoryCrossAttention
+    _nd = torch.load(ndb_store, map_location='cpu', weights_only=False)
+    ndb = MemoryCrossAttention(
+        model.config.n_embd, _nd['keys'], _nd['pos'], store_vals=_nd.get('vals'),
+        chunk=ndb_chunk, top_k=ndb_top_k, n_head=model.config.n_head,
+        gate_init=ndb_gate_init, exclude_radius=ndb_exclude_radius,
+        retr_noise=ndb_retr_noise, att_sim_gain=ndb_att_sim).to(device)
+    if ndb_heldout:
+        _hd = torch.load(ndb_heldout, map_location='cpu', weights_only=False)
+        _ndb_held = {'keys': _hd['keys'].to(device),
+                     'pos': _hd['pos'].to(device, dtype=torch.int32),
+                     'vals': (_hd['vals'].to(device) if _hd.get('vals') is not None else None)}
+
+    @torch._dynamo.disable  # 检索/交叉注意力保持 eager：不进编译图，避开编译期显存尖峰
+    def _ndb_hook(m, inp, out):
+        if not _ndb_state['on']:
+            return out
+        delta = ndb(out.mean(dim=2), q_pos=_ndb_state['q_pos'])
+        if _ndb_state['drop']:
+            delta = torch.zeros_like(delta)
+        _ndb_state['delta_norm'] = delta.float().norm(dim=-1).mean().item()
+        return out + delta.unsqueeze(2)  # 广播到 mHC 各残差流
+
+    model.transformer.h[ndb_layer].register_forward_hook(_ndb_hook)
+    if _ndb_resume is not None:
+        ndb.load_state_dict(_ndb_resume, strict=False)
+        if master_process:
+            print("  NDB        从 checkpoint 恢复接口参数")
+    _ndb_params = [p for p in ndb.parameters() if p.requires_grad]
+    # 独立 AdamW：MuonAdamW 不支持 add_param_group；独立优化器还能把接口 lr 固定住
+    ndb_opt = torch.optim.AdamW(_ndb_params, lr=ndb_lr, weight_decay=0.0)
+    if _ndb_opt_resume is not None:
+        try:
+            ndb_opt.load_state_dict(_ndb_opt_resume)
+        except Exception as _e:  # noqa: BLE001
+            if master_process:
+                print(f"  NDB        优化器状态载入失败（{_e}）→ 重建（丢弃旧动量）")
+            ndb_opt = torch.optim.AdamW(_ndb_params, lr=ndb_lr, weight_decay=0.0)
+        else:
+            # 新增参数（如 sim_gain）可能不在旧状态里而被挤出去 → 显式校验并补回
+            _in_opt = {id(p) for g in ndb_opt.param_groups for p in g['params']}
+            _miss = [n for n, p in ndb.named_parameters()
+                     if p.requires_grad and id(p) not in _in_opt]
+            if _miss:
+                if master_process:
+                    print(f"  NDB        优化器状态缺 {_miss} → 重建（丢弃旧动量）")
+                ndb_opt = torch.optim.AdamW(_ndb_params, lr=ndb_lr, weight_decay=0.0)
+    if master_process:
+        print(f"  NDB        {os.path.basename(ndb_store)} · "
+              f"{'token' if ndb.per_token else 'mean'} rank={ndb.rank} · 层 {ndb_layer} · "
+              f"top_k {ndb_top_k} · {_nd['keys'].shape[0]} chunks · "
+              f"接口 {sum(p.numel() for p in _ndb_params) / 1e3:.0f}K 参数 @ lr {ndb_lr:g} · "
+              f"dropout {ndb_dropout} · 检索噪声 {ndb_retr_noise}")
 
 # 编译模型
 if compile:
@@ -555,19 +699,84 @@ if ddp:
 def estimate_loss(splits=('train', 'val')):
     out = {}
     model.eval()
+    # 监控口径必须干净：检索噪声只在训练步生效，否则 val loss 不可与历史对比
+    _rn = ndb.retr_noise if ndb is not None else 0.0
+    if ndb is not None:
+        ndb.retr_noise = 0.0
     for split in splits:
-        losses = []
+        tot, n = 0.0, 0
         for k in range(eval_iters):
             X, Y = get_batch(split)
+            n_i = int((Y != -100).sum().item())
+            if n_i == 0:
+                continue  # 全 mask 窗口：无有效 token，跳过（否则 loss 为 nan）
             with ctx:
                 logits, loss = model(X, Y)
             # NaN 防护：train 数据某些窗口无 <eos>/<cont> → mask 全 -100 → loss 为 nan。
             # 跳过这些无效 batch，只对有限 loss 求均值（与训练循环的 step_nan 防护对齐）。
             if torch.isfinite(loss):
-                losses.append(loss.item())
-        out[split] = torch.tensor(losses).mean() if losses else float('nan')
+                # token 级加权平均：与训练损失同口径（旧版是窗口均值，两者不可比）
+                tot += loss.item() * n_i
+                n += n_i
+        out[split] = torch.tensor(tot / n) if n else float('nan')
     model.train()
+    if ndb is not None:
+        ndb.retr_noise = _rn
     return out
+
+
+@torch.no_grad()
+def ndb_eval():
+    """NDB 监控：mem-on / base-off / 随机检索 / 未见库 四个 val loss。
+
+    Δ       = mem − base_off      记忆有没有用
+    Δ_rand  = rand − base_off     选择性（≈0 = 学会「无关就不注入」）
+    Δ_held  = held − base_off     换成没训过的库是否照样有用（读策略可迁移性）
+    """
+    if ndb is None:
+        return None
+    was_training = model.training
+    model.eval()
+    _ndb_state['drop'] = False
+    _rn = ndb.retr_noise          # 监控口径干净：噪声只在训练步生效
+    ndb.retr_noise = 0.0
+
+    # 配对评估：四个条件用同一批 val batch。否则各条件抽到不同窗口，
+    # 采样噪声（±0.1）会淹没 Δ（±0.03），Δ 变成纯噪声（2026-09-10 实测教训）。
+    batches = [get_batch('val') for _ in range(ndb_eval_iters)]
+
+    def _run(which='train', random=False, on=True):
+        _ndb_state['on'] = on
+        ndb.random_retrieve = random
+        cur = (ndb.store, ndb.store_pos, getattr(ndb, 'vals', None))
+        if which == 'held' and _ndb_held is not None:
+            ndb.store, ndb.store_pos = _ndb_held['keys'], _ndb_held['pos']
+            if ndb.per_token:
+                ndb.vals = _ndb_held['vals']
+        tot, n = 0.0, 0
+        for X, Y in batches:
+            n_i = int((Y != -100).sum().item())
+            if n_i == 0:
+                continue
+            with ctx:
+                _, loss = model(X, Y)
+            if torch.isfinite(loss):
+                tot += loss.item() * n_i  # token 级加权，与训练损失同口径
+                n += n_i
+        ndb.store, ndb.store_pos = cur[0], cur[1]
+        if ndb.per_token:
+            ndb.vals = cur[2]
+        ndb.random_retrieve = False
+        return tot / max(n, 1)
+
+    res = {'mem': _run('train', False, True), 'off': _run('train', False, False),
+           'rand': _run('train', True, True)}
+    res['held'] = _run('held', False, True) if _ndb_held is not None else None
+    _ndb_state['on'] = True
+    ndb.retr_noise = _rn
+    if was_training:
+        model.train()
+    return res
 
 
 def ngram_rep(s, n):
@@ -651,27 +860,15 @@ def run_health_check(model, tok):
         health_ok=eos_rate >= health_min_eos_rate and rep3 <= health_max_rep3,
     )
 
-# 学习率衰减调度器（带预热的余弦）
+# 学习率衰减调度器（带预热的余弦 / WSD）
+# 实现与全部边界条件在 training/schedules.py::lr_at（有单元测试），这里只注入全局。
 def get_lr(it):
-    # 1) 线性预热 warmup_iters 步
-    if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
-    # 2) WSD（warmup-stable-decay，DeepSeek-V3）：稳定段保持 learning_rate，
-    #    最后 (1-stable_frac) 段线性衰减到 min_lr——训完 decay 出最优 checkpoint。
-    if schedule == 'wsd':
-        decay_start = int(lr_decay_iters * stable_frac)
-        if it <= decay_start:
-            return learning_rate
-        decay_ratio = (it - decay_start) / max(lr_decay_iters - decay_start, 1)
-        decay_ratio = min(decay_ratio, 1.0)
-        return learning_rate + (min_lr - learning_rate) * decay_ratio
-    # 3) 余弦调度（旧行为）：中间部分用余弦衰减下降到最小学习率
-    if it > lr_decay_iters:
-        return min_lr
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff 取值范围 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+    return _lr_at(
+        it,
+        learning_rate=learning_rate, min_lr=min_lr,
+        warmup_iters=warmup_iters, lr_decay_iters=lr_decay_iters,
+        schedule=schedule, stable_frac=stable_frac,
+    )
 
 # 日志
 if wandb_log and master_process:
@@ -733,6 +930,15 @@ if master_process:
     results_csv = open(os.path.join(out_dir, 'results.csv'), 'w', newline='', encoding='utf-8')
     csv_writer = csv.writer(results_csv)
     csv_writer.writerow(['step', 'train/loss', 'val/loss', 'lr', 'mfu', 'time'])
+
+# NDB 监控 CSV（启用 NDB 时；每评估点一行）
+ndb_csv = None
+ndb_csv_writer = None
+if master_process and ndb_store:
+    ndb_csv = open(os.path.join(out_dir, 'ndb.csv'), 'w', newline='', encoding='utf-8')
+    ndb_csv_writer = csv.writer(ndb_csv)
+    ndb_csv_writer.writerow(['iter', 'base_off', 'mem', 'delta', 'rand', 'delta_rand',
+                             'held', 'delta_held', 'gate', 'delta_norm'])
 
 # 健康体检初始化（health_enabled 时加载分词器 + 打开 health.csv；失败则本次跳过体检）
 health_tok = None
@@ -842,6 +1048,22 @@ train_start = time.time()  # 训练总起点，results.csv 里的 time 列用这
 local_iter_num = 0 # 本进程生命周期内的迭代次数
 raw_model = model.module if ddp else model # 如果需要，解开 DDP 容器
 running_mfu = -1.0
+grad_norm = 0.0     # 首步 OOM/NaN 跳过时日志仍可用
+_oom_steps = 0      # 因显存尖峰被跳过的步数（见微步循环里的 OOM 防护）
+_oom_dumps = 0      # 已落盘的 OOM 现场次数（限流，避免刷爆磁盘）
+_mem_snap_done = False
+# 训练侧窗口均值（2026-09-10）：单步 loss 只有 ~550 个有效 token，且其中 ~41% 来自同一个
+# 窗口（实测），逐点看就是纯抽样噪声（0.77 / 3.40 / 2.25）。进度条改成「最近 log_interval
+# 步的 token 加权均值」才看得见趋势；同时落一份 CSV 便于事后画曲线。
+_win_sum, _win_n = 0.0, 0
+loss_win_path = os.path.join(out_dir, 'train_loss_window.csv')
+if master_process and not os.path.exists(loss_win_path):
+    with open(loss_win_path, 'w') as _f:
+        _f.write('step,window_mean,window_steps,last_step_loss,grad_norm,lr\n')
+if mem_snapshot_gb > 0 and master_process:
+    # 显存分配历史：峰值超阈值时 dump，用来定位一次性尖峰的真正来源
+    torch.cuda.memory._record_memory_history(max_entries=200000)
+    print(f"  [诊断] 显存分配历史已开启，峰值 >{mem_snapshot_gb:g}GB 时 dump 快照")
 running_train_loss = None   # 训练侧 loss EMA（eval_train_split=false 时 results.csv 用它）
 # tqdm 进度条：DDP 下只有主进程显示
 pbar = tqdm(total=max_iters, initial=iter_num, desc="训练中", dynamic_ncols=True) if master_process else None
@@ -871,10 +1093,15 @@ while True:
     # Muon 实际用 5 倍学习率的 bug（100M 训练 NaN 的根因之一）。
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr * param_group.get('lr_ratio', 1.0)
+        if param_group.get('fixed_lr') is not None:  # NDB 接口：固定 lr，不随基座调度衰减
+            param_group['lr'] = param_group['fixed_lr']
+        else:
+            param_group['lr'] = lr * param_group.get('lr_ratio', 1.0)
 
     # 在 train/val 集合上评估损失并保存 checkpoint
-    if iter_num % eval_interval == 0 and master_process:
+    # 续训载入的那一步跳过：checkpoint 就是这一步存的，重评重存纯浪费（2GB 写盘 +
+    # 评估的 val batch 会消耗 CPU RNG → 打乱续训后的数据流，破坏可复现性）。
+    if iter_num % eval_interval == 0 and master_process and iter_num != _resume_iter:
         # 评估开销优化：eval_train_split=false 时只评 val，train/loss 用训练侧 EMA 代替
         eval_splits = ('val',) if not eval_train_split else ('train', 'val')
         losses = estimate_loss(eval_splits)
@@ -882,6 +1109,27 @@ while True:
             losses['train'] = running_train_loss if running_train_loss is not None else 0.0
         # 用 pbar.write 打印到进度条上方，不打断进度条
         pbar.write(f"step {iter_num}: train 损失 {losses['train']:.4f}, val 损失 {losses['val']:.4f}")
+        # --- NDB 监控：Δ / Δ_rand / Δ_held / 门控 / 注入幅度 ---
+        if ndb is not None:
+            _nr = ndb_eval()
+            _d = _nr['mem'] - _nr['off']
+            _dr = _nr['rand'] - _nr['off']
+            _dh = (_nr['held'] - _nr['off']) if _nr['held'] is not None else None
+            _msg = (f"[ndb {iter_num}] base_off={_nr['off']:.4f} mem={_nr['mem']:.4f} "
+                    f"Δ={_d:+.4f} rand={_nr['rand']:.4f} Δ_rand={_dr:+.4f} "
+                    f"gate={ndb.gate.item():+.4f} |Δ|={_ndb_state['delta_norm']:.3f}")
+            if _dh is not None:
+                _r = (_dh / _d) if abs(_d) > 1e-9 else float('nan')
+                _msg += f" held={_nr['held']:.4f} Δ_held={_dh:+.4f} Δ_held/Δ={_r:.2f}"
+            pbar.write(_msg)
+            if ndb_csv_writer is not None:
+                ndb_csv_writer.writerow([
+                    iter_num, f"{_nr['off']:.4f}", f"{_nr['mem']:.4f}", f"{_d:+.4f}",
+                    f"{_nr['rand']:.4f}", f"{_dr:+.4f}",
+                    (f"{_nr['held']:.4f}" if _dh is not None else ''),
+                    (f"{_dh:+.4f}" if _dh is not None else ''),
+                    f"{ndb.gate.item():+.4f}", f"{_ndb_state['delta_norm']:.3f}"])
+                ndb_csv.flush()
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -951,6 +1199,8 @@ while True:
                 'numpy_rng_state': np.random.get_state(),
                 # float16 训练时 GradScaler 的 scale 状态（bf16 下为 no-op，仍存以保证兼容）
                 'scaler_state': scaler.state_dict(),
+                'ndb': ndb.state_dict() if ndb is not None else None,  # NDB 接口参数
+                'ndb_opt': ndb_opt.state_dict() if ndb is not None else None,
             }
             save_checkpoint_async(checkpoint, os.path.join(out_dir, 'last.pt'))
             # 逢 1000 步归档独立检查点，防止被后续最优覆盖，方便阶段性回溯审查
@@ -1002,32 +1252,102 @@ while True:
     # 前向反向更新，带可选的梯度累积以模拟更大的 batch size
     # 如果数据类型是 float16，则使用 GradScaler
     step_nan = False
-    for micro_step in range(gradient_accumulation_steps):
+    step_loss_val = 0.0
+    # 先把整步所有 microbatch 取齐：只有先知道全步的有效 token 总数，才能做正确的
+    # token 级归一化。旧写法对每个 microbatch 各取一次 mean 再平均 → 有效 token 少的
+    # microbatch 被过度加权；全 mask 的 microbatch 还会返回 NaN 让整步作废。
+    # （2026-09-10：本数据集 ~80% 的 256 窗口全 mask，只有 8% 的 token 参与 loss。）
+    micro_batches = []
+    micro_qpos = []  # 每个 microbatch 自己的 q_pos：NDB 的 exclude_radius 靠它排除自匹配
+    for _ in range(gradient_accumulation_steps):
+        _mx, _my = get_batch('train')
+        micro_batches.append((_mx, _my))
+        micro_qpos.append(_ndb_state.get('q_pos') if ndb is not None else None)
+    micro_counts = [float((Y != -100).sum().item()) for _, Y in micro_batches]
+    n_valid_total = sum(micro_counts)
+    last_valid_idx = max((i for i, n in enumerate(micro_counts) if n > 0), default=-1)
+    if n_valid_total == 0:
+        step_nan = True  # 整步全 mask（概率 ~0.1%），无事可做
+    for micro_step, ((X, Y), n_i) in enumerate(zip(micro_batches, micro_counts)):
+        if n_i == 0:
+            continue  # 该 microbatch 无有效 token：跳过（旧版会 NaN 掉整步）
         if ddp:
             # 在 DDP 训练中，我们只需要在最后一个微步同步梯度。
             # 官方的做法是用 model.no_sync() 上下文管理器，但
             # 我很不喜欢它让代码膨胀并迫使我们重复代码。
             # 看了那个上下文管理器的源码，它只是切换这个变量。
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # 缩放损失以计入梯度累积
-        # 在模型于 GPU 上进行前向传播时，立即异步预取下一个 batch
-        X, Y = get_batch('train')
-        # NaN 防护：loss 非有限值（nan/inf）时跳过该微步的反向，
-        # 避免 NaN 梯度污染参数（一旦参数变 NaN 就永远救不回来）。
-        # 常见原因：loss mask 标记与数据不匹配、lr 过大、新架构数值不稳。
-        if not torch.isfinite(loss):
+            model.require_backward_grad_sync = (micro_step == last_valid_idx)
+        if ndb is not None:
+            # 必须逐 microbatch 复位 q_pos：get_batch 每次都覆盖它，
+            # 一次性预取 4 个 batch 后若不复位，四个 microbatch 会全用最后一个 batch 的位置，
+            # exclude_radius 形同虚设 → 可能检索到与查询重叠的 chunk（答案泄漏，Δ 虚高）。
+            _ndb_state['q_pos'] = micro_qpos[micro_step]
+            _ndb_state['drop'] = (random.random() < ndb_dropout)
+            # 检索噪声的按步种子：同一步（含梯度检查点的反向重算）拿到同一张掩码
+            ndb.noise_seed = iter_num * 1000 + micro_step
+        try:
+            with ctx:
+                logits, loss = model(X, Y)
+                loss = loss * (n_i / n_valid_total)  # token 级加权 → 全步等价于 token 均值
+            # NaN 防护：loss 非有限值（nan/inf）时跳过该微步的反向，
+            # 避免 NaN 梯度污染参数（一旦参数变 NaN 就永远救不回来）。
+            if not torch.isfinite(loss):
+                step_nan = True
+                continue
+            # 反向传播，如果以 fp16 训练则进行梯度缩放
+            scaler.scale(loss).backward()
+            step_loss_val += loss.item()
+        except torch.OutOfMemoryError:
+            # 显存尖峰防护（2026-09-10）：少数 batch 会在基座前向里触发一次性 ~3GB
+            # 尖峰（NDB 无关，NDB-off 对照同样发生）。把致命崩溃降级成「跳过该步」，
+            # 否则一次尖峰就会让数天的训练直接死掉。
+            #
+            # ★ 2026-09-10 补：旧版这里**把 traceback 丢掉了**，而快照的触发条件是
+            #   max_memory_allocated > mem_snapshot_gb，碎片型 OOM（reserved 满、allocated 没到阈值）
+            #   两个机制同时沉默 —— 这就是「莫名 OOM 查不出原因」的真正原因。
+            #   现在：前 3 次 OOM 落盘完整现场（操作栈 + allocated/reserved/峰值 + 快照）。
+            _oom_steps += 1
+            if master_process:
+                pbar.write(f"⚠ step {iter_num}: 显存不足，跳过该步（累计 {_oom_steps} 次）")
+            if master_process and _oom_dumps < 3 and device_type == 'cuda':
+                _oom_dumps += 1
+                try:
+                    _al = torch.cuda.memory_allocated() / 2**30
+                    _rs = torch.cuda.memory_reserved() / 2**30
+                    _pk = torch.cuda.max_memory_allocated() / 2**30
+                    _txt = os.path.join(out_dir, f'oom_dump_{iter_num}.txt')
+                    with open(_txt, 'w') as _f:
+                        _f.write(f"step={iter_num}  micro_step={micro_step}  iter={iter_num}\n")
+                        _f.write(f"allocated={_al:.3f}G  reserved={_rs:.3f}G  "
+                                 f"peak_allocated={_pk:.3f}G  mem_snapshot_gb={mem_snapshot_gb:g}\n")
+                        _f.write(f"batch_size={batch_size} grad_accum={gradient_accumulation_steps} "
+                                 f"block={block_size} tokens/step={tokens_per_iter}\n")
+                        _f.write(f"gradient_checkpointing(config)={gradient_checkpointing}  "
+                                 f"use_moe={use_moe} use_aux_free_balance={use_aux_free_balance} "
+                                 f"use_mhc={use_mhc} hc_mult={hc_mult} use_mtp={use_mtp}\n")
+                        _f.write("\n===== 分配现场（谁要的这块内存）=====\n")
+                        _f.write(traceback.format_exc())
+                    _sp = os.path.join(out_dir, f'oom_snap_{iter_num}.pickle')
+                    torch.cuda.memory._dump_snapshot(_sp)
+                    pbar.write(f"   ↳ 现场已落盘：{os.path.basename(_txt)} + "
+                               f"{os.path.basename(_sp)}（alloc={_al:.2f}G rsv={_rs:.2f}G peak={_pk:.2f}G）")
+                except Exception as _e:
+                    pbar.write(f"   ↳ OOM 现场落盘失败：{type(_e).__name__}: {_e}")
+            optimizer.zero_grad(set_to_none=True)
+            if ndb is not None:
+                ndb_opt.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
             step_nan = True
-            continue
-        # 反向传播，如果以 fp16 训练则进行梯度缩放
-        scaler.scale(loss).backward()
+            loss = torch.zeros((), device=device)
+            break
     if step_nan:
         # 本步含 NaN 微步：丢弃整步梯度（含正常微步累积的部分），跳过优化器更新
         if master_process:
             pbar.write(f"⚠ step {iter_num}: loss 非有限值（nan/inf），已跳过该步优化。"
                        f"检查 use_loss_masking 标记配置 / lr / 新架构数值稳定性")
         optimizer.zero_grad(set_to_none=True)
+        if ndb is not None:
+            ndb_opt.zero_grad(set_to_none=True)  # NaN 步：接口梯度同样丢弃
         scaler.update()
     else:
         # 裁剪梯度
@@ -1041,15 +1361,26 @@ while True:
         scaler.update()
         # 尽快清空梯度，不再需要这块内存
         optimizer.zero_grad(set_to_none=True)
+        # NDB 接口：独立优化器（固定 lr），单独裁剪 + 更新
+        if ndb is not None:
+            if grad_clip != 0.0:
+                torch.nn.utils.clip_grad_norm_(_ndb_params, grad_clip)
+            ndb_opt.step()
+            ndb_opt.zero_grad(set_to_none=True)
+
+    # 计入窗口统计（NaN/OOM 跳过的步不算，避免把残缺值拉进来）
+    if not step_nan:
+        _win_sum += step_loss_val
+        _win_n += 1
 
     # 计时与日志：更新 tqdm 进度条
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
-        # 把损失转成 float。注意：这是一个 CPU-GPU 同步点
-        # 放大以抵消上面的除法，近似真实的总体损失（精确做法应是求和）
-        lossf = loss.item() * gradient_accumulation_steps
+        # 进度条显示「最近 log_interval 步的 token 加权均值」——单步值只有 ~550 个有效
+        # token 且高度集中在一两个窗口上，逐点看纯粹是噪声，看不出趋势。
+        lossf = _win_sum / _win_n if _win_n else step_loss_val
         # 训练侧 loss EMA（eval_train_split=false 时 results.csv 的 train/loss 用它）
         running_train_loss = lossf if running_train_loss is None \
             else 0.9 * running_train_loss + 0.1 * lossf
@@ -1058,9 +1389,37 @@ while True:
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         epoch_str = f"{iter_num/steps_per_epoch:.2f}" if steps_per_epoch else "-"
         # 显存监控与实时吞吐追踪
-        mem_gb = torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
+        mem_gb = torch.cuda.max_memory_allocated() / (1024**3) if device_type == 'cuda' else 0.0
         tps = (tokens_per_iter) / max(dt, 1e-4)
-        pbar.set_postfix(轮次=f"{epoch_str}", 损失=f"{lossf:.4f}", 梯范=f"{grad_norm:.2f}", 显存=f"{mem_gb:.1f}G", 吞吐=f"{tps:.0f}t/s")
+        pbar.set_postfix(轮次=f"{epoch_str}", 损失=f"{lossf:.4f}",
+                         梯范=f"{grad_norm:.2f}", 显存=f"{mem_gb:.1f}G", 吞吐=f"{tps:.0f}t/s")
+        try:
+            with open(loss_win_path, 'a') as _f:
+                _f.write(f"{iter_num},{lossf:.6f},{_win_n},{step_loss_val:.6f},"
+                         f"{grad_norm:.4f},{get_lr(iter_num):.8g}\n")
+        except Exception:
+            pass
+        _win_sum, _win_n = 0.0, 0
+    if master_process and device_type == 'cuda' and not _mem_snap_done \
+            and should_dump_snapshot(torch.cuda.max_memory_allocated(),
+                                     torch.cuda.memory_reserved(), mem_snapshot_gb):
+        # 峰值超阈值：dump 分配历史（含每个 alloc 的调用栈），用于定位一次性尖峰。
+        # 触发条件取 max(allocated, reserved)：碎片型尖峰是 reserved 涨上去而
+        # allocated 没到阈值，旧实现因此从来不触发（至今 0 个 mem_snap 文件）。
+        _snap = os.path.join(out_dir, f'mem_snap_{iter_num}.pickle')
+        torch.cuda.memory._dump_snapshot(_snap)
+        _mem_snap_done = True
+        print(f"  [诊断] 峰值 allocated={torch.cuda.max_memory_allocated()/2**30:.2f}GB "
+              f"reserved={torch.cuda.memory_reserved()/2**30:.2f}GB → 显存快照 {_snap}", flush=True)
+    # 显存调试行：只在 log_interval 的整数倍打印（原来每步一行，把日志刷成两倍长）；
+    # OOM/尖峰有独立的告警与快照，不靠这行发现。
+    # ★ 判据用 device_type（实际训练设备），**不能**用 torch.cuda.is_available()：
+    #   有显卡的机器上跑 --device=cpu 时后者仍为 True，而 CUDA 分配器没有统计
+    #   → memory_stats() 缺键 → KeyError 崩在 step 0（2026-09-10 冒烟实测）。
+    if ndb_debug_mem and master_process and iter_num % log_interval == 0:
+        _line = mem_debug_line(device_type)
+        if _line is not None:
+            print(f"[mem {iter_num}] {_line}", flush=True)
     iter_num += 1
     local_iter_num += 1
     if pbar is not None:

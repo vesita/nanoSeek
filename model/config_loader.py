@@ -33,9 +33,14 @@ def _load_yaml_with_inheritance(path, _stack=None):
     if not isinstance(data, dict):
         raise TypeError(f"配置文件必须是 YAML 映射（dict）：{path}")
 
+    # 两个父配置别名都**无条件**取出。早期实现只在 extends 为 None 时才
+    # pop('base')，于是同时写 `extends:` 和 `base:` 时 `base` 会残留下来，
+    # 被当成普通配置键注入 train.py 全局（静默多一个无意义变量）。
+    # 两者本就是别名，全取掉更干净；同时出现时 extends 优先。
     parent_ref = data.pop("extends", None)
+    base_ref = data.pop("base", None)
     if parent_ref is None:
-        parent_ref = data.pop("base", None)
+        parent_ref = base_ref
     if parent_ref is not None:
         if not isinstance(parent_ref, str):
             raise TypeError(f"'{path.name}' 里的 extends/base 必须是字符串路径")

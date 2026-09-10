@@ -18,7 +18,9 @@ def build_assistant_mask(y, reply_ids, sep_ids):
     """返回 (B, T) bool mask：True = 计算 loss，False = 忽略。
 
     y: (B, T) int64 token id 张量。
-    reply_ids: 可迭代的回复终止符 id（新词表字级下 <eos>=117, <cont>=119）。
+    reply_ids: 可迭代的回复终止符 id。**以 tokenizer 为准，别硬编码**：
+        当前 data/chinese/char_tokenizer.json 里 `<eos>`=128、`<cont>`=130
+        （调用方用 `_cv['<eos>']` / `_cv['<cont>']` 取；旧词表曾是 117/119，已作废）。
     sep_ids: 忽略（保留参数以兼容调用方；换行边界自动检测）。
     """
     B, T = y.shape

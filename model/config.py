@@ -42,7 +42,14 @@ class GPTConfig:
     # 矩阵参数经 Newton-Schulz 正交化后更新，深层训练更稳、收敛更快。
     use_muon: bool = False      # True：矩阵参数用 Muon，embedding/lm_head/norm 用 AdamW
     muon_momentum: float = 0.95 # Muon 动量系数
-    muon_ns_steps: int = 10     # Newton-Schulz 迭代次数（默认 8 激进 + 2 经典）
+    muon_ns_steps: int = 10     # Newton-Schulz 迭代总次数
+    # 前 muon_ns_aggressive 步用「激进系数」(3.4445,-4.7750,2.0315)，其余用「经典系数」
+    # (2,-1.5,0.5)。激进收敛快但 p(1)=0.701≠1（落不到不动点），经典有不动点但收敛慢，
+    # 混相兼得。实测（真实动量矩阵最差残差 ‖QᵀQ−I‖_F/√n）：
+    #   经典 10 步 2.31e-04 ｜ 经典 5 步 6.64e-01 ｜ **激进 4 + 经典 3 = 7 步 1.22e-04**
+    # 取 (ns_steps=7, ns_aggressive=4) → 正交化质量不降，NS 计算省 30%。
+    # 0 = 纯经典系数（与本项目旧行为逐位一致）。
+    muon_ns_aggressive: int = 0
     muon_lr_scale: float = 0.2 # Muon 矩阵参数 lr 缩放（DeepSeek/Kimi 惯例：AdamW lr × 0.2）
     # --- GLM-5 Muon Split（2026-02 GLM-5 技术报告）---
     # 问题：Muon 配 MLA/注意力时，整块投影矩阵做 NS 正交化追不上简单方案（GLM-5 实测

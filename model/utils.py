@@ -111,15 +111,27 @@ def sinkhorn_knopp(log_alpha, n_iter=20):
 # 正交化保留了梯度向量的几何结构，深层训练更稳、收敛更快。
 # -----------------------------------------------------------------------------
 
-def zeropower_via_newtonschulz(G, steps=10, eps=1e-7):
+def zeropower_via_newtonschulz(G, steps=10, eps=1e-7, aggressive=0):
     """用 Newton-Schulz 迭代把矩阵 G 正交化（求「最近正交矩阵」）。
     数学上等于 SVD 里的 U V^T：对 G 做极分解的「旋转」部分，去掉缩放。
 
-    用 DeepSeek-V4 的「经典系数」(2, -1.5, 0.5)：
-        M ← 2M - 1.5(M·Mᵀ)M + 0.5(M·Mᵀ)²M
-    实测比旧版 (1.5, -0.5) 收敛快约 3 个数量级（同步数、一般随机矩阵）。
-    V4 报告里混相 8+2 的「激进系数」(3.4445, -4.7750, 2.0315) 经实测在一般矩阵上
-    不满足 p(1)=1（正交矩阵不是不动点），正交化测试不过关，故未采用。
+    两组系数，前 `aggressive` 步用激进系数、其余用经典系数（**混相**）：
+
+      激进 (3.4445, -4.7750, 2.0315)：收敛快，但 p(1)=0.701≠1，正交矩阵不是不动点。
+      经典 (2.0,    -1.5,     0.5)  ：p(1)=1，有不动点，但收敛慢。
+
+    只跑激进 → 快但落不到不动点；只跑经典 → 要 ~10 步才收敛（这正是本项目旧实现
+    用 steps=10 的原因，也是 model/config.py 注释里「8 激进 + 2 经典」的由来——
+    但旧实现其实只用了经典系数，注释与实现不符，这里让实现兑现文档）。
+
+    实测（真实动量矩阵，最差相对残差 ‖QᵀQ−I‖_F/√n）：
+        经典 10 步              2.305e-04   ← 本项目原来的行为
+        经典  5 步              6.642e-01   ← 远远不够，别砍步数
+        激进  5 步              3.348e-01
+        激进 4 + 经典 3 = 7 步   1.218e-04   ← 更好，且 NS 计算省 30%
+    良态随机矩阵对照（steps=10, aggressive=0）：残差 5.86e-07，说明函数本身没问题。
+
+    `aggressive=0` 时与本函数旧行为**逐位一致**（向后兼容）。
 
     先除以 Frobenius 范数：因为 ‖X‖_op ≤ ‖X‖_F，归一后算子范数 ≤ 1，
     特征值落在 (0,1]，迭代必然稳定收敛。
@@ -133,15 +145,22 @@ def zeropower_via_newtonschulz(G, steps=10, eps=1e-7):
     if was_tall:
         X = X.T
     X = X / (X.norm() + eps)  # Frobenius 范数归一，保证算子范数 ≤ 1
-    for _ in range(steps):
+    n_aggr = max(0, min(int(aggressive), int(steps)))
+    for i in range(steps):
         XX = X @ X.T
-        X = 2.0 * X - 1.5 * (XX @ X) + 0.5 * (XX @ XX @ X)
+        if i < n_aggr:
+            # 激进系数写成 X ← a·X + (b·A + c·A²)·X，A = X·Xᵀ
+            B = -4.7750 * XX + 2.0315 * (XX @ XX)
+            X = 3.4445 * X + B @ X
+        else:
+            X = 2.0 * X - 1.5 * (XX @ X) + 0.5 * (XX @ XX @ X)
     if was_tall:
         X = X.T
     return X.to(G.dtype)
 
 
-def zeropower_via_newtonschulz_split(G, steps=10, eps=1e-7, n_heads=4, head_first=True):
+def zeropower_via_newtonschulz_split(G, steps=10, eps=1e-7, n_heads=4, head_first=True,
+                                     aggressive=0):
     """GLM-5 Muon Split：把注意力投影矩阵按「注意力头」分块，逐头做 NS 正交化。
 
     背景（2026-02 GLM-5 技术报告）：Muon 对整块投影矩阵正交化时配 MLA/注意力追不上
@@ -163,9 +182,14 @@ def zeropower_via_newtonschulz_split(G, steps=10, eps=1e-7, n_heads=4, head_firs
         X = X.transpose(1, 2)                              # (H, d, n) 转窄侧迭代
     # 逐头 Frobenius 归一（算子范数 ≤ 1，迭代稳定），再批处理 NS
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
-    for _ in range(steps):
+    n_aggr = max(0, min(int(aggressive), int(steps)))
+    for i in range(steps):
         XX = torch.bmm(X, X.transpose(1, 2))               # (H, d, d)
-        X = 2.0 * X - 1.5 * torch.bmm(XX, X) + 0.5 * torch.bmm(torch.bmm(XX, XX), X)
+        if i < n_aggr:
+            B = -4.7750 * XX + 2.0315 * torch.bmm(XX, XX)
+            X = 3.4445 * X + torch.bmm(B, X)
+        else:
+            X = 2.0 * X - 1.5 * torch.bmm(XX, X) + 0.5 * torch.bmm(torch.bmm(XX, XX), X)
     if head_first:
         return X.reshape(G.shape).to(G.dtype)
     return X.transpose(1, 2).permute(1, 0, 2).reshape(G.shape).to(G.dtype)

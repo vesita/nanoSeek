@@ -11,6 +11,43 @@ train_chinese.yaml 对应）：
     #   0=剔除（train 只剩对话）；0.1=留 10%。
     # --insert-eos：每条「模型：」回复后插 <eos>（turn-level 终止符，默认开启）。
     # agent_dialogue.txt 归入 DIALOGUE_FILES，享受 90/10 验证切分。
+
+============================================================================
+变更记录 2026-09-10（任务：重建中文语料数据集）
+============================================================================
+【问题】修前的 train/val 切分是"双标准"：
+    - DIALOGUE_FILES 硬编码 5 个文件名（其中 agent_dialogue.txt 实际不存在，
+      真正命中的只有 dailychat / muice / multi_turn / zhihu_kol 4 个）按 10% 抽 val；
+    - 其它所有来源（含 deepseek_r1_distill、qwen3_235b_distill、coig_wiki、
+      lccc、c4_zh、wikipedia_cn 等）只在 `--val-all` 下按 `--val-ratio`（实跑 0.01）抽 val。
+    后果：对话类在 val 里被放大约 6.5 倍。实测修前 train 中 4 个对话文件只占 7.08%
+    字符，却占了 val 的 45.70% 字符；val 的 <eos>/<cont> 密度和"有效 token 占比"
+    远高于 train，两个 split 实际不是同一个任务（见 DATASET_REPORT.md）。
+
+【修复】`--val-all` 现在真正统一：**所有来源**都用同一个 `--val-ratio` 抽 val，
+    DIALOGUE_FILES 不再有第二套 90/10 标准。DIALOGUE_FILES 常量保留，只在
+    *不传* `--val-all` 时（旧默认行为）生效，因此默认调用方的语义不变。
+    同时去掉了 val 侧 `max(1, ...)`：块数 <100 的小源不再被整段抽进 val。
+    统一后 val 的来源构成与 train 一致（目标：bigram CE 差距 < 0.15 nats）。
+
+【新增】`--out-prefix PREFIX`：所有产物加后缀，例如 `--out-prefix v2` 写出
+    train_char_v2.bin / val_char_v2.bin / meta_char_v2.pkl / manifest_v2.json。
+    默认空 = 旧文件名，保证不覆盖既有数据集。
+    `--seed`：可选，固定 annotate_replies 的随机种子，让重建结果可复现
+    （不传时保持旧行为 = 不设种子）。
+
+【注意】`--source-ratio` 仍然只作用于 train 侧（val 保持不变以跨实验可比）；
+    它与统一 val 比例叠加时，会让被降采样的源在 val 中占比偏高。本次重建
+    未使用任何 `--source-ratio`。
+
+【另修一个真 bug】encode_to_bin 原先只在"两个特殊符之间的整段"处理完后才
+    flush；train 拼接的第一个来源 c4_zh.txt（~1.89 亿字符、无 <eos>/<cont>）
+    会被整段塞进 buffer → 实测 RSS 7.1GB、系统可用内存剩 469MB、swap 打满，
+    险些 OOM。现改为在 1M 字符分块内 flush；已用已知输入做逐字节等价自检
+    （输出与旧实现完全一致）。
+
+【留痕】manifest 的 prepare_args 现在记录完整 `argv`。教训：旧构建的
+    source_ratio 未落盘，产物里发现 ~9.5 万 block 的 train 缺口却无法反查命令。
 """
 import datetime
 import hashlib
@@ -18,6 +55,7 @@ import json
 import os
 import pickle
 import random
+import sys
 import requests
 import numpy as np
 from split_sentences import split_text  # 数据分句器（dev-notes/49）
@@ -37,6 +75,63 @@ DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKENIZER_PATH = os.path.join(DATA_DIR, 'tokenizer.json')
 CHAR_TOKENIZER_PATH = os.path.join(DATA_DIR, 'char_tokenizer.json')
 CHUNK = 1_000_000  # 编码分块大小（字符），控制内存
+
+# 旧默认行为里享受 90/10 切分的"对话类"文件（agent_dialogue.txt 实际不存在，
+# 留着以兼容历史语义）。仅在 *不传* --val-all 时生效；传 --val-all 时所有来源统一比例。
+DIALOGUE_FILES = {'dailychat_dialogue.txt', 'muice_dialogue.txt', 'multi_turn_dialogue.txt',
+                  'agent_dialogue.txt', 'zhihu_kol_dialogue.txt'}
+
+
+def named_output(stem, prefix, ext):
+    """按 --out-prefix 生成产物文件名：空 prefix 保持旧名，否则 stem_prefix.ext。"""
+    return f'{stem}{("_" + prefix) if prefix else ""}{ext}'
+
+
+def split_one_source(fn, blocks, args, src_ratio=None):
+    """切分单个来源的 blocks 为 (train_blocks, val_blocks)。
+
+    修复点（2026-09-10）：`args.val_all` 为真时，**所有来源**（包括
+    DIALOGUE_FILES）统一用 `args.val_ratio` 抽 val —— val 的来源构成与 train 一致。
+    不传 `--val-all` 时完全保持旧行为（对话 90/10，非对话全部进 train）。
+    """
+    n = len(blocks)
+    if args.val_all:
+        # 统一比例切分（修复双标准）。seed 按文件名派生 → 各源独立、可复现。
+        random.seed(1337 + sum(ord(c) for c in fn) + 7)
+        random.shuffle(blocks)
+        n_val = int(n * args.val_ratio)          # 注意：不再 max(1,·)，小源可贡献 0 条 val
+        val_blocks, train_blocks = blocks[:n_val], blocks[n_val:]
+        if src_ratio is not None and src_ratio < 1.0:
+            random.seed(1337 + sum(ord(c) for c in fn) + 1)
+            random.shuffle(train_blocks)
+            train_blocks = train_blocks[:max(1, int(len(train_blocks) * src_ratio))]
+        return train_blocks, val_blocks
+    if fn in DIALOGUE_FILES:
+        random.seed(1337)  # 固定 seed：重复运行切分一致，实验结果可复现
+        random.shuffle(blocks)
+        k = int(n * 0.9)
+        train_blocks, val_blocks = blocks[:k], blocks[k:]
+        if src_ratio is not None and src_ratio < 1.0:
+            random.seed(1337 + sum(ord(c) for c in fn) + 1)
+            random.shuffle(train_blocks)
+            train_blocks = train_blocks[:max(1, int(len(train_blocks) * src_ratio))]
+        return train_blocks, val_blocks
+    if src_ratio is not None:
+        random.seed(1337 + sum(ord(c) for c in fn) + 1)
+        random.shuffle(blocks)
+        k = max(1, int(n * src_ratio))
+        return blocks[:k], []
+    if args.task_ratio >= 1.0:
+        return blocks, []  # 默认：非对话(任务/指令)全部进训练，让模型学全面
+    if args.task_ratio > 0:
+        # 数据治理（2026-08-12）：任务/指令样本按比例抽样进 train。
+        # 根因：zhuangxialie(149MB 单轮指令)占 train 55%，模型自由生成学成
+        # "碎片拼贴"（对对联/实体识别/热评等任务模板拼贴，dev-notes 见 21）。
+        random.seed(1337 + sum(ord(c) for c in fn))
+        random.shuffle(blocks)
+        k = max(1, int(n * args.task_ratio))
+        return blocks[:k], []
+    return [], []  # task_ratio == 0：任务/指令样本剔除，train 只剩对话
 
 
 def download_if_missing(local_name, book_name):
@@ -151,6 +246,15 @@ def encode_to_bin(text, tokenizer, out_path):
     with open(out_path, 'wb') as f:
         buf = []
         prev_end = 0
+
+        def _flush():
+            """把 buf 写成 uint16；在分块内调用，避免长段（如无终止符的 c4_zh
+            189M 字符）把 buf 撑到数 GB 导致 OOM。输出字节与一次性写完全一致。"""
+            nonlocal buf
+            if buf:
+                np.array(buf, dtype=np.uint16).tofile(f)
+                buf = []
+
         for m in pattern.finditer(text):
             seg = text[prev_end:m.end() - len(m.group())]
             # 段前普通文本
@@ -159,13 +263,14 @@ def encode_to_bin(text, tokenizer, out_path):
                     chunk = seg[j:j + CHUNK]
                     if chunk:
                         buf.extend(tokenizer.encode(chunk).ids)
+                        if len(buf) >= 1 << 20:
+                            _flush()
             # 特殊符 id
             if markers.get(m.group()) is not None:
                 buf.append(markers[m.group()])
             prev_end = m.end()
             if len(buf) >= 1 << 20:
-                np.array(buf, dtype=np.uint16).tofile(f)
-                buf = []
+                _flush()
         # 结尾余段
         seg = text[prev_end:]
         if seg:
@@ -173,8 +278,9 @@ def encode_to_bin(text, tokenizer, out_path):
                 chunk = seg[j:j + CHUNK]
                 if chunk:
                     buf.extend(tokenizer.encode(chunk).ids)
-        if buf:
-            np.array(buf, dtype=np.uint16).tofile(f)
+                    if len(buf) >= 1 << 20:
+                        _flush()
+        _flush()
 
 EOS_ID = 256  # 字节直入模式（dev-notes/48）：0-255 = UTF-8 字节，256 = <eos>
 
@@ -209,11 +315,22 @@ def sha256_file(path):
 
 
 def write_manifest(args, tokenizer, train_samples, val_samples,
-                   train_data, val_data, meta):
-    """把数据集的来源、切分、哈希等信息写进 manifest.json。
+                   train_data, val_data, meta,
+                   train_bin=None, val_bin=None, meta_path=None,
+                   manifest_path=None, source_stats=None,
+                   n_train_samples=None, n_val_samples=None):
+    """把数据集的来源、切分、哈希等信息写进 manifest（默认 manifest.json）。
 
-    以后训练 checkpoint 可以记录这个文件的哈希，就能回答“这个模型用的哪版数据”。
+    train_bin/val_bin/meta_path 传入真实产物名（支持 --out-prefix），
+    source_stats 传入逐来源 (blocks/train_chars/val_chars) 统计用于审计。
     """
+    stem = getattr(args, 'out_prefix', '') or ''
+    if manifest_path is None:
+        manifest_path = os.path.join(DATA_DIR, named_output('manifest', stem, '.json'))
+    if train_bin is None:
+        train_bin = os.path.join(DATA_DIR, 'train.bin')
+    if val_bin is None:
+        val_bin = os.path.join(DATA_DIR, 'val.bin')
     manifest = {
         "dataset": "chinese",
         "created_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -222,17 +339,30 @@ def write_manifest(args, tokenizer, train_samples, val_samples,
             "task_ratio": args.task_ratio,
             "insert_eos": args.insert_eos,
             "pretrain": getattr(args, 'pretrain', False),
+            "char_level": getattr(args, 'char_level', False),
+            "byte_level": getattr(args, 'byte_level', False),
+            "val_all": getattr(args, 'val_all', False),
+            "val_ratio": getattr(args, 'val_ratio', None),
+            "source_ratio": list(getattr(args, 'source_ratio', []) or []),
+            "seed": getattr(args, 'seed', None),
+            "out_prefix": getattr(args, 'out_prefix', ''),
+            # 完整命令行：2026-09 事故教训——旧构建的 source_ratio 没落盘，
+            # 导致 train 缺口 9.5 万 block 无法从产物反查。以后一律留痕。
+            "argv": list(sys.argv),
         },
         "tokenizer": meta,
         "counts": {
-            "train_samples": len(train_samples),
-            "val_samples": len(val_samples),
+            "train_samples": (n_train_samples if n_train_samples is not None
+                              else len(train_samples)),
+            "val_samples": (n_val_samples if n_val_samples is not None
+                            else len(val_samples)),
             "train_chars": len(train_data),
             "val_chars": len(val_data),
-            "train_tokens": os.path.getsize(os.path.join(DATA_DIR, 'train.bin')) // 2,
-            "val_tokens": os.path.getsize(os.path.join(DATA_DIR, 'val.bin')) // 2,
+            "train_tokens": os.path.getsize(train_bin) // 2,
+            "val_tokens": os.path.getsize(val_bin) // 2,
         },
         "source_files": [],
+        "source_breakdown": source_stats or [],
         "artifacts": {},
     }
     for fn in sorted(os.listdir(DATA_DIR)):
@@ -245,14 +375,14 @@ def write_manifest(args, tokenizer, train_samples, val_samples,
             "sha256": sha256_file(path),
             "mtime": datetime.datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds"),
         })
-    for name in ('train.bin', 'val.bin', 'tokenizer.json', 'meta.pkl'):
+    for name in (os.path.basename(train_bin), os.path.basename(val_bin),
+                 'tokenizer.json', os.path.basename(meta_path) if meta_path else 'meta.pkl'):
         path = os.path.join(DATA_DIR, name)
         if os.path.exists(path):
             manifest["artifacts"][name] = {
                 "size_bytes": os.path.getsize(path),
                 "sha256": sha256_file(path),
             }
-    manifest_path = os.path.join(DATA_DIR, 'manifest.json')
     with open(manifest_path, 'w', encoding='utf-8') as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
     print(f'数据清单已写入：{manifest_path}')
@@ -266,11 +396,21 @@ def main():
     ap.add_argument('--task-ratio', type=float, default=1.0,
                     help='非对话(任务/指令)样本保留比例：1.0=全保留(默认,所有数据)，0=剔除，0.1=留10%%')
     ap.add_argument('--val-ratio', type=float, default=0.1,
-                    help='每个来源抽到验证集的样本比例（默认0.1=10%）。'
-                         '默认只对对话源(DIALOGUE_FILES)抽 val；设为非 None 时所有来源统一按此比例抽，'
-                         '让 val 分布匹配 train 的各来源占比。')
+                    help='当 --val-all 开启时，**所有来源统一**抽到验证集的样本比例'
+                         '（默认0.1=10%%）。推荐 0.01=1%%：val 仍 ≈9.4M token，'
+                         '且 train 只损失 1%%。不传 --val-all 时此参数不生效'
+                         '（旧行为：DIALOGUE_FILES 固定 90/10）。')
     ap.add_argument('--val-all', action='store_true',
-                    help='让所有来源(含百科/网页/指令)都参与验证集抽样，val 分布匹配 train。')
+                    help='让所有来源(含百科/网页/指令)都参与验证集抽样，'
+                         '并统一使用 --val-ratio（修复"对话10%%/其它1%%"的双标准 bug），'
+                         'val 来源构成与 train 一致。')
+    ap.add_argument('--out-prefix', default='', metavar='PREFIX',
+                    help='产物文件名加后缀，避免覆盖现有数据集：'
+                         '--out-prefix v2 → train_char_v2.bin / val_char_v2.bin / '
+                         'meta_char_v2.pkl / manifest_v2.json。默认空=旧文件名。')
+    ap.add_argument('--seed', type=int, default=None,
+                    help='可选：固定 annotate_replies 的随机种子，使重建结果可复现。'
+                         '不传则保持旧行为（不设种子，每次标注随机）。')
     ap.add_argument('--source-ratio', action='append', default=[], metavar='NAME=RATIO',
                     help='按文件名前缀降采样某源（仅 train 侧，val 不变保持可比）。'
                          '可重复：--source-ratio multi_turn=0.15 --source-ratio zhuangxialie=0.2')
@@ -321,16 +461,21 @@ def main():
             val_parts.append(text[n:])
         train_data = ''.join(train_parts)
         val_data = ''.join(val_parts)
-        encode_to_bin(train_data, tokenizer, os.path.join(DATA_DIR, 'pretrain.bin'))
-        encode_to_bin(val_data, tokenizer, os.path.join(DATA_DIR, 'val.bin'))
+        pfx = args.out_prefix or ''
+        pretrain_bin = os.path.join(DATA_DIR, named_output('pretrain', pfx, '.bin'))
+        val_bin = os.path.join(DATA_DIR, named_output('val', pfx, '.bin'))
+        meta_path = os.path.join(DATA_DIR, named_output('meta', pfx, '.pkl'))
+        encode_to_bin(train_data, tokenizer, pretrain_bin)
+        encode_to_bin(val_data, tokenizer, val_bin)
         meta = {'vocab_size': vocab_size, 'tokenizer_path': os.path.basename(TOKENIZER_PATH)}
         print(f'预训练数据：{len(train_data):,} 训练字符 / {len(val_data):,} 验证字符')
-        print(f'pretrain token 数：{os.path.getsize(os.path.join(DATA_DIR, "pretrain.bin")) // 2:,}')
-        print(f'val token 数：{os.path.getsize(os.path.join(DATA_DIR, "val.bin")) // 2:,}')
-        with open(os.path.join(DATA_DIR, 'meta.pkl'), 'wb') as f:
+        print(f'pretrain token 数：{os.path.getsize(pretrain_bin) // 2:,}')
+        print(f'val token 数：{os.path.getsize(val_bin) // 2:,}')
+        with open(meta_path, 'wb') as f:
             pickle.dump(meta, f)
         write_manifest(args, tokenizer, train_parts, val_parts,
-                       train_data, val_data, meta)
+                       train_data, val_data, meta,
+                       train_bin=pretrain_bin, val_bin=val_bin, meta_path=meta_path)
         print('完成 ✅ pretrain.bin / val.bin / meta.pkl / manifest.json 已生成（预训练模式）')
         return
 
@@ -338,12 +483,10 @@ def main():
     #    旧实现是按文件拼接后整段硬切 90/10，会让 val 恰好落在最后一个文件
     #    （zhuangxialie 单轮指令）的后半段，而 train 主要是对话 → 分布错位，
     #    train-val gap 巨大（val 7.17 vs train 4.44）。
-    #    策略（用户 2026-08-11）：val 只验证"对话"（核心目标），train 学全面。
-    #    对话类文件（闲聊/多轮）单独 90/10 切：对话 90% 进 train、10% 进 val；
-    #    非对话类文件（单轮指令/逻辑/古风）全部进 train，不参与 val。
-    DIALOGUE_FILES = {'dailychat_dialogue.txt', 'muice_dialogue.txt', 'multi_turn_dialogue.txt',
-                       'agent_dialogue.txt', 'zhihu_kol_dialogue.txt'}
+    #    2026-09-10 修复：--val-all 时所有来源统一 --val-ratio，val 来源构成对齐 train。
+    #    切分逻辑见 split_one_source()（模块级函数，审计脚本可复用）。
     train_samples, val_samples = [], []
+    source_stats = []
     for fn in sorted(os.listdir(DATA_DIR)):
         if not fn.endswith('.txt'):
             continue
@@ -351,84 +494,62 @@ def main():
             text = f.read()
         blocks = [b.strip() for b in text.split('\n\n') if b.strip()]
         # --source-ratio NAME=RATIO：按文件名降采样该源（只作用于 train 侧，
-        # val 保持 90/10 全量 → val.bin 不变，跨实验 val 可比）。NAME 是文件名前缀，
+        # val 保持全量 → val.bin 不变，跨实验 val 可比）。NAME 是文件名前缀，
         # 如 multi_turn=0.15 / zhuangxialie=0.2。优先级高于 task_ratio。
         src_ratio = None
         for spec in args.source_ratio:
             name, ratio = spec.split('=', 1)
             if fn.startswith(name):
                 src_ratio = float(ratio)
-        if fn in DIALOGUE_FILES:
-            random.seed(1337)  # 固定 seed：重复运行切分一致，实验结果可复现
-            random.shuffle(blocks)
-            n = int(len(blocks) * 0.9)
-            train_blocks, val_blocks = blocks[:n], blocks[n:]
-            if src_ratio is not None and src_ratio < 1.0:
-                random.seed(1337 + sum(ord(c) for c in fn) + 1)
-                random.shuffle(train_blocks)
-                train_blocks = train_blocks[:max(1, int(len(train_blocks) * src_ratio))]
-            train_samples += train_blocks
-            val_samples += val_blocks
-        elif args.val_all:
-            # 分布匹配：所有来源统一 90/10 抽 val（val_ratio 可调），train 降采样仍在 train 侧生效
-            random.seed(1337 + sum(ord(c) for c in fn) + 7)
-            random.shuffle(blocks)
-            n_val = max(1, int(len(blocks) * args.val_ratio))
-            val_blocks = blocks[:n_val]
-            train_blocks = blocks[n_val:]
-            if src_ratio is not None and src_ratio < 1.0:
-                random.seed(1337 + sum(ord(c) for c in fn) + 1)
-                random.shuffle(train_blocks)
-                train_blocks = train_blocks[:max(1, int(len(train_blocks) * src_ratio))]
-            train_samples += train_blocks
-            val_samples += val_blocks
-        elif src_ratio is not None:
-            random.seed(1337 + sum(ord(c) for c in fn) + 1)
-            random.shuffle(blocks)
-            n = max(1, int(len(blocks) * src_ratio))
-            train_samples += blocks[:n]
-        elif args.task_ratio >= 1.0:
-            train_samples += blocks  # 默认：非对话(任务/指令)全部进训练，让模型学全面
-        elif args.task_ratio > 0:
-            # 数据治理（2026-08-12）：任务/指令样本按比例抽样进 train。
-            # 根因：zhuangxialie(149MB 单轮指令)占 train 55%，模型自由生成学成
-            # "碎片拼贴"（对对联/实体识别/热评等任务模板拼贴，dev-notes 见 21）。
-            # 降比例让对话主导；每个文件独立 seed 保证可复现。
-            random.seed(1337 + sum(ord(c) for c in fn))
-            random.shuffle(blocks)
-            n = max(1, int(len(blocks) * args.task_ratio))
-            train_samples += blocks[:n]
-        # task_ratio == 0：任务/指令样本剔除，train 只剩对话
+        train_blocks, val_blocks = split_one_source(fn, blocks, args, src_ratio)
+        train_samples += train_blocks
+        val_samples += val_blocks
+        source_stats.append({
+            'file': fn,
+            'size_bytes': os.path.getsize(os.path.join(DATA_DIR, fn)),
+            'blocks': len(blocks),
+            'train_blocks': len(train_blocks),
+            'val_blocks': len(val_blocks),
+            'train_chars_raw': sum(len(b) for b in train_blocks),
+            'val_chars_raw': sum(len(b) for b in val_blocks),
+        })
+    if args.seed is not None:
+        random.seed(args.seed)   # 可选：固定标注随机性，使重建可复现
     if args.insert_eos:
         train_samples = [insert_eos_after_replies(b) for b in train_samples]
         val_samples = [insert_eos_after_replies(b) for b in val_samples]
-    print(f'训练 {len(train_samples)} 条 / 验证 {len(val_samples)} 条（仅对话）')
+    print(f'训练 {len(train_samples)} 条 / 验证 {len(val_samples)} 条')
     train_data = '\n\n'.join(train_samples)
     val_data = '\n\n'.join(val_samples)
+    # 释放 block 列表（~2GB），降低编码阶段峰值内存
+    n_train_samples, n_val_samples = len(train_samples), len(val_samples)
+    del train_samples, val_samples
     print(f'{len(train_data):,} 训练字符 / {len(val_data):,} 验证字符')
 
     # 5) 编码 + 写 bin（--char-level：字级；--byte-level：字节直入；默认：BPE）
+    #    --out-prefix 给所有产物加后缀（如 v2），绝不覆盖既有数据集。
+    pfx = args.out_prefix or ''
     if args.char_level:
-        train_bin = os.path.join(DATA_DIR, 'train_char.bin')
-        val_bin = os.path.join(DATA_DIR, 'val_char.bin')
+        train_bin = os.path.join(DATA_DIR, named_output('train_char', pfx, '.bin'))
+        val_bin = os.path.join(DATA_DIR, named_output('val_char', pfx, '.bin'))
         char_tok = Tokenizer.from_file(CHAR_TOKENIZER_PATH)   # WordLevel 字级（dev-notes/50）
         encode_to_bin(train_data, char_tok, train_bin)
         encode_to_bin(val_data, char_tok, val_bin)
         vocab_size = char_tok.get_vocab_size()
         meta = {'vocab_size': vocab_size, 'char_level': True,
                 'tokenizer_path': os.path.basename(CHAR_TOKENIZER_PATH)}
-        meta_path = os.path.join(DATA_DIR, 'meta_char.pkl')   # 独立 meta，不覆盖 BPE/byte
+        meta_path = os.path.join(DATA_DIR, named_output('meta_char', pfx, '.pkl'))  # 独立 meta
     elif args.byte_level:
-        train_bin = os.path.join(DATA_DIR, 'train_byte.bin')
-        val_bin = os.path.join(DATA_DIR, 'val_byte.bin')
+        train_bin = os.path.join(DATA_DIR, named_output('train_byte', pfx, '.bin'))
+        val_bin = os.path.join(DATA_DIR, named_output('val_byte', pfx, '.bin'))
         encode_bytes_to_bin(train_data, train_bin)
         encode_bytes_to_bin(val_data, val_bin)
         vocab_size = 257  # 0-255 字节 + <eos>=256
         meta = {'vocab_size': vocab_size, 'byte_level': True}
-        meta_path = os.path.join(DATA_DIR, 'meta_byte.pkl')   # 独立 meta，不覆盖 BPE 的 meta.pkl
+        meta_path = os.path.join(DATA_DIR, named_output('meta_byte', pfx, '.pkl'))
     else:
-        train_bin = os.path.join(DATA_DIR, 'train.bin')
-        val_bin = os.path.join(DATA_DIR, 'val.bin')
+        train_bin = os.path.join(DATA_DIR, named_output('train', pfx, '.bin'))
+        val_bin = os.path.join(DATA_DIR, named_output('val', pfx, '.bin'))
         encode_to_bin(train_data, tokenizer, train_bin)
         encode_to_bin(val_data, tokenizer, val_bin)
         vocab_size = tokenizer.get_vocab_size()
@@ -436,16 +557,27 @@ def main():
             'vocab_size': vocab_size,
             'tokenizer_path': os.path.basename(TOKENIZER_PATH),
         }
-        meta_path = os.path.join(DATA_DIR, 'meta.pkl')
+        meta_path = os.path.join(DATA_DIR, named_output('meta', pfx, '.pkl'))
     print(f'train token 数：{os.path.getsize(train_bin) // 2:,}')
     print(f'val token 数：{os.path.getsize(val_bin) // 2:,}')
 
     # 6) meta 信息（train.py 只读 vocab_size；推理端用 tokenizer.json 编解码）
     with open(meta_path, 'wb') as f:
         pickle.dump(meta, f)
-    write_manifest(args, tokenizer, train_samples, val_samples,
-                   train_data, val_data, meta)
-    print('完成 ✅ train.bin / val.bin / meta.pkl / manifest.json 已生成')
+    # 逐来源占比：把 raw 字符统计换算成占比写进 manifest，便于审计
+    tot_t = sum(s['train_chars_raw'] for s in source_stats) or 1
+    tot_v = sum(s['val_chars_raw'] for s in source_stats) or 1
+    for s in source_stats:
+        s['train_share'] = round(s['train_chars_raw'] / tot_t, 6)
+        s['val_share'] = round(s['val_chars_raw'] / tot_v, 6)
+    write_manifest(args, tokenizer, None, None,
+                   train_data, val_data, meta,
+                   train_bin=train_bin, val_bin=val_bin, meta_path=meta_path,
+                   source_stats=source_stats,
+                   n_train_samples=n_train_samples, n_val_samples=n_val_samples)
+    print(f'完成 ✅ {os.path.basename(train_bin)} / {os.path.basename(val_bin)} / '
+          f'{os.path.basename(meta_path)} / '
+          f'{named_output("manifest", pfx, ".json")} 已生成')
 
 
 if __name__ == '__main__':

@@ -42,3 +42,60 @@ package = false
 name = "pytorch-rocm"
 url = "https://download.pytorch.org/whl/rocm6.4"
 explicit = true
+
+# 开发依赖：跑测试 / lint 用（uv sync --group dev）
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+# -----------------------------------------------------------------------------
+# 单元测试配置。设计约束（详见 tests/README.md）：
+#   - 全部测试必须能在**纯 CPU** 上跑通；需要显卡的用例打 `@pytest.mark.gpu`，
+#     无卡机器自动 skip，不会误报失败。
+#   - `testpaths=tests` → 直接 `pytest` 即可，不会误扫 data/external 下几万个第三方文件。
+#   - `pythonpath=.` → 让 `from model import ...` 在 tests/ 子目录里也能用。
+# -----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q --strict-markers --strict-config"
+markers = [
+    "slow: 单条要跑十几秒以上（`pytest -m 'not slow'` 可跳过）",
+    "gpu: 需要 GPU/ROCm（无卡机器自动 skip）",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+# -----------------------------------------------------------------------------
+# lint：只开「一定是 bug」的规则，杜绝风格噪声把门禁变成摆设。
+#
+# 选这四条的依据（2026-09-10 全项目实测）：
+#   F821 未定义名 → 1 处；F811 重复定义 → 1 处；F823 局部变量未绑定 → 0 处
+# 合计只有 1 处真实违规，所以可以设**零容忍**。正确性由 tests/test_lint.py 守住。
+#
+# 故意**不**开：
+#   E501 行宽、I 导入排序等纯风格规则 —— 这个仓库大量长行是有意为之；
+#   F401 未使用导入（88 处）、F841 未使用变量（29 处）—— 遗留噪声太大，
+#   开成硬门禁会逼人加 noqa，反而让门禁失去意义。想清理时单独跑：
+#       ruff check --select F401 --fix
+#
+# 本次运行已按 F821/F811 修掉：
+#   local/eval_mem_dialogue.py  TOP_K 被 import 后又被覆盖（前者失效）
+# -----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [
+    "data/external",       # 第三方语料仓库（几万个文件，不属于本项目）
+    "data/openwebtext",
+    "out",                 # 训练产物
+    ".venv",
+]
+
+[tool.ruff.lint]
+select = ["E9", "F821", "F811", "F823"]
+

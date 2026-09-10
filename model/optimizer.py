@@ -21,8 +21,9 @@ class Muon(torch.optim.Optimizer):
     """
 
     def __init__(self, params, lr, momentum=0.95, nesterov=True, ns_steps=10,
-                 orthogonalization_fn=None, split_heads=None):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+                 ns_aggressive=0, orthogonalization_fn=None, split_heads=None):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
+                        ns_aggressive=ns_aggressive)
         super().__init__(params, defaults)
         self.orthogonalization_fn = orthogonalization_fn or zeropower_via_newtonschulz
         self.split_heads = split_heads or {}   # id(p) → (n_heads, head_first)
@@ -38,6 +39,7 @@ class Muon(torch.optim.Optimizer):
             momentum = group['momentum']
             nesterov = group['nesterov']
             ns_steps = group['ns_steps']
+            ns_aggr = group.get('ns_aggressive', 0)
             wd = group.get('weight_decay', 0.0)
             for p in group['params']:
                 if p.grad is None:
@@ -57,12 +59,13 @@ class Muon(torch.optim.Optimizer):
                     spec = self.split_heads.get(id(p))
                     if spec is None:
                         # Muon 的核心：只对矩阵参数做正交化（整块）
-                        g = self.orthogonalization_fn(g, steps=ns_steps)
+                        g = self.orthogonalization_fn(g, steps=ns_steps, aggressive=ns_aggr)
                     else:
                         # GLM-5 Muon Split：按注意力头分块正交化
                         n_heads, head_first = spec
                         g = zeropower_via_newtonschulz_split(
-                            g, steps=ns_steps, n_heads=n_heads, head_first=head_first)
+                            g, steps=ns_steps, n_heads=n_heads, head_first=head_first,
+                            aggressive=ns_aggr)
                     # 权重衰减：正交化的方向 + 掺一点原参数做收缩
                     g = (1 - wd) * g + wd * p.data
                 p.data.add_(g, alpha=-lr)

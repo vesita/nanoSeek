@@ -1,0 +1,283 @@
+{
+  "mode": "prefix",
+  "val_ratio": 0.01,
+  "total_train_chars": 927410632,
+  "total_val_chars": 15935661,
+  "rows": [
+    {
+      "file": "c4_zh.txt",
+      "size_mb": 466.2,
+      "blocks": 191459,
+      "train_chars": 189158879,
+      "val_chars": 1842739,
+      "train_tokens_est": 189158879,
+      "val_tokens_est": 1842739,
+      "train_share": 0.2039645357440759,
+      "val_share": 0.11563618227069464
+    },
+    {
+      "file": "classical_poetry.txt",
+      "size_mb": 5.8,
+      "blocks": 24556,
+      "train_chars": 2106588,
+      "val_chars": 21982,
+      "train_tokens_est": 2106588,
+      "val_tokens_est": 21982,
+      "train_share": 0.002271472773022943,
+      "val_share": 0.00137942191415844
+    },
+    {
+      "file": "code_alpaca_dialogue.txt",
+      "size_mb": 24.2,
+      "blocks": 148512,
+      "train_chars": 24316134,
+      "val_chars": 251949,
+      "train_tokens_est": 24316134,
+      "val_tokens_est": 251949,
+      "train_share": 0.02621938239759149,
+      "val_share": 0.01581038903877285
+    },
+    {
+      "file": "coig_code_dialogue.txt",
+      "size_mb": 2.1,
+      "blocks": 4907,
+      "train_chars": 1001554,
+      "val_chars": 5672,
+      "train_tokens_est": 1001554,
+      "val_tokens_est": 5672,
+      "train_share": 0.0010799466443899902,
+      "val_share": 0.00035593126635914256
+    },
+    {
+      "file": "coig_cqia_dialogue.txt",
+      "size_mb": 11.6,
+      "blocks": 47191,
+      "train_chars": 4424412,
+      "val_chars": 45319,
+      "train_tokens_est": 4424412,
+      "val_tokens_est": 45319,
+      "train_share": 0.0047707152013758665,
+      "val_share": 0.002843873247554651
+    },
+    {
+      "file": "coig_logic_dialogue.txt",
+      "size_mb": 1.8,
+      "blocks": 6246,
+      "train_chars": 730775,
+      "val_chars": 4774,
+      "train_tokens_est": 730775,
+      "val_tokens_est": 4774,
+      "train_share": 0.0007879734982378334,
+      "val_share": 0.0002995796660082064
+    },
+    {
+      "file": "coig_math_dialogue.txt",
+      "size_mb": 1.1,
+      "blocks": 3750,
+      "train_chars": 493459,
+      "val_chars": 5306,
+      "train_tokens_est": 493459,
+      "val_tokens_est": 5306,
+      "train_share": 0.0005320825349347516,
+      "val_share": 0.0003329639103141062
+    },
+    {
+      "file": "coig_other_dialogue.txt",
+      "size_mb": 13.4,
+      "blocks": 30348,
+      "train_chars": 5388909,
+      "val_chars": 43670,
+      "train_tokens_est": 5388909,
+      "val_tokens_est": 43670,
+      "train_share": 0.005810704356902391,
+      "val_share": 0.002740394640674146
+    },
+    {
+      "file": "coig_wiki_dialogue.txt",
+      "size_mb": 107.5,
+      "blocks": 194534,
+      "train_chars": 40058407,
+      "val_chars": 406930,
+      "train_tokens_est": 40058407,
+      "val_tokens_est": 406930,
+      "train_share": 0.04319381902449443,
+      "val_share": 0.025535809277067327
+    },
+    {
+      "file": "dailychat_dialogue.txt",
+      "size_mb": 0.1,
+      "blocks": 912,
+      "train_chars": 47682,
+      "val_chars": 5434,
+      "train_tokens_est": 47682,
+      "val_tokens_est": 5434,
+      "train_share": 5.141411835787537e-05,
+      "val_share": 0.0003409962096959768
+    },
+    {
+      "file": "deepseek_r1_distill_dialogue.txt",
+      "size_mb": 573.4,
+      "blocks": 109999,
+      "train_chars": 255231274,
+      "val_chars": 2577288,
+      "train_tokens_est": 255231274,
+      "val_tokens_est": 2577288,
+      "train_share": 0.27520848391567715,
+      "val_share": 0.16173085007267662
+    },
+    {
+      "file": "glm_dialogue.txt",
+      "size_mb": 13.0,
+      "blocks": 42530,
+      "train_chars": 4916689,
+      "val_chars": 49784,
+      "train_tokens_est": 4916689,
+      "val_tokens_est": 49784,
+      "train_share": 0.005301523219975335,
+      "val_share": 0.0031240624408363105
+    },
+    {
+      "file": "gsm8k_cot_dialogue.txt",
+      "size_mb": 4.6,
+      "blocks": 7477,
+      "train_chars": 4166488,
+      "val_chars": 40846,
+      "train_tokens_est": 4166488,
+      "val_tokens_est": 40846,
+      "train_share": 0.004492603229073182,
+      "val_share": 0.002563182035561625
+    },
+    {
+      "file": "identity_dialogue.txt",
+      "size_mb": 0.0,
+      "blocks": 12,
+      "train_chars": 520,
+      "val_chars": 45,
+      "train_tokens_est": 520,
+      "val_tokens_est": 45,
+      "train_share": 5.607009258440332e-07,
+      "val_share": 2.8238552514388954e-06
+    },
+    {
+      "file": "kdconv_dialogue.txt",
+      "size_mb": 2.5,
+      "blocks": 2438,
+      "train_chars": 926030,
+      "val_chars": 9092,
+      "train_tokens_est": 926030,
+      "val_tokens_est": 9092,
+      "train_share": 0.0009985113045372117,
+      "val_share": 0.0005705442654684986
+    },
+    {
+      "file": "lccc_dialogue.txt",
+      "size_mb": 21.6,
+      "blocks": 150000,
+      "train_chars": 7683873,
+      "val_chars": 75584,
+      "train_tokens_est": 7683873,
+      "val_tokens_est": 75584,
+      "train_share": 0.008285297509938403,
+      "val_share": 0.00474307278499461
+    },
+    {
+      "file": "muice_dialogue.txt",
+      "size_mb": 0.6,
+      "blocks": 3642,
+      "train_chars": 200923,
+      "val_chars": 23160,
+      "train_tokens_est": 200923,
+      "val_tokens_est": 23160,
+      "train_share": 0.00021664944639107825,
+      "val_share": 0.0014533441694072181
+    },
+    {
+      "file": "multi_turn_dialogue.txt",
+      "size_mb": 126.9,
+      "blocks": 100000,
+      "train_chars": 40774164,
+      "val_chars": 4530529,
+      "train_tokens_est": 40774164,
+      "val_tokens_est": 4530529,
+      "train_share": 0.04396559904868548,
+      "val_share": 0.2843012912988046
+    },
+    {
+      "file": "qwen3_235b_distill_dialogue.txt",
+      "size_mb": 266.7,
+      "blocks": 109999,
+      "train_chars": 134611323,
+      "val_chars": 1439002,
+      "train_tokens_est": 134611323,
+      "val_tokens_est": 1439002,
+      "train_share": 0.14514748737536579,
+      "val_share": 0.09030074121180164
+    },
+    {
+      "file": "wikipedia_cn.txt",
+      "size_mb": 456.3,
+      "blocks": 253054,
+      "train_chars": 183711218,
+      "val_chars": 1799660,
+      "train_tokens_est": 183711218,
+      "val_tokens_est": 1799660,
+      "train_share": 0.19809048080872121,
+      "val_share": 0.11293287426232272
+    },
+    {
+      "file": "zhihu_kol_dialogue.txt",
+      "size_mb": 73.4,
+      "blocks": 136934,
+      "train_chars": 24559562,
+      "val_chars": 2723518,
+      "train_tokens_est": 24559562,
+      "val_tokens_est": 2723518,
+      "train_share": 0.026481863753315262,
+      "val_share": 0.1709071245930746
+    },
+    {
+      "file": "三国演义.txt",
+      "size_mb": 1.7,
+      "blocks": 1566,
+      "train_chars": 587328,
+      "val_chars": 7263,
+      "train_tokens_est": 587328,
+      "val_tokens_est": 7263,
+      "train_share": 0.0006332987564887007,
+      "val_share": 0.0004557702375822377
+    },
+    {
+      "file": "水浒传.txt",
+      "size_mb": 2.5,
+      "blocks": 6824,
+      "train_chars": 832032,
+      "val_chars": 11662,
+      "train_tokens_est": 832032,
+      "val_tokens_est": 11662,
+      "train_share": 0.0008971559860228128,
+      "val_share": 0.00073181777649512
+    },
+    {
+      "file": "红楼梦.txt",
+      "size_mb": 2.4,
+      "blocks": 2654,
+      "train_chars": 831685,
+      "val_chars": 7214,
+      "train_tokens_est": 831685,
+      "val_tokens_est": 7214,
+      "train_share": 0.000896781825981913,
+      "val_share": 0.0004526953729751154
+    },
+    {
+      "file": "西游记.txt",
+      "size_mb": 1.9,
+      "blocks": 3311,
+      "train_chars": 650724,
+      "val_chars": 7239,
+      "train_tokens_est": 650724,
+      "val_tokens_est": 7239,
+      "train_share": 0.0007016568255171782,
+      "val_share": 0.00045426418144813696
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "label": "new_v2_unified",
+  "seed": 20260910,
+  "n_windows": 3000,
+  "block": 256,
+  "train": "data/chinese/train_char_v2.bin",
+  "val": "data/chinese/val_char_v2.bin",
+  "train_stats": {
+    "n_windows": 3000,
+    "n_tokens": 768000,
+    "valid_token_ratio": 0.06355989583333334,
+    "empty_window_ratio": 0.8353333473205566,
+    "terminator_density": 0.0013216145833333333,
+    "eos_density": 0.0009583333333333333,
+    "cont_density": 0.00036328125
+  },
+  "val_stats": {
+    "n_windows": 3000,
+    "n_tokens": 768000,
+    "valid_token_ratio": 0.0648828125,
+    "empty_window_ratio": 0.8323333263397217,
+    "terminator_density": 0.0014010416666666668,
+    "eos_density": 0.0010416666666666667,
+    "cont_density": 0.000359375
+  },
+  "bigram": {
+    "train_ce": 4.462197569882113,
+    "val_ce": 4.434706290403278,
+    "gap_val_minus_train": -0.027491279478835118,
+    "n_pairs_train": 765000,
+    "n_pairs_val": 765000,
+    "train_half_selfcheck_ce_1": 4.4576177406171364,
+    "train_half_selfcheck_ce_2": 4.4576177406171364,
+    "selfcheck_abs_diff": 0.0
+  }
+}
