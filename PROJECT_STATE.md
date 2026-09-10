@@ -38,14 +38,8 @@ cat PROJECT_STATE.md TECH_DEBT.md       # ② 恢复记忆
 **唯一动作**：每轮唤醒只做「查状态 → 挂下一个后台定时器」，**不读源码**（避免上下文膨胀）。
 
 ```bash
-# 每轮唤醒的固定一条命令（不读源码、不跑测试）
-cd /home/vesita/coding/my/nanoSeek && \
-  tr '\r' '\n' < out/base_v2_train.log | grep -v '^训练中' | tail -3 && \
-  tr '\r' '\n' < out/base_v2_train.log | grep '^训练中' | tail -1 | cut -c1-140 && \
-  tail -3 out/base_v2/results.csv && \
-  echo "异常=$(grep -cE 'Traceback|OutOfMemory|非有限值' out/base_v2_train.log)" && \
-  scripts/prune_ckpts.sh out/base_v2 5000 2 && \
-  (pgrep -f "training/train.py configs/base_v2" >/dev/null && echo "🟢 仍在跑" || echo "🔴 已停止")
+# 每轮唤醒的固定动作就这一条（不读源码、不跑测试）
+bash scripts/watch.sh
 ```
 
 **为什么巡检里带 `prune_ckpts.sh`**：`train.py` 逢 1000 步写一个 `ckpt_step_<N>.pt`（≈0.6GB）,
@@ -53,6 +47,17 @@ cd /home/vesita/coding/my/nanoSeek && \
 见 `training/checkpoints.py` + `tests/test_checkpoints.py`），**但只对下次重启后生效**；
 当前这个运行进程是旧代码，所以由外部脚本按「每 5000 步留一个 + 最新 2 个」稀疏化。
 脚本幂等、只删归档、绝不碰 `best.pt`/`last.pt`。
+
+**★ 巡检动作必须是一个脚本，不能是每次现敲的长命令。**
+2026-09-11 事故：我把 prune 写进了**文档里**的巡检命令，但实际挂出去的定时器只有
+`ls | wc -l`（只数个数）→ **看起来在清理，实际没清**。
+现在巡检 = `bash scripts/watch.sh`（一条不可分割、可审计的脚本），定时器只负责
+`sleep N && bash scripts/watch.sh`，没机会漏步骤。
+
+**★ 守夜人（独立于 agent 定时器）**：`scripts/ckpt_janitor.sh`，
+`setsid nohup` 出去、每 1800s 稀疏化一次、**训练进程消失即自动退出**。
+存在理由：训练是 `setsid nohup` 出去的，**会话/定时器链死了训练还会继续**，
+那时归档会以 ~0.63GB/小时 无限增长。停止：`pkill -f ckpt_janitor.sh`。
 
 **节律（以 300s = 5 分钟起步，逐次翻倍，5 小时 = 18000s 封顶）**：
 ```
