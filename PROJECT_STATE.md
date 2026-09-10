@@ -1,7 +1,7 @@
 # nanoSeek 项目状态（上下文压缩后的唯一恢复入口）
 
 > **上下文被压缩后，第一件事就是读这个文件。** 不要凭记忆重启训练、不要凭记忆改配置。
-> 最后更新：2026-09-10 23:0x（全量 n-gram 探针跑完 + 工程侧补测试）
+> 最后更新：2026-09-10 23:2x（**主线基座训练已启动** + NDB v7 原型落地）
 >
 > 配套文档：`TECH_DEBT.md`（技术债清单与现有闸门）、`tests/README.md`（测试布局）。
 
@@ -9,11 +9,20 @@
 
 ## 0. 一句话现状
 
-基座配方已全部实测完毕（**−32% 步时**）、数据集已重建并验收通过（**v2**）、
-新基座配置已就绪但**尚未启动**；NDB 方向已重新定位到"可读可写的后缀 n-gram 库"，
-**全量容量探针已跑完并推翻了 §12.3 的覆盖率结论**（见 §6.3）：
-覆盖率不是瓶颈，**槽碰撞**才是 —— 槽位 67M→268M 让 Δ 从 −0.035 翻到 **−0.069**。
-工程侧已补上 **269 条单元测试 + lint 门禁**。
+🟢 **主线基座训练正在跑**（`configs/base_v2.yaml`，**WSD 调度**，70000 步，ETA 2.73 天）。
+NDB 方向已从"神经元级"重定位到"可读可写的后缀 n-gram 库"；全量容量探针
+**推翻了 §12.3 的覆盖率结论**（§6.3），并已落地 **NDB v7 原型**
+（no_grad 表 + 可学习读写门控，`model/ngram_ndb.py`，§12）。
+工程侧有 **289 条单元测试 + lint 门禁**（§11）。
+
+### 恢复上下文后先做这三件事
+```bash
+cd /home/vesita/coding/my/nanoSeek
+tail -c 1500 out/base_v2_train.log      # ① 训练还在跑吗（日志在 out_dir **之外**！见 §8 铁律 9）
+pgrep -f "training/train.py configs/base_v2" && echo 在跑
+cat PROJECT_STATE.md TECH_DEBT.md       # ② 恢复记忆
+.venv/bin/python -m pytest tests/ -q    # ③ 289 条测试应当全绿（跳过 slow 时 <1 秒）
+```
 
 ---
 
@@ -171,8 +180,8 @@ raw_B ≡ 0（12 层全是精确 0.0）    raw_A = [0.3487, 0.3487]（分量恒�
 - **数据开关已验证**：`--data_prefix=v2` → 读 `train_char_v2.bin`；`--data_prefix=''` → 读旧文件
 - ETA：70000 × 3.371 s = **65.5 小时 = 2.73 天**；0.61 epoch
 
-### ★ 尚未决定：LR 调度 cosine vs WSD
-`training/train.py` **两种都已实现**（`schedule = 'cosine' | 'wsd'`，`stable_frac: 0.8`）。
+### ✅ 已决定：LR 调度用 **WSD**（2026-09-10）
+`training/train.py` 两种都已实现（`schedule = 'cosine' | 'wsd'`，`stable_frac: 0.8`）。
 ```
       step    cosine(decay=70000)   WSD(stable_frac=0.8)
      10000          2.903e-04             3.000e-04
@@ -180,16 +189,33 @@ raw_B ≡ 0（12 层全是精确 0.0）    raw_A = [0.3487, 0.3487]（分量恒�
      60000          1.099e-04             2.429e-04
      69999          1.000e-04             1.000e-04
 ```
-**WSD 的好处**：本项目有明确的中断史（长跑在 19781 被停、pilot 被 kill 两次），WSD 下稳定段随便停，
-最后再退火；cosine 下每次中断都停在退火中途。MiniCPM4 用 7T 稳定 + 1.3T 退火，DeepSeek-V3 亦然。
-**当前 `configs/base_v2.yaml` 里写的是 `cosine`。**
+**为什么选 WSD**（实测见 `scripts/run_sched_compare.sh` 与 `out/_sched_driver.log`）：
+1. 本项目有明确的中断史（长跑在 19781 被停、pilot 被 kill 两次）。WSD 下稳定段随便停、
+   最后再退火；cosine 下每次中断都停在退火中途。
+2. **中断续训的 LR 轨迹已实测逐点相同**（`wsd_whole` vs `wsd_seg1+seg2`，
+   15 个公共步点最大 LR 差 **0.00e+00**）。这条是选 WSD 的核心理由，已验证。
+3. MiniCPM4 用 7T 稳定 + 1.3T 退火，DeepSeek-V3 亦然。
 
-启动命令：
+⚠ **未测**：两者的**训练质量**差异。150 步的对照测不出这个（预算太小），
+本决策只基于"可中断性"，不基于"哪个 loss 更低"。
+**当前 `configs/base_v2.yaml` 里写的是 `wsd`。**
+
+### ★ 启动命令（注意日志路径）
+
 ```bash
 cd /home/vesita/coding/my/nanoSeek
+mkdir -p out/base_v2
 HSA_OVERRIDE_GFX_VERSION=10.3.0 HSA_ENABLE_SDMA=0 \
-  .venv/bin/python -u training/train.py configs/base_v2.yaml >> out/base_v2/train.log 2>&1
+  setsid nohup .venv/bin/python -u training/train.py configs/base_v2.yaml \
+  > out/base_v2_train.log 2>&1 < /dev/null &
 ```
+
+**日志必须放在 `out_dir` 之外**（这里是 `out/base_v2_train.log`，不是 `out/base_v2/train.log`）。
+原因见 §8 铁律 9：shell 在进程启动前就创建了 `out/base_v2/train.log`，而
+`_backup_old_run` 会把 `out_dir` 里的**所有**文件挪进 `old/` —— 进程的 fd 跟着被挪走，
+`out/base_v2/train.log` 永远是空的（人会被这个假象骗很久）。
+
+**当前状态**：PID 297961，`pgrep -f "training/train.py configs/base_v2"` 可查。
 
 ### 深度：**保持 12 层，不要加深**
 `data/paper/2601.20994v1.pdf`（*The Depth Delusion*，W=512 的 U 型曲线）：
@@ -401,6 +427,17 @@ buffer、`local/ngram_memory_probe.py`、`local/ngram_sample_capacity.py`、`loc
    ```
    上面第 7 条那个崩溃**单元测试抓不到**，就是冒烟测试抓到的。
    跑完记得 `rm -rf out/_smoke`（会写 ~1.2GB 的 ckpt）。
+9. **★ 训练日志必须放在 `out_dir` 之外**（用 `out/base_v2_train.log`，
+   不要用 `out/base_v2/train.log`）。
+   shell 的重定向 `>> out/base_v2/train.log` 在进程启动**之前**就创建了文件，
+   而 `_backup_old_run` 会把 `out_dir` 里的**所有**文件挪进 `old/` ——
+   进程的 fd 跟着 inode 被挪走，于是 `out/base_v2/train.log` 永远是**空的**。
+   看护的人会以为训练挂了，实际它在正常跑、日志在 `out/base_v2/old/train.log`。
+   （与第 3 条"配置不能放 out_dir 内"是同一个根因：**out_dir 会被整体归档**。）
+10. **★ 离线预热是 NDB 在线实验的前提。** 小预算在线实验里表几乎是空的
+    （300 步 × 1024 token = 30 万次观测 vs 6700 万槽位 → 覆盖率 0.5%），
+    必须先用 `NgramNDB.observe_tokens()` 在大量语料上把表填到有覆盖率，
+    再在训练中增量写。没有这一步，测出来的 Δ 是噪声。
 
 ---
 
@@ -415,21 +452,27 @@ buffer、`local/ngram_memory_probe.py`、`local/ngram_sample_capacity.py`、`loc
 
 ## 10. 下一步（按优先级）
 
-1. **决定 cosine vs WSD**（见 §5）—— 这是启动基座前的最后一个待定项。
-   WSD 更适合本项目"有中断史"的实际情况；配置里现在写的是 `cosine`。
-2. **启动新基座**（`configs/base_v2.yaml`，70000 步，约 2.73 天）。
-   启动前先跑 §8 铁律 8 的 2 步冒烟（已通过，见 §11.3）。
-3. 基座训好后 → **用 v2 基座重测 Δ**（§7 下一步 1），再决定 NDB v7 的具体配置。
-4. 然后 **NDB v7**（读+写，§6.5）+ **软检索**（§7 下一步 2）。
+1. 🔄 **等主线基座训完**（`configs/base_v2.yaml`，WSD，70000 步，ETA 2.73 天）。
+   看护按 §8 铁律 1 的后台定时器节奏；进度看 `out/base_v2_train.log` 与
+   `out/base_v2/train_loss_window.csv`。
+2. **用 v2 基座重跑容量探针**（`scripts/run_delta_sweep.sh`）——
+   §6.3 的 Δ=−0.0723 是 **v1 基座评 v2 数据**，必须重测。这是 NDB 方向下一个硬数字。
+3. **跑 NDB v7 在线 A/B**（`scripts/ndb_online_ab.py`）—— 回答
+   "离线 −0.0723 在线能不能兑现"。脚本已写好并冒烟通过（§12.4）。
+   ⚠ 冒烟用的是退化配置（M=4M 槽装 20M token），**要看结论必须用
+   `--slots 268435456 --prewarm_m 900 --steps 300`**（约 30-45 分钟）。
+4. **软检索**（top-K 计数分布取代 hard top-1）—— §6.3 结论 3 说 23.27% 是
+   hard top-1 的本征上限；模块已支持 `top_k>1`，只差一次对照。
+5. 上面三条都清楚了，再把 NDB **正式接进 `train.py`**（不是现在的独立脚本）。
 
 ---
 
 ## 11. 工程侧（2026-09-10 本轮新增，与算法无关但很值）
 
-### 11.1 单元测试：0 → 269 条
+### 11.1 单元测试：0 → 289 条
 
 ```bash
-uv run pytest                 # 269 条，跳过 slow 时 < 1 秒
+uv run pytest                 # 289 条，跳过 slow 时 < 1 秒
 uv run pytest -m 'not slow'
 uv run ruff check             # lint 门禁（同时也是 pytest 里的一条测试）
 ```
@@ -472,3 +515,74 @@ uv run ruff check             # lint 门禁（同时也是 pytest 里的一条�
 本轮已偿还 6 类、待还 9 项（按"代价 ÷ 修复成本"排序）。最大的一笔仍是
 **`train.py` 的 1466 行模块级脚本**，其次是 `local/` 57 个一次性脚本无索引、
 `training/rl/`（2704 行）与本项目当前目标无关。
+
+---
+
+## 12. NDB v7 原型：**可读可写、no_grad、模型自己决定**（2026-09-10 新增）
+
+### 12.1 在哪
+```
+model/ngram_ndb.py           模块（no_grad 表 + 可学习读写门控），约 440 行
+tests/test_ngram_ndb.py      20 条测试
+scripts/ndb_online_ab.py     在线 A/B（三臂：off / frozen / joint）
+```
+
+### 12.2 与 v5/v6 的根本区别（三处，都针对已被证伪的旧范式）
+```
+              v5/v6（残差式 / 神经元级）           v7
+  键          隐藏态 h                             离散 token 后缀哈希
+  值          e_y − E_p[e]（残差向量）              token 计数的 top-K
+  寻址        可微（PKM 的 key_proj 可学）          离散 + no_grad（hash 直查）
+  写          建库一次 / 写残差（被 E_p 过滤）      在线增量计数（数据统计量）
+```
+理由就是 §6.2 的校准定理 + §6.4 那张负结果表。**表的内容永远是数据统计量，
+不进 `parameters()` / `state_dict()`** → "不增加模型大小"成立（部署模型仍 75.15M）。
+
+### 12.3 「模型自己决定读写」落在哪
+```
+【写】模型决定写多重   w_t = σ(W_w · h_t)              ← 可学习写门控
+【读】模型决定信多少   g_t = σ(W_r · [h_t; 槽统计量; w_t]) ← 可学习读门控
+【级】模型决定信哪级   α = softmax(level_weight)        ← 可学习多级混合
+       p = (1−g_t)·p_model + g_t·Σ_L α_L·p_ng^(L)
+      槽统计量 = [log(1+total), top1占比, 槽是否非空]（全是推理时可得、无标签）
+```
+
+**梯度路径（诚实说明，别假装是严格端到端）**
+```
+✓ ∂L/∂W_r ≠ 0           读门控直接可微，路径干净
+✓ ∂L/∂level_weight ≠ 0  多级混合直接可微
+△ ∂L/∂W_w ≠ 0           **但不是通过"写"来的**：离散表阻断了跨 batch 的梯度链。
+      本实现让 w_t 同时作为 read_gate 的输入特征 → W_w 从读侧拿到真实梯度。
+      是合理的归纳偏置（"想读的地方就多写"），**不是**严格的写信用分配。
+```
+
+### 12.4 已做的验证
+- **20 条单测全绿**（含"增量写 == 离线建表逐位对照"）
+- **端到端冒烟通过**：`scripts/ndb_online_ab.py` 用退化配置
+  （M=4M / 预热 20M token / 3 步）跑完 off+frozen 两臂，32 秒，
+  输出配对 Δ 与 JSON。⚠ 那个 Δ 是**正的**，因为配置退化（碰撞严重 + 只训 3 步），
+  **不是结论**；要看结论必须用 `--slots 268435456 --prewarm_m 900 --steps 300`。
+- 测试期间抓到 **4 个真 bug + 2 个设计缺陷**，全部会静默给出错误检索结果：
+  1. `p_ng` 未归一化（top-K 计数之和 < total）→ `p_new` 总和只有 0.88
+  2. 未覆盖位置的读门控没归零 → `p_new = (1−g)·p_model` 总和 < 1
+  3. 表初始化成 0 而非 -1 → 空槽里 token 0 是**合法词表 id** →
+     第一次 flush 时每槽凭空多出 K 个 `(token=0, count=0)` **幽灵候选**
+  4. int32 计数每次 flush 四舍五入 → 累积丢精度（5.0 vs 5.848）。改 float32，内存不变
+  5. `read_gate.weight` 全零初始化 ⇒ `∂g/∂w_t = g(1−g)·W_r[:,−1] = 0`
+     ⇒ **写门控在 init 时梯度恒为零**（死启动）
+  6. `flush` 里多余的 `_toks[us_s[sel]] = 0`（`_cnts` 无对应清理）→ 又一批幽灵条目
+
+  **其中 3/4/6 只有靠"增量写 == 离线建表逐位对照"才抓得到** —— 它们不崩、
+  不让 loss 异常，只是让表里多几个看起来无害的条目。这是 skill 里
+  "对照必须能区分"那条纪律的直接价值。
+
+### 12.5 已知未做（下一步，见 §10）
+- **没有接进 `train.py`**。接入时的头号风险是 **val 泄漏**：`train.py` 的同一个
+  forward 同时服务训练 / `estimate_loss` / 健康体检，若把"写"挂在 forward 上，
+  验证集会写进训练库。模块已设计成**写路径默认关闭**，必须显式
+  `with ndb.write_enabled():` 只包训练 micro-batch
+  （`tests/test_ngram_ndb.py::test_write_is_disabled_by_default` 是防线）。
+- **表不进 checkpoint**（2.4GB 太大）。所以**续训会丢 DB**，
+  目前靠"离线预热可重建"绕过。这需要在正式接入前决定策略。
+- **在线 vs 离线的 Δ 对照还没跑**（`scripts/ndb_online_ab.py` 只冒烟过）。
+  这是 NDB 方向最关键的一个数字：离线的 −0.0723 能否兑现。

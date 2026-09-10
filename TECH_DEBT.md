@@ -9,10 +9,10 @@
 
 ## 1. 本轮已偿还
 
-### 1.1 建立了单元测试（0 → 269 条）
+### 1.1 建立了单元测试（0 → 289 条）
 
 ```bash
-uv run pytest          # 269 条，跳过 slow 时 < 1 秒跑完
+uv run pytest          # 289 条，跳过 slow 时 < 1 秒跑完
 uv run pytest -m 'not slow'
 ```
 
@@ -212,7 +212,7 @@ ruff check --select F841 --output-format concise   # 27 处，逐个看，可能
 
 ### P3 — 无 CI / 无 pre-commit
 
-**代价**：269 条测试和 lint 门禁目前只能靠人记得跑。
+**代价**：289 条测试和 lint 门禁目前只能靠人记得跑。
 
 **建议动作**：加一个 `scripts/check.sh`（`ruff check && pytest -q`），
 再考虑 `.pre-commit-config.yaml`。本机是单机开发，CI 不是必需，

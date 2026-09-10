@@ -87,7 +87,7 @@ qk_rope_head_dim: 32
 rope_theta: 1000000.0
 route_scale: 2.5
 sample_boundary_reset: true
-schedule: cosine
+schedule: wsd
 stable_frac: 0.8
 stage: full
 swiglu_clamp: 10.0
