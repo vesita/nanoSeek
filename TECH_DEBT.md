@@ -102,6 +102,38 @@ uv run pytest -m 'not slow'
 **顺带证伪**：不是 NaN 导致的。同一 checkpoint 前向 `finite=True`、`max|logit|=13.9`；
 探针两次成功运行都是 `nonfinite_logits = 0`。
 
+### 1.7 归档检查点会写满磁盘（2026-09-11 巡检发现并修复）
+
+**发现过程**：驻守巡检时顺手看了一眼 `df`，发现分区 270G 已用 181G、`out/` 占 74G，
+而**首次 eval 才刚过（step 1000）**。顺着查到 `train.py` 逢 1000 步写
+`ckpt_step_<N>.pt`，**没有任何清理**：
+
+```
+0.59GB/个 × (70000 / 1000) = 42GB     ← 光这一项
++ best.pt / last.pt 各 0.59GB
+```
+
+87GB 可用空间**勉强**够，但会被吃到只剩 ~45GB，而后续 NDB 实验（top-1 缓存 2.1GB/份、
+库表 2~3GB）还要占盘。**这是一个"跑得越久越危险"的隐性故障**，不修的话
+最坏情况是跑到第 60k 步时 `OSError: No space left on device` 杀死 2.7 天的训练。
+
+**修法**：
+- `training/checkpoints.py` —— 纯函数 `prune_step_checkpoints(out_dir, keep)`，
+  只保留最近 `keep` 个；`training/train.py` 记完归档就调它，`keep` 取自
+  `getattr(config, 'keep_step_ckpts', 5)`（**故意不用模块级全局**，避开配置快照陷阱）。
+- `tests/test_checkpoints.py` —— **11 条单测**。这块代码**会删文件**，写错就是数据丢失，
+  所以必须离线覆盖，不能只靠"起一次真训练看看"。
+- `scripts/prune_ckpts.sh` —— 外部稀疏化（每 5000 步留一个 + 最新 2 个），
+  专治**当前已在跑的旧代码进程**（改代码对它无效）。已挂进巡检命令，幂等。
+
+**★ 关键回归点（写进测试）**：必须按**整数步号**排序，不能按文件名字典序 ——
+字典序下 `ckpt_step_9000.pt > ckpt_step_10000.pt`（`'9' > '1'`），
+于是"保留最近的"会**删掉真正最新的那个，留下旧的，且不报错**。
+`test_prune_keeps_newest_by_numeric_order` 就是防这一条。
+
+**通用教训**：长期训练的资源消耗要**按"最坏情况 × 总时长"算一遍**，
+而不是看"现在还剩多少"。以及：**巡检时顺手看一眼 `df`，成本近乎为零。**
+
 ---
 
 ## 2. 待还的债（按「代价 ÷ 修复成本」排序）

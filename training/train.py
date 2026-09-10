@@ -67,6 +67,7 @@ from training.schedules import lr_at as _lr_at, pick_bin_names
 # 诊断用的纯函数（显存调试行 / 快照触发 / OOM 现场）：抽出来是为了能在 CPU 上
 # 单测 —— 诊断代码自己不能变成新的故障源（见 training/diag.py 的说明）。
 from training.diag import mem_debug_line, should_dump_snapshot
+from training.checkpoints import DEFAULT_KEEP_STEP_CKPTS, prune_step_checkpoints
 
 # -----------------------------------------------------------------------------
 # 默认配置：small 模型在字符级莎士比亚上训练（与 config/train_shakespeare_char.yaml 一致）。
@@ -1208,6 +1209,14 @@ while True:
                 step_ckpt = os.path.join(out_dir, f'ckpt_step_{iter_num}.pt')
                 save_checkpoint_async(checkpoint, step_ckpt)
                 pbar.write(f"💾 归档检查点 → {step_ckpt}")
+                # 保留策略（2026-09-11 加）：只留最近 keep_step_ckpts 个归档检查点。
+                # 起因：每个 ckpt ≈ 0.6GB，70000 步 / 1000 = 70 个 → 42GB，
+                # 加上 out/ 已有 74GB，曾把 87GB 剩余空间逼到临界。best.pt / last.pt
+                # 是固定文件名不受影响，续训只依赖 last.pt，历史归档仅用于阶段回溯。
+                # 用 getattr(config, ...) 而非全局变量：避免踩 config_keys 快照陷阱（§8 铁律 4）。
+                _keep = int(getattr(config, 'keep_step_ckpts', DEFAULT_KEEP_STEP_CKPTS))
+                for _f in prune_step_checkpoints(out_dir, _keep):
+                    pbar.write(f"🧹 清理旧归档检查点 → {_f}（保留最近 {_keep} 个）")
 
             # 神经网络数据库 GC 例程：逢 gc_interval（默认 200 步）触发一次僵尸槽位清理与变异复活
             if getattr(config, 'use_neural_db', False) and iter_num > 0:
