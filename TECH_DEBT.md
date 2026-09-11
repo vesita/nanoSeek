@@ -138,6 +138,55 @@ uv run pytest -m 'not slow'
 
 ## 2. 待还的债（按「代价 ÷ 修复成本」排序）
 
+### P0 — `DATASET_REPORT.md` 里"val CE 的标准误 1e-3 nats"是错的（差 70 倍）
+
+**位置**：`data/chinese/DATASET_REPORT.md` §"结论摘要"第 2 条 / §5。
+**代价**：它按 **token 独立**估 SE（61 万有效 token → 1e-3），但 val loss 的有效独立
+单元是**窗口**不是 token —— 实测窗口级 CE 的 σ≈2.0 nats，`eval_iters=200`（800 窗口）
+的真实 **σ_eval ≈ 0.087**。这条错误结论会直接诱导人做"跑 N 步比单点 val"的判断，
+而 NDB 的 Δ 只有 0.02~0.07 —— **信号会被噪声淹掉 2~4 倍**。
+**动作**：改掉那句话，指向 `PROJECT_STATE.md §0.5.3`。
+**证据**：`scripts/ckpt_paired_eval.py`（800 窗口分块 sd 实测 0.0865）+ 两条独立推算。
+
+### P0 — 名义数据配比 ≠ 实际训练分布：40% 的语料对训练完全不可见
+
+**位置**：`configs/base_v2.yaml` 的 `use_loss_masking: true` + `stage: full`，
+配合 `data/chinese/manifest_v2.json` 的来源配比。
+**代价**：`build_assistant_mask` 是行级判据，而 `c4_zh`（20.25%，1.9 亿 token）
+**一个 `<eos>/<cont>` 都没有** → 它永远不产生梯度；加上 `wikipedia_cn`（19.67%），
+**40% 的语料对训练完全不可见**。模型实际上只见过约 57.6M 有效 token
+（全库的 6.14%），却要在上面跑 3.9 遍。
+这不是效率问题（拒绝采样已经自动跳过了这些源），是**能力覆盖问题**：
+数据卡上写着 40% 的百科/网页，模型一天都没学过。
+**动作**：二选一，取决于目标 ——
+(a) 通用中文 LM：`use_loss_masking: false`（有效 token 6.14% → 100%，**16.3×**，
+    但**不要**用 `stage: pretrain`，它会把 train 切成不存在的 `pretrain.bin`）；
+(b) 对话模型：改名义配比，把 c4_zh/wikipedia 的权重让给对话源。
+**证据**：全库逐来源终止符精确计数（`c4_zh` = 0）+ 拒绝采样后的实际来源分布。
+
+### P1 — `eval_dialogue.py` 的提示词是「用户：/模型：」格式，v2 语料已去标签
+
+**位置**：`inference/scripts/eval_dialogue.py` 的 `DIALOGUE_PROMPTS`。
+**代价**：v2 语料已改成 `A：`/`B：`、且项目整体删掉了 `用户：/模型：` 标签
+（dev-notes/61）。用旧格式 prompt 评 v2 模型 → 输入 OOD，`turns` 指标
+**三个模型全是 0.0**，看起来像"碎片拼贴"其实只是提示词不匹配；
+更糟的是 **v1 基座是在带标签语料上训的，在这套 prompt 上有主场优势**，
+所以 `d1/d2` 那一列**不能用来比较 v1 与 v2**（会得出反向结论）。
+**动作**：把 prompt 集按语料实际格式（`A：`/`B：`，或裸文本）参数化，
+或至少加一组去标签 prompt 并分开报告；顺带把"提示词格式必须与语料一致"写进
+指标说明。
+**证据**：`out/eval_dialogue.log`（2026-09-11）。
+
+### P2 — `inference/scripts/*` 只认 `out_dir/best.pt`，评不了任意 checkpoint
+
+**位置**：`inference/scripts/sample_py.py::build_model_from_checkpoint` 写死 `best.pt`。
+**代价**：想评 `ckpt_step_21000.pt` 这种中间归档，只能先
+`ln -f <ckpt> out/_eval_x/best.pt` 造目录 —— 而 `best.pt` 本身是
+**噪声选出来的**（`PROJECT_STATE §0.5.4`），所以"评估工具默认评 best.pt"
+这件事本身就在**推荐用噪声点**。
+**动作**：加 `--ckpt <path>` / `--ckpt-name` 参数，默认仍 best.pt 但允许覆盖。
+
+
 ### P0 — `training/train.py` 仍是 1466 行的模块级脚本
 
 **代价**：无法 import、无法单测、无法局部复用。每加一个功能都要在 1466 行里找位置，

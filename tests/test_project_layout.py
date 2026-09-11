@@ -141,7 +141,12 @@ def test_base_v2_matches_documented_decisions():
     expected = {
         'data_prefix': 'v2',
         'out_dir': 'out/base_v2',
-        'init_from': 'scratch',
+        # 2026-09-11 暂停在 step 22000 后由 'scratch' 改成 'resume'，这是**有意**的：
+        # 'resume' 是更安全的重启默认 —— 若写 'scratch'，误用 §0.4 那条（不带
+        # --init_from 的）重启命令会触发 `_backup_old_run` 把整个 run 静默移进 old/。
+        # 本断言的作用正是逼着"文档和配置一起改"，所以以后要改这个值，
+        # **必须同时改 PROJECT_STATE §5 那张表**，不要只改这里。
+        'init_from': 'resume',
         'batch_size': 4,
         'gradient_accumulation_steps': 8,
         'use_mhc': False,
