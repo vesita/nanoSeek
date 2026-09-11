@@ -40,7 +40,7 @@ health_seeds: 5
 health_temp: 0.8
 health_top_k: 200
 indexer_warmup_steps: 0
-init_from: scratch
+init_from: resume
 kv_lora_rank: 96
 kv_memory_block: 1
 kv_memory_checkpoint: false

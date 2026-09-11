@@ -9,11 +9,52 @@
 
 ## 0. 一句话现状
 
-🟢 **主线基座训练正在跑**（`configs/base_v2.yaml`，**WSD 调度**，70000 步，ETA 2.73 天）。
+🟸 **主线基座训练已按用户要求「暂停」在 step 22000 / 70000（2026-09-11 20:21）**，
+存档完整、可续训（见 §0.4）。今天的训练告一段落。
 NDB 方向已从"神经元级"重定位到"可读可写的后缀 n-gram 库"；全量容量探针
 **推翻了 §12.3 的覆盖率结论**（§6.3），并已落地 **NDB v7 原型**
 （no_grad 表 + 可学习读写门控，`model/ngram_ndb.py`，§12）。
-工程侧有 **289 条单元测试 + lint 门禁**（§11）。
+工程侧有 **300 条单元测试 + lint 门禁**（§11）。
+
+### 0.4 ⏸️ 从暂停点续训（复制即用）
+
+```bash
+cd /home/vesita/coding/my/nanoSeek
+HSA_OVERRIDE_GFX_VERSION=10.3.0 HSA_ENABLE_SDMA=0 \
+  setsid nohup .venv/bin/python -u training/train.py configs/base_v2.yaml \
+  > out/base_v2_train.log 2>&1 < /dev/null &
+disown
+# 注意：第一条命令只负责启动并立刻返回（铁律 6），监控另起 `sleep` 后台定时器
+```
+
+**前提**：`configs/base_v2.yaml` 里 `init_from: resume` 且 `out_dir: out/base_v2`
+—— **两者都已写死在配置里**，所以重启命令永远就是上面那一条。
+`train.py` 会读 `out/base_v2/last.pt`，自动恢复模型/优化器/LR 进度/四路 RNG，
+并**跳过载入那一步的评估与存档**（`_resume_iter` 机制，续训确定性）。
+
+⚠️ **想从零开一个新 run 时**，必须显式覆盖：`--init_from=scratch --out_dir=out/<新目录>`。
+否则 `init_from=resume` 会去读旧 run 的 `last.pt`。
+（同理，§8 铁律 8 的 2 步冒烟命令要加 `--init_from=scratch`，否则会尝试 resume 空目录。）
+
+**暂停点存档清单**（`out/base_v2/`，每份 0.59 GiB）：
+
+| 文件 | step | val | 备注 |
+|---|---|---|---|
+| `last.pt` | **22000** | 1.9107 | ★ **续训用这个** |
+| `ckpt_step_22000.pt` | 22000 | 1.9107 | 同步归档 |
+| `ckpt_step_21000.pt` | 21000 | 1.7924 | |
+| `ckpt_step_20000.pt` | 20000 | **1.6432** | = `best.pt` |
+| `ckpt_step_15000.pt` | 15000 | 2.0631 | 稀疏保留点 |
+| `ckpt_step_10000.pt` | 10000 | 2.0809 | 稀疏保留点 |
+| `ckpt_step_5000.pt` | 5000 | 2.1694 | 稀疏保留点 |
+| `best.pt` | 20000 | 1.6432 | ⚠️ 见下 |
+
+⚠️ **`best.pt` 是"噪声选出来的"，不要当作"最好的模型"**：
+它的 val 1.6432 明显低于左右邻居（19000: 1.9203、21000: 1.7924、22000: 1.9107），
+而单点 eval 噪声 σ≈0.10（§0.2）→ 这个 −0.15~0.27 的优势里**有相当部分是抽样运气**。
+做 NDB 对照实验请用 `last.pt`（22000）或固定某个稀疏归档，**不要用 `best.pt`**。
+
+**暂停时的状态**：`lr` 仍在 WSD 稳定段（3e-4，衰减要到 step 56000）→ 续训无 LR 断层。
 
 ### 恢复上下文后先做这三件事
 ```bash
@@ -544,10 +585,12 @@ buffer、`local/ngram_memory_probe.py`、`local/ngram_sample_capacity.py`、`loc
 8. **★ 改完 `train.py` 必须跑一次 2 步冒烟**（成本 20 秒，`--device=cpu` 即可）：
    ```bash
    .venv/bin/python -u training/train.py configs/base_v2.yaml \
-     --out_dir=out/_smoke --device=cpu --compile=false \
+     --out_dir=out/_smoke --init_from=scratch --device=cpu --compile=false \
      --batch_size=2 --gradient_accumulation_steps=1 \
      --max_iters=2 --eval_interval=1 --eval_iters=1 --eval_train_split=false
    ```
+   ⚠ `--init_from=scratch` **必须加**：`configs/base_v2.yaml` 现已是 `init_from: resume`
+   （为了让重启命令永远只有一条），不加就会去 `out/_smoke/last.pt` 找续训点然后报错。
    上面第 7 条那个崩溃**单元测试抓不到**，就是冒烟测试抓到的。
    跑完记得 `rm -rf out/_smoke`（会写 ~1.2GB 的 ckpt）。
 9. **★ 训练日志必须放在 `out_dir` 之外**（用 `out/base_v2_train.log`，
