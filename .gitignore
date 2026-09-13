@@ -11,6 +11,8 @@ data/*/*.txt
 data/*/tokenizer.json
 data/*/*.bin
 *.bin
+*.off
+*.pkl
 data/*/meta.pkl
 data/*/manifest.json
 # 字级/字节直入数据产物（dev-notes/48/50，train_tokenizer.py/prepare.py 可重建）
@@ -27,6 +29,11 @@ data/*/*.bak*
 # 数据治理快照（govern_dialogue_data.py 产出：治理前备份 + 被剔除源，本地可回滚、不进库）
 data/*/_backup_*/
 data/*/_discarded/
+data/chinese/clean_v3/
+data/chinese/raw_all/
+data/chinese/stages/
+data/chinese/new_sources/
+data/chinese/new_dialogue/
 
 # 外部克隆的开源数据仓库（TheAlgorithms/doocs/chinese-poetry，第三方代码不进库）
 data/external/
