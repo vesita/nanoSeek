@@ -1,0 +1,316 @@
+{
+  "dataset": "chinese",
+  "created_at": "2026-09-13T14:44:47+08:00",
+  "prepare_args": {
+    "with_books": false,
+    "task_ratio": 1.0,
+    "insert_eos": true,
+    "pretrain": false,
+    "char_level": true,
+    "byte_level": false,
+    "val_all": true,
+    "val_ratio": 0.01,
+    "source_ratio": [],
+    "seed": 20260910,
+    "out_prefix": "v3_know",
+    "emit_offsets": true,
+    "source_dir": "/home/vesita/coding/my/nanoSeek/data/chinese/stages/v3_know",
+    "argv": [
+      "/home/vesita/coding/my/nanoSeek/data/chinese/prepare.py",
+      "--char-level",
+      "--val-all",
+      "--val-ratio",
+      "0.01",
+      "--seed",
+      "20260910",
+      "--source-dir",
+      "/home/vesita/coding/my/nanoSeek/data/chinese/stages/v3_know",
+      "--out-prefix",
+      "v3_know",
+      "--emit-offsets"
+    ]
+  },
+  "tokenizer": {
+    "vocab_size": 8192,
+    "char_level": true,
+    "tokenizer_path": "char_tokenizer.json"
+  },
+  "counts": {
+    "train_samples": 923119,
+    "val_samples": 9317,
+    "train_chars": 491256712,
+    "val_chars": 4985961,
+    "train_tokens": 487755407,
+    "val_tokens": 4950588
+  },
+  "source_files": [
+    {
+      "file": "code_alpaca_dialogue.txt",
+      "size_bytes": 10532481,
+      "sha256": "610786b5df194c89fd29c200a641b875befbeaf0db0d49b8f23cc523e4662a8d",
+      "mtime": "2026-09-13T13:50:09"
+    },
+    {
+      "file": "coig_code_dialogue.txt",
+      "size_bytes": 2047984,
+      "sha256": "72bdb437d64093675d7631edcf0dcd2f7a96de447b713f10461033286ecd1538",
+      "mtime": "2026-09-13T13:50:09"
+    },
+    {
+      "file": "coig_cqia_dialogue.txt",
+      "size_bytes": 10939356,
+      "sha256": "23ab2c0ed25536edfa5799ec2bdc1b5e9bbcf53ac5e17bf02b3699ab06b3604a",
+      "mtime": "2026-09-13T13:50:10"
+    },
+    {
+      "file": "coig_logic_dialogue.txt",
+      "size_bytes": 1148570,
+      "sha256": "2dba4794e063bcd8fff49c8d1cdb8031649fd80523b7ae579f3a437b4922a320",
+      "mtime": "2026-09-13T13:50:10"
+    },
+    {
+      "file": "coig_math_dialogue.txt",
+      "size_bytes": 300953,
+      "sha256": "d33cbdca827a3eb5f87f565f561cf357c94495e73167897cfdd605f40f9ece3a",
+      "mtime": "2026-09-13T13:50:11"
+    },
+    {
+      "file": "coig_other_dialogue.txt",
+      "size_bytes": 9429859,
+      "sha256": "2e6c6a9fcca86889fbea7008c5d3ede1d52d5c2093c0eb68168bb67fb08e73d4",
+      "mtime": "2026-09-13T13:50:12"
+    },
+    {
+      "file": "coig_wiki_dialogue.txt",
+      "size_bytes": 97155903,
+      "sha256": "5eb2008fee518dd7693f4d15aae28dd82e088b549cb716761fd7b0198673b244",
+      "mtime": "2026-09-13T13:50:19"
+    },
+    {
+      "file": "deepseek_r1_distill_dialogue.txt",
+      "size_bytes": 601145745,
+      "sha256": "a1070e04fb60ce60cf1984d7661df960ddf3186b78e1ce4fe58f75e961c9f46a",
+      "mtime": "2026-09-13T13:50:56"
+    },
+    {
+      "file": "gsm8k_cot_dialogue.txt",
+      "size_bytes": 4753284,
+      "sha256": "3076e55017bcfb41e311df99355db8cba83e023e1816095027478a3a5dff4dee",
+      "mtime": "2026-09-13T13:51:01"
+    },
+    {
+      "file": "identity_dialogue.txt",
+      "size_bytes": 1684,
+      "sha256": "a901120a059a910998325e441f9775b936ae48fe815f43b91efe547dc26b268d",
+      "mtime": "2026-09-13T13:51:01"
+    },
+    {
+      "file": "muice_dialogue.txt",
+      "size_bytes": 576852,
+      "sha256": "5188b01046312c033e7b6b85a415659393d1b62785da529600baf598d771ab19",
+      "mtime": "2026-09-13T13:51:07"
+    },
+    {
+      "file": "qa_knowledge.txt",
+      "size_bytes": 55797724,
+      "sha256": "b713b38e227d0347cf5e8fc59fae7558820acd10aea08f30a40da68be69fdbc3",
+      "mtime": "2026-09-13T14:03:52"
+    },
+    {
+      "file": "qwen3_235b_distill_dialogue.txt",
+      "size_bytes": 269449054,
+      "sha256": "e623b08969bd464accea6be22dee5cfc1124a8f8e7a871814abae414a28c0ceb",
+      "mtime": "2026-09-13T13:52:34"
+    },
+    {
+      "file": "zhihu_kol_dialogue.txt",
+      "size_bytes": 76877415,
+      "sha256": "f9e233735c384035a18926b339f9cea50eb6c29a5d0556f54145340ab5cfbaf9",
+      "mtime": "2026-09-13T13:53:40"
+    }
+  ],
+  "source_breakdown": [
+    {
+      "file": "code_alpaca_dialogue.txt",
+      "size_bytes": 10532481,
+      "blocks": 80185,
+      "train_blocks": 79384,
+      "val_blocks": 801,
+      "train_chars_raw": 10094456,
+      "val_chars_raw": 101346,
+      "train_share": 0.020775,
+      "val_share": 0.020549
+    },
+    {
+      "file": "coig_code_dialogue.txt",
+      "size_bytes": 2047984,
+      "blocks": 4602,
+      "train_blocks": 4556,
+      "val_blocks": 46,
+      "train_chars_raw": 870945,
+      "val_chars_raw": 9383,
+      "train_share": 0.001792,
+      "val_share": 0.001902
+    },
+    {
+      "file": "coig_cqia_dialogue.txt",
+      "size_bytes": 10939356,
+      "blocks": 42397,
+      "train_blocks": 41974,
+      "val_blocks": 423,
+      "train_chars_raw": 3934205,
+      "val_chars_raw": 49212,
+      "train_share": 0.008097,
+      "val_share": 0.009978
+    },
+    {
+      "file": "coig_logic_dialogue.txt",
+      "size_bytes": 1148570,
+      "blocks": 3748,
+      "train_blocks": 3711,
+      "val_blocks": 37,
+      "train_chars_raw": 457671,
+      "val_chars_raw": 2451,
+      "train_share": 0.000942,
+      "val_share": 0.000497
+    },
+    {
+      "file": "coig_math_dialogue.txt",
+      "size_bytes": 300953,
+      "blocks": 408,
+      "train_blocks": 404,
+      "val_blocks": 4,
+      "train_chars_raw": 138303,
+      "val_chars_raw": 1410,
+      "train_share": 0.000285,
+      "val_share": 0.000286
+    },
+    {
+      "file": "coig_other_dialogue.txt",
+      "size_bytes": 9429859,
+      "blocks": 8906,
+      "train_blocks": 8817,
+      "val_blocks": 89,
+      "train_chars_raw": 3646759,
+      "val_chars_raw": 24858,
+      "train_share": 0.007505,
+      "val_share": 0.00504
+    },
+    {
+      "file": "coig_wiki_dialogue.txt",
+      "size_bytes": 97155903,
+      "blocks": 159840,
+      "train_blocks": 158242,
+      "val_blocks": 1598,
+      "train_chars_raw": 34381918,
+      "val_chars_raw": 341827,
+      "train_share": 0.07076,
+      "val_share": 0.069309
+    },
+    {
+      "file": "deepseek_r1_distill_dialogue.txt",
+      "size_bytes": 601145745,
+      "blocks": 109860,
+      "train_blocks": 108762,
+      "val_blocks": 1098,
+      "train_chars_raw": 255132742,
+      "val_chars_raw": 2591489,
+      "train_share": 0.525075,
+      "val_share": 0.525449
+    },
+    {
+      "file": "gsm8k_cot_dialogue.txt",
+      "size_bytes": 4753284,
+      "blocks": 7396,
+      "train_blocks": 7323,
+      "val_blocks": 73,
+      "train_chars_raw": 4117651,
+      "val_chars_raw": 41657,
+      "train_share": 0.008474,
+      "val_share": 0.008446
+    },
+    {
+      "file": "identity_dialogue.txt",
+      "size_bytes": 1684,
+      "blocks": 12,
+      "train_blocks": 12,
+      "val_blocks": 0,
+      "train_chars_raw": 565,
+      "val_chars_raw": 0,
+      "train_share": 1e-06,
+      "val_share": 0.0
+    },
+    {
+      "file": "muice_dialogue.txt",
+      "size_bytes": 576852,
+      "blocks": 3446,
+      "train_blocks": 3412,
+      "val_blocks": 34,
+      "train_chars_raw": 199500,
+      "val_chars_raw": 1953,
+      "train_share": 0.000411,
+      "val_share": 0.000396
+    },
+    {
+      "file": "qa_knowledge.txt",
+      "size_bytes": 55797724,
+      "blocks": 270984,
+      "train_blocks": 268275,
+      "val_blocks": 2709,
+      "train_chars_raw": 18921980,
+      "val_chars_raw": 191583,
+      "train_share": 0.038942,
+      "val_share": 0.038845
+    },
+    {
+      "file": "qwen3_235b_distill_dialogue.txt",
+      "size_bytes": 269449054,
+      "blocks": 103888,
+      "train_blocks": 102850,
+      "val_blocks": 1038,
+      "train_chars_raw": 127011357,
+      "val_chars_raw": 1304467,
+      "train_share": 0.261395,
+      "val_share": 0.264493
+    },
+    {
+      "file": "zhihu_kol_dialogue.txt",
+      "size_bytes": 76877415,
+      "blocks": 136764,
+      "train_blocks": 135397,
+      "val_blocks": 1367,
+      "train_chars_raw": 26989320,
+      "val_chars_raw": 270315,
+      "train_share": 0.055545,
+      "val_share": 0.054809
+    }
+  ],
+  "artifacts": {
+    "train_char_v3_know.bin": {
+      "size_bytes": 975510814,
+      "sha256": "858956d26916d57714eb8ac81e53ae34a859aa4be7c28ba358457b022b583f34"
+    },
+    "val_char_v3_know.bin": {
+      "size_bytes": 9901176,
+      "sha256": "bb9ec2dfd3fde7f8be3489d82bbca7399d999e4b6fdb8dde8899b26d769d2807"
+    },
+    "tokenizer.json": {
+      "size_bytes": 593448,
+      "sha256": "04ba03e90b6b0d2f7f23d5c1d5bb2e18bd58e2fb4c6b6538cc9fb87f7faf86b8"
+    },
+    "meta_char_v3_know.pkl": {
+      "size_bytes": 85,
+      "sha256": "a5e16acc691e0af348d520b8d006feb644820705d84ac6dba20f0daede380dd4"
+    },
+    "train_char_v3_know.off": {
+      "size_bytes": 7384960,
+      "sha256": "308c8d7f64701f25b03d070e445454667d1ad84d081048920c6e440b273bd55a",
+      "elements": 923120
+    },
+    "val_char_v3_know.off": {
+      "size_bytes": 74544,
+      "sha256": "35dcc2437582ba404f779e71b8c528650f4295d05d5298bc62c30a35693e2afe",
+      "elements": 9318
+    }
+  }
+}

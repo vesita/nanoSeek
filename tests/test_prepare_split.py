@@ -263,3 +263,88 @@ def test_shipped_v2_has_no_dialogue_double_standard():
 ])
 def test_named_output(prep, stem, prefix, ext, expect):
     assert prep.named_output(stem, prefix, ext) == expect
+
+
+# ==========================================================================
+# 7) annotate_replies：终止符**位置**（2026-09-13 修的真 bug）
+# ==========================================================================
+# 为什么值得测：旧实现逐行处理，只给「以 模型： 开头的那一行」加终止符，
+# 多行回复的续行不带 ⇒ 终止符落在回复**开头**。子代理 A 实测后果：
+#   deepseek_r1_distill（占语料 27.3%）100% 回复是多行、首行是 `<think>`，
+#   终止符落在回复的 **0.33%** 处 —— 等于在教模型"<think> 之后就停"；
+#   qwen3 5.9%、gsm8k 4.8%。旧 masking 口径下续行（约 348M 字符）零梯度。
+# 这个 bug 之前**一条测试都没有**，所以潜伏了很久。
+def _fixed_style(prep, monkeypatch, ab=False, quote=False):
+    """把两种随机维度钉死，便于断言逐字输出。"""
+    import random
+    monkeypatch.setattr(random, 'random', lambda: 0.0 if not ab and not quote else 1.0)
+
+
+def test_annotate_terminator_goes_to_end_of_multiline_reply(prep):
+    out = prep.annotate_replies('用户：问\n模型：<think>\n第一步\n第二步',
+                                ab_rate=0.0, quote_rate=0.0)
+    # 终止符必须在**整条回复的末尾**
+    assert out.endswith('第二步<eos>'), out
+    # ★ 反向对照：旧 bug 的写法是挂在首行（`<think><eos>`），这里必须不成立
+    assert '<think><eos>' not in out, f'终止符又跑到首行去了（旧 bug 复现）：{out!r}'
+    assert out.split('\n')[0] == '问', out          # 用户轮
+    assert out.split('\n')[1] == '<think>', out     # 助手回复首行（不带终止符）
+
+
+def test_annotate_should_continue_sees_whole_reply(prep):
+    """判定要看**整条回复**：多行回复的最后一行是问句 → <cont>。"""
+    out = prep.annotate_replies('用户：问\n模型：<think>\n先分析\n那你觉得呢？',
+                                ab_rate=0.0, quote_rate=0.0)
+    assert out.endswith('那你觉得呢？<cont>'), out
+
+
+def test_annotate_single_line_reply_unchanged(prep):
+    """单行回复：终止符紧跟正文（回归——修多行不能改坏单行）。"""
+    out = prep.annotate_replies('用户：问\n模型：好的', ab_rate=0.0, quote_rate=0.0)
+    assert out == '问\n好的<eos>', out
+
+
+def test_annotate_keeps_nondialogue_lines(prep):
+    out = prep.annotate_replies('# 标题\n用户：问\n模型：<eos>', ab_rate=0.0, quote_rate=0.0)
+    assert out.startswith('# 标题\n'), out
+
+
+def test_should_continue_known_values(prep):
+    """已知答案 + 反向对照：规则本身没坏，才谈得上模型学没学会。"""
+    assert prep._should_continue('好的') is False
+    assert prep._should_continue('你觉得呢') is True
+    assert prep._should_continue('先想一步\n再说吧') is False
+    assert prep._should_continue('分析\n那你觉得呢？') is True
+
+
+def test_continue_question_constant_is_gone(prep):
+    """★ 别把 `CONTINUE_QUESTION` 加回来。
+
+    它曾是死常量（含「吧」「呢」），2026-09-13 一度准备"接线"，**先量了一遍才没有接**：
+    v3 语料 1,466,294 条回复里，按"整条回复以 吧/呢 结尾"只翻转 0.65%，抽检 40 条
+    绝大多数是语气助词（我还没拿呢）与祈使/建议（我们明天做个计划吧），不是递回；
+    按"正文出现过 吧/呢"会翻转 3.02%，第一条抽检就是**《摔跤吧！爸爸》**（电影名）。
+    证据与抽检原文见 `prepare.py` 该常量原处的注释 / `PROJECT_STATE §0.5.11`。
+    """
+    assert not hasattr(prep, 'CONTINUE_QUESTION'), \
+        'CONTINUE_QUESTION 已因证据不足被删除；要恢复请先拿出递回判定的新证据'
+
+
+def test_should_continue_rejects_ba_ne_counterexamples(prep):
+    """反向对照：真实语料里抽出的 吧/呢 结尾句**不该**被判成递回。
+
+    这些都不是构造的，是从 `data/chinese/clean_v3/` 抽检出来的原文。
+    """
+    for reply in [
+        '没有。,我还高兴见到她呢',                 # 呢 = 持续体
+        '我还没去拿呢',
+        '回不去还要好几个月呢',
+        '谁叫他们是我的衣食父母呢',
+        '就放在桌上吧',                           # 吧 = 祈使
+        '我们明天做个计划吧',
+        '去试试看吧',
+        '《摔跤吧！爸爸》',                        # ★ 电影名，接线后的经典误伤
+        '让我们一起助力垃圾分类吧！从分类垃圾开始，让世界更美好！',  # 吧在句中
+    ]:
+        assert prep._should_continue(reply) is False, f'不该判成待续：{reply!r}'
+

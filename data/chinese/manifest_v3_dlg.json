@@ -1,0 +1,231 @@
+{
+  "dataset": "chinese",
+  "created_at": "2026-09-13T15:34:48+08:00",
+  "prepare_args": {
+    "with_books": false,
+    "task_ratio": 1.0,
+    "insert_eos": true,
+    "pretrain": false,
+    "char_level": true,
+    "byte_level": false,
+    "val_all": true,
+    "val_ratio": 0.01,
+    "source_ratio": [],
+    "seed": 20260910,
+    "out_prefix": "v3_dlg",
+    "emit_offsets": true,
+    "source_dir": "/home/vesita/coding/my/nanoSeek/data/chinese/stages/v3_dlg",
+    "argv": [
+      "/home/vesita/coding/my/nanoSeek/data/chinese/prepare.py",
+      "--char-level",
+      "--val-all",
+      "--val-ratio",
+      "0.01",
+      "--seed",
+      "20260910",
+      "--source-dir",
+      "/home/vesita/coding/my/nanoSeek/data/chinese/stages/v3_dlg",
+      "--out-prefix",
+      "v3_dlg",
+      "--emit-offsets"
+    ]
+  },
+  "tokenizer": {
+    "vocab_size": 8192,
+    "char_level": true,
+    "tokenizer_path": "char_tokenizer.json"
+  },
+  "counts": {
+    "train_samples": 288209,
+    "val_samples": 2908,
+    "train_chars": 117555845,
+    "val_chars": 1138333,
+    "train_tokens": 114228196,
+    "val_tokens": 1104890
+  },
+  "source_files": [
+    {
+      "file": "belle_multiturn.txt",
+      "size_bytes": 71430422,
+      "sha256": "79d932fa79b0b5a341a735fddbd5234da50e5e7c871f0d76df577e747d78c330",
+      "mtime": "2026-09-13T14:03:25"
+    },
+    {
+      "file": "dailychat_dialogue.txt",
+      "size_bytes": 109653,
+      "sha256": "5945ec43832e6832b61df8878bae3b82bf716884779cf4e4907f00148487d0ee",
+      "mtime": "2026-09-13T13:50:19"
+    },
+    {
+      "file": "escov_zh.txt",
+      "size_bytes": 1344651,
+      "sha256": "4d7a29093177b5f3b2b8e5556d8e4d5df9a53361974127212a8976a5ca823090",
+      "mtime": "2026-09-13T15:31:22"
+    },
+    {
+      "file": "glm_dialogue.txt",
+      "size_bytes": 13577151,
+      "sha256": "be5eabee5a6756498bd41527f83009f70f906955d53ffef9a5f9d6379b3fdd15",
+      "mtime": "2026-09-13T13:51:01"
+    },
+    {
+      "file": "kdconv_dialogue.txt",
+      "size_bytes": 2605151,
+      "sha256": "a719bc80a97a08810cbccd31f48e047b9531d575e2c3a489df9f8eb499c1790b",
+      "mtime": "2026-09-13T13:51:02"
+    },
+    {
+      "file": "lccc_dialogue.txt",
+      "size_bytes": 22659836,
+      "sha256": "df387657fba15822f4e9b50848dfde68fa0411fab7871ebf647a9f64a61665c8",
+      "mtime": "2026-09-13T13:51:07"
+    },
+    {
+      "file": "multi_turn_dialogue.txt",
+      "size_bytes": 600,
+      "sha256": "3676268b2533bda5ad6d41bf1df1e80ba61d860f19099dd28766e68067a9a491",
+      "mtime": "2026-09-13T13:51:44"
+    },
+    {
+      "file": "sharegpt_zh_38k.txt",
+      "size_bytes": 143684697,
+      "sha256": "f98168e0213e0ab5c3acd5ea9550f8a8da3b44e6d461917c1457b2be790046be",
+      "mtime": "2026-09-13T14:04:16"
+    },
+    {
+      "file": "wildchat_zh.txt",
+      "size_bytes": 28844849,
+      "sha256": "461b9d50e7911b097d74f19eecdec1c6aa3f122c5dcb0a4aaa3034ba12b07e7b",
+      "mtime": "2026-09-13T15:13:29"
+    }
+  ],
+  "source_breakdown": [
+    {
+      "file": "belle_multiturn.txt",
+      "size_bytes": 71430422,
+      "blocks": 53686,
+      "train_blocks": 53150,
+      "val_blocks": 536,
+      "train_chars_raw": 24609289,
+      "val_chars_raw": 250166,
+      "train_share": 0.218052,
+      "val_share": 0.229283
+    },
+    {
+      "file": "dailychat_dialogue.txt",
+      "size_bytes": 109653,
+      "blocks": 622,
+      "train_blocks": 616,
+      "val_blocks": 6,
+      "train_chars_raw": 37253,
+      "val_chars_raw": 348,
+      "train_share": 0.00033,
+      "val_share": 0.000319
+    },
+    {
+      "file": "escov_zh.txt",
+      "size_bytes": 1344651,
+      "blocks": 608,
+      "train_blocks": 602,
+      "val_blocks": 6,
+      "train_chars_raw": 479446,
+      "val_chars_raw": 5515,
+      "train_share": 0.004248,
+      "val_share": 0.005055
+    },
+    {
+      "file": "glm_dialogue.txt",
+      "size_bytes": 13577151,
+      "blocks": 42486,
+      "train_blocks": 42062,
+      "val_blocks": 424,
+      "train_chars_raw": 4917039,
+      "val_chars_raw": 47462,
+      "train_share": 0.043568,
+      "val_share": 0.0435
+    },
+    {
+      "file": "kdconv_dialogue.txt",
+      "size_bytes": 2605151,
+      "blocks": 2438,
+      "train_blocks": 2414,
+      "val_blocks": 24,
+      "train_chars_raw": 926030,
+      "val_chars_raw": 9092,
+      "train_share": 0.008205,
+      "val_share": 0.008333
+    },
+    {
+      "file": "lccc_dialogue.txt",
+      "size_bytes": 22659836,
+      "blocks": 149903,
+      "train_blocks": 148404,
+      "val_blocks": 1499,
+      "train_chars_raw": 7675929,
+      "val_chars_raw": 76567,
+      "train_share": 0.068013,
+      "val_share": 0.070175
+    },
+    {
+      "file": "multi_turn_dialogue.txt",
+      "size_bytes": 600,
+      "blocks": 1,
+      "train_blocks": 1,
+      "val_blocks": 0,
+      "train_chars_raw": 208,
+      "val_chars_raw": 0,
+      "train_share": 2e-06,
+      "val_share": 0.0
+    },
+    {
+      "file": "sharegpt_zh_38k.txt",
+      "size_bytes": 143684697,
+      "blocks": 38247,
+      "train_blocks": 37865,
+      "val_blocks": 382,
+      "train_chars_raw": 60093448,
+      "val_chars_raw": 595927,
+      "train_share": 0.532462,
+      "val_share": 0.546181
+    },
+    {
+      "file": "wildchat_zh.txt",
+      "size_bytes": 28844849,
+      "blocks": 3126,
+      "train_blocks": 3095,
+      "val_blocks": 31,
+      "train_chars_raw": 14120942,
+      "val_chars_raw": 106003,
+      "train_share": 0.12512,
+      "val_share": 0.097154
+    }
+  ],
+  "artifacts": {
+    "train_char_v3_dlg.bin": {
+      "size_bytes": 228456392,
+      "sha256": "f69e783bb6887bc210efa48caaffc83cc91db4adddeb167b51b2d22891c016c5"
+    },
+    "val_char_v3_dlg.bin": {
+      "size_bytes": 2209780,
+      "sha256": "b81f96c2b738b0eba1b5687b25e23321018e120d79e8cc535ecae2bb0c1292d2"
+    },
+    "tokenizer.json": {
+      "size_bytes": 593448,
+      "sha256": "04ba03e90b6b0d2f7f23d5c1d5bb2e18bd58e2fb4c6b6538cc9fb87f7faf86b8"
+    },
+    "meta_char_v3_dlg.pkl": {
+      "size_bytes": 85,
+      "sha256": "a5e16acc691e0af348d520b8d006feb644820705d84ac6dba20f0daede380dd4"
+    },
+    "train_char_v3_dlg.off": {
+      "size_bytes": 2305680,
+      "sha256": "64330d682327c156af83ab4fd06795e8d9ddd5c7ce724c4d4192ce6a3cae217e",
+      "elements": 288210
+    },
+    "val_char_v3_dlg.off": {
+      "size_bytes": 23272,
+      "sha256": "5ee9130947b47ccb82c63ae263a4f9b2466815a6140bdcf9c7da04cd95f5b9a0",
+      "elements": 2909
+    }
+  }
+}

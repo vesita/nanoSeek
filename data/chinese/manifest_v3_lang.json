@@ -1,0 +1,197 @@
+{
+  "dataset": "chinese",
+  "created_at": "2026-09-13T14:11:38+08:00",
+  "prepare_args": {
+    "with_books": false,
+    "task_ratio": 1.0,
+    "insert_eos": true,
+    "pretrain": false,
+    "char_level": true,
+    "byte_level": false,
+    "val_all": true,
+    "val_ratio": 0.01,
+    "source_ratio": [],
+    "seed": 20260910,
+    "out_prefix": "v3_lang",
+    "emit_offsets": true,
+    "source_dir": "/home/vesita/coding/my/nanoSeek/data/chinese/stages/v3_lang",
+    "argv": [
+      "/home/vesita/coding/my/nanoSeek/data/chinese/prepare.py",
+      "--char-level",
+      "--val-all",
+      "--val-ratio",
+      "0.01",
+      "--seed",
+      "20260910",
+      "--source-dir",
+      "/home/vesita/coding/my/nanoSeek/data/chinese/stages/v3_lang",
+      "--out-prefix",
+      "v3_lang",
+      "--emit-offsets"
+    ]
+  },
+  "tokenizer": {
+    "vocab_size": 8192,
+    "char_level": true,
+    "tokenizer_path": "char_tokenizer.json"
+  },
+  "counts": {
+    "train_samples": 421179,
+    "val_samples": 4252,
+    "train_chars": 280417976,
+    "val_chars": 2754290,
+    "train_tokens": 280417976,
+    "val_tokens": 2754290
+  },
+  "source_files": [
+    {
+      "file": "c4_zh.txt",
+      "size_bytes": 291919401,
+      "sha256": "5abcac8fab475e69680b541991c25d6d06e6f0091efeee3b608ef61e1165a078",
+      "mtime": "2026-09-13T13:50:04"
+    },
+    {
+      "file": "classical_poetry.txt",
+      "size_bytes": 6058993,
+      "sha256": "82f382125dd70a9e36cc902d902e433b43a35766c021d1193222dbe78632e800",
+      "mtime": "2026-09-13T13:50:05"
+    },
+    {
+      "file": "wikipedia_cn.txt",
+      "size_bytes": 426578530,
+      "sha256": "1ac97d1a82962bf26c8ed70269841b9875becc8dceaa1b8ed3f5195094f0b3cd",
+      "mtime": "2026-09-13T13:53:29"
+    },
+    {
+      "file": "三国演义.txt",
+      "size_bytes": 1790389,
+      "sha256": "ac37caf40c11130ceb1b6457f11eed2ba2ef1299c951bb82886f384f833dc627",
+      "mtime": "2026-09-13T13:53:40"
+    },
+    {
+      "file": "水浒传.txt",
+      "size_bytes": 2562274,
+      "sha256": "f56e6202aeb9f34e10f10a1c74a7f4081daec030cdb6383a124ae5150011b813",
+      "mtime": "2026-09-13T13:53:40"
+    },
+    {
+      "file": "红楼梦.txt",
+      "size_bytes": 2514257,
+      "sha256": "909a8fbbf395e8143af51a917a1e0749ca5a5e17c2be993a57608510e86ee27a",
+      "mtime": "2026-09-13T13:53:41"
+    },
+    {
+      "file": "西游记.txt",
+      "size_bytes": 1990106,
+      "sha256": "26c2a826ce3ac7d53a4759a65b198fb8a43e2ad5a52e8587ac30dc31dcb0461d",
+      "mtime": "2026-09-13T13:53:41"
+    }
+  ],
+  "source_breakdown": [
+    {
+      "file": "c4_zh.txt",
+      "size_bytes": 291919401,
+      "blocks": 150104,
+      "train_blocks": 148603,
+      "val_blocks": 1501,
+      "train_chars_raw": 111777337,
+      "val_chars_raw": 1115404,
+      "train_share": 0.399811,
+      "val_share": 0.406224
+    },
+    {
+      "file": "classical_poetry.txt",
+      "size_bytes": 6058993,
+      "blocks": 24435,
+      "train_blocks": 24191,
+      "val_blocks": 244,
+      "train_chars_raw": 2097227,
+      "val_chars_raw": 20323,
+      "train_share": 0.007501,
+      "val_share": 0.007402
+    },
+    {
+      "file": "wikipedia_cn.txt",
+      "size_bytes": 426578530,
+      "blocks": 236582,
+      "train_blocks": 234217,
+      "val_blocks": 2365,
+      "train_chars_raw": 162795947,
+      "val_chars_raw": 1582473,
+      "train_share": 0.582297,
+      "val_share": 0.576327
+    },
+    {
+      "file": "三国演义.txt",
+      "size_bytes": 1790389,
+      "blocks": 1565,
+      "train_blocks": 1550,
+      "val_blocks": 15,
+      "train_chars_raw": 588924,
+      "val_chars_raw": 5643,
+      "train_share": 0.002106,
+      "val_share": 0.002055
+    },
+    {
+      "file": "水浒传.txt",
+      "size_bytes": 2562274,
+      "blocks": 6807,
+      "train_blocks": 6739,
+      "val_blocks": 68,
+      "train_chars_raw": 833799,
+      "val_chars_raw": 8949,
+      "train_share": 0.002982,
+      "val_share": 0.003259
+    },
+    {
+      "file": "红楼梦.txt",
+      "size_bytes": 2514257,
+      "blocks": 2635,
+      "train_blocks": 2609,
+      "val_blocks": 26,
+      "train_chars_raw": 831727,
+      "val_chars_raw": 6485,
+      "train_share": 0.002975,
+      "val_share": 0.002362
+    },
+    {
+      "file": "西游记.txt",
+      "size_bytes": 1990106,
+      "blocks": 3303,
+      "train_blocks": 3270,
+      "val_blocks": 33,
+      "train_chars_raw": 650659,
+      "val_chars_raw": 6511,
+      "train_share": 0.002327,
+      "val_share": 0.002371
+    }
+  ],
+  "artifacts": {
+    "train_char_v3_lang.bin": {
+      "size_bytes": 560835952,
+      "sha256": "2fb750534c89e1b8c27c00aa1655c2b38973c2790f9b6ca075f017d19811b192"
+    },
+    "val_char_v3_lang.bin": {
+      "size_bytes": 5508580,
+      "sha256": "d096e1d272f58e544b7a6b0c734323a8e940fbc52202f182a0dc241730a01422"
+    },
+    "tokenizer.json": {
+      "size_bytes": 593448,
+      "sha256": "04ba03e90b6b0d2f7f23d5c1d5bb2e18bd58e2fb4c6b6538cc9fb87f7faf86b8"
+    },
+    "meta_char_v3_lang.pkl": {
+      "size_bytes": 85,
+      "sha256": "a5e16acc691e0af348d520b8d006feb644820705d84ac6dba20f0daede380dd4"
+    },
+    "train_char_v3_lang.off": {
+      "size_bytes": 3369440,
+      "sha256": "7f2d6ed9f9cc3abad1ba73a86cf459b262a99d275d4e72678e1ae9e7d259f07d",
+      "elements": 421180
+    },
+    "val_char_v3_lang.off": {
+      "size_bytes": 34024,
+      "sha256": "2ee8cbc51bade9c18e99067ec5bc35b22c05cbd812043674dba64939b4cc410d",
+      "elements": 4253
+    }
+  }
+}

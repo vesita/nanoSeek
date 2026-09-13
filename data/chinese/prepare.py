@@ -157,8 +157,19 @@ def download_if_missing(local_name, book_name):
 
 # 追问/待续判定：回复"期待用户继续回应"→ 标注 <cont>；否则收尾 → <eos>。
 # 语义(dev-notes/61)：<eos> = 本轮话说完可以停；<cont> = 本轮说完但请对话继续(递回/追问)。
-CONTINUE_QUESTION = ["？", "?", "吧", "呢", "对不对", "是不是", "你觉得", "你说呢",
-                     "怎么样", "想不想", "要不要", "怎么样？", "如何", "们看"]
+#
+# ★ 2026-09-13：这里曾有一个 `CONTINUE_QUESTION` 常量（含「吧」「呢」），
+#   全仓库**没有任何调用点**（`_should_continue` 只用问号 + 下面的 `CONTINUE_PHRASE`）。
+#   一度打算把它"接上"，**先量了一遍，结论是不该接** —— v3 语料 1,466,294 条回复里：
+#     * 按「整条回复以 吧/呢 结尾」算，只会翻转 9,545 条（**0.65%**），抽检 40 条后
+#       发现绝大多数是**语气助词与建议**，不是递回：
+#         「我还没拿呢」「回不去还要好几个月呢」「谁叫他们是我的衣食父母呢」（呢=持续体）
+#         「就放在桌上吧」「我们明天做个计划吧」「去试试看吧」（吧=祈使/建议）
+#     * 按「正文里出现过 吧/呢」算（这才是"接线"最可能的实现方式），会翻转 44,248 条
+#       （**3.02%**），而抽检第一条就是 **《摔跤吧！爸爸》**（电影名）与
+#       「让我们一起助力垃圾分类吧！从分类垃圾开始…」（吧在句中）。
+#   ⇒ 该常量表达的是**错误意图**，已删除；下面留一条测试钉住「吧/呢 不触发 cont」，
+#     防止下一个 agent 再把它"修"回来。要真正提高递回识别率，得换一个不是关键词的判据。
 CONTINUE_PHRASE = ["你觉", "你呢", "怎么样", "是不是", "想不想", "要不要",
                    "你说呢", "对不对", "如何", "可以吗", "好吗", "吗?", "吗？"]
 
@@ -190,6 +201,14 @@ def annotate_replies(block: str, ab_rate: float = 0.7, quote_rate: float = 0.8) 
           20% → 无引号
       两种维度独立 → 四种组合: "A：..." / A：... / "..." / 裸文本
     <eos>/<cont> 统一插在模型(B/偶数段)回复后：待续/追问 → <cont>, 收尾 → <eos>。
+
+    ★ 2026-09-13 修：终止符必须贴在**整条回复的最后一行之后**，且 `_should_continue`
+      要看**整条回复**。旧实现逐行处理，只给「以 模型： 开头的那一行」加终止符，
+      多行回复的续行不带 → 终止符落在回复的**开头**。子代理 A 实测后果：
+        * `deepseek_r1_distill`（占语料 27.3%）**100% 的回复是多行、首行是 `<think>`**，
+          终止符落在回复的 **0.33%** 处 ⇒ 训练在教"`<think>` 之后就停"；
+        * `qwen3_235b_distill` 5.9%、`gsm8k_cot` 4.8%。
+      旧 masking 口径下这还意味着续行（约 348M 字符）**一个梯度都不产生**。
     """
     import random
     use_ab = random.random() < ab_rate
@@ -197,28 +216,44 @@ def annotate_replies(block: str, ab_rate: float = 0.7, quote_rate: float = 0.8) 
 
     lines = block.split("\n")
     out = []
-    for line in lines:
-        stripped = line.strip()
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
         if stripped.startswith("用户：") or stripped.startswith("模型："):
             is_model = stripped.startswith("模型：")
             body = stripped.split("：", 1)[1] if "：" in stripped else stripped
+            # 收集续行（到下一条 用户：/模型： 之前）—— 多行回复的正文，
+            # deepseek 的 `<think>...</think>` 整段 CoT 就是续行。
+            cont = []
+            j = i + 1
+            while j < len(lines):
+                s2 = lines[j].strip()
+                if s2.startswith("用户：") or s2.startswith("模型："):
+                    break
+                cont.append(lines[j])
+                j += 1
             if use_ab:
                 speaker = "B" if is_model else "A"
                 text = f"{speaker}：{body}"
             else:
                 text = body
-            # 引号维度（正交）；终止符紧随回复正文同行（引号外），不独立成行
+            # 引号维度（正交）；引号只包首行，续行原样（与旧行为一致）
             if use_quote:
                 text = f'"{text}"'
-            if is_model:
-                ann = "<cont>" if _should_continue(body) else "<eos>"
-                text = text + ann
             out.append(text)
-        elif not stripped:
-            if line:
-                out.append(line)
+            out.extend(cont)
+            if is_model:
+                # ★ 终止符贴在**整条回复的末尾**；判定也看整条回复
+                full = "\n".join([body, *cont])
+                out[-1] = out[-1] + ("<cont>" if _should_continue(full) else "<eos>")
+            i = j
+            continue
+        if not stripped:
+            if lines[i]:
+                out.append(lines[i])
         else:
-            out.append(line)               # 非对话行（备注/续行）原样保留
+            out.append(lines[i])               # 非对话行（备注）原样保留
+        i += 1
     return "\n".join(out)
 
 
@@ -227,25 +262,78 @@ def insert_eos_after_replies(block: str) -> str:
     return annotate_replies(block)
 
 
-def encode_to_bin(text, tokenizer, out_path):
-    """分块编码文本为 uint16 token ids，增量写入 bin 文件。
-
-    字面量 <eos>/<cont> 映射为 tokenizer 的对应 special id（而非逐字符编码），
-    与 encode_bytes_to_bin 逻辑一致——先按特殊符分割，各段独立编码，
-    段间插入对应 id。分块 flush 控制内存。
-    """
-    # 特殊符字面量 → 目标 id 映射（只映射词表中存在且为特殊符的）
+def _marker_ids(tokenizer):
+    """`<eos>`/`<cont>` 字面量 → tokenizer 里对应的 special id（只含词表中真实存在的）。"""
     markers = {}
     for sym in ("<eos>", "<cont>"):
         sid = tokenizer.token_to_id(sym)
         if sid is not None:
             markers[sym] = sid
+    return markers
+
+
+def _iter_token_pieces(text, tokenizer, markers=None):
+    """按 `encode_to_bin` **完全相同**的顺序/切分，逐段产出 `(char_start, char_len, ids, offsets)`。
+
+    每个 piece 恰好对应旧实现里的一次 `tokenizer.encode(chunk)`（或一个特殊符 id）。
+    把切分逻辑收进一个生成器，`encode_to_bin` 与 `--emit-offsets` 共用同一条路径，
+    从根上避免"bin 与 .off 用两套编码逻辑"导致的错位。
+
+    offsets 是 `tokenizer.encode` 返回的逐 token 字符区间（相对本 piece 起点），
+    仅用于把 block 起始字符位置映射到 token 下标。
+    """
     import re
-    # 通用分割：按任一特殊符字面量切分，并保留分隔物
+    if markers is None:
+        markers = _marker_ids(tokenizer)
     pattern = re.compile("|".join(re.escape(m) for m in markers) or r"$^")
+
+    def _emit(start, seg):
+        for j in range(0, max(len(seg), 1), CHUNK):
+            chunk = seg[j:j + CHUNK]
+            if chunk:
+                enc = tokenizer.encode(chunk)
+                yield start + j, len(chunk), enc.ids, enc.offsets
+
+    prev_end = 0
+    for m in pattern.finditer(text):
+        seg = text[prev_end:m.end() - len(m.group())]
+        yield from _emit(prev_end, seg)
+        sym = m.group()
+        if markers.get(sym) is not None:
+            # 特殊符字面量只产 1 个 token（不是逐字编码），占用 len(sym) 个字符
+            yield m.start(), len(sym), [markers[sym]], [(0, len(sym))]
+        prev_end = m.end()
+    yield from _emit(prev_end, text[prev_end:])
+
+
+def encode_to_bin(text, tokenizer, out_path, block_starts=None):
+    """分块编码文本为 uint16 token ids，增量写入 bin 文件。
+
+    字面量 <eos>/<cont> 映射为 tokenizer 的对应 special id（而非逐字符编码），
+    与 encode_bytes_to_bin 逻辑一致——先按特殊符分割，各段独立编码，
+    段间插入对应 id。分块 flush 控制内存。
+
+    `block_starts`（可选，升序字符下标，首元素必须为 0）非 None 时，
+    额外返回 `int64` 的 block 边界表：每个元素 = 一个 block 在 bin 里的**起始 token 下标**，
+    末尾补 `len(bin)` 哨兵（长度 = block 数 + 1）。映射用的 token 字符区间来自
+    与写 bin **同一次** `tokenizer.encode` 调用，保证与 bin 逐 token 对齐。
+    """
+    markers = _marker_ids(tokenizer)
+    off = None
+    bi = 1
+    if block_starts is not None:
+        if len(block_starts) == 0:
+            off = np.zeros(1, dtype=np.int64)          # 空 split：只有哨兵
+        else:
+            if block_starts[0] != 0:
+                raise ValueError('block_starts 必须以 0 开头（第一个 block 从 token 0 开始）')
+            if any(block_starts[i] >= block_starts[i + 1] for i in range(len(block_starts) - 1)):
+                raise ValueError('block_starts 必须严格递增（block 非空）')
+            off = np.empty(len(block_starts) + 1, dtype=np.int64)
+            off[0] = 0
+    n_tok = 0
     with open(out_path, 'wb') as f:
         buf = []
-        prev_end = 0
 
         def _flush():
             """把 buf 写成 uint16；在分块内调用，避免长段（如无终止符的 c4_zh
@@ -255,32 +343,58 @@ def encode_to_bin(text, tokenizer, out_path):
                 np.array(buf, dtype=np.uint16).tofile(f)
                 buf = []
 
-        for m in pattern.finditer(text):
-            seg = text[prev_end:m.end() - len(m.group())]
-            # 段前普通文本
-            if seg:
-                for j in range(0, max(len(seg), 1), CHUNK):
-                    chunk = seg[j:j + CHUNK]
-                    if chunk:
-                        buf.extend(tokenizer.encode(chunk).ids)
-                        if len(buf) >= 1 << 20:
-                            _flush()
-            # 特殊符 id
-            if markers.get(m.group()) is not None:
-                buf.append(markers[m.group()])
-            prev_end = m.end()
+        for cs, clen, ids, spans in _iter_token_pieces(text, tokenizer, markers):
+            if off is not None and len(block_starts):
+                # 本 piece 覆盖字符区间 [cs, cs+clen)；把落在其中的 block 起点映射成 token 下标。
+                # cursor 单调前进 → 每 piece 的映射是 O(tokens + blocks)，无重复扫描。
+                end_char = cs + clen
+                cursor = 0
+                while bi < len(block_starts) and block_starts[bi] < end_char:
+                    rel = block_starts[bi] - cs
+                    while cursor < len(spans) and spans[cursor][0] < rel:
+                        cursor += 1
+                    off[bi] = n_tok + cursor
+                    bi += 1
+            buf.extend(ids)
             if len(buf) >= 1 << 20:
                 _flush()
-        # 结尾余段
-        seg = text[prev_end:]
-        if seg:
-            for j in range(0, max(len(seg), 1), CHUNK):
-                chunk = seg[j:j + CHUNK]
-                if chunk:
-                    buf.extend(tokenizer.encode(chunk).ids)
-                    if len(buf) >= 1 << 20:
-                        _flush()
+            n_tok += len(ids)
         _flush()
+    if off is not None:
+        if len(block_starts) and bi != len(block_starts):
+            raise ValueError(f'有 {len(block_starts) - bi + 1} 个 block 起点超出文本范围（.off 会与 bin 错位）')
+        off[-1] = n_tok
+    return off
+
+
+def offsets_path_for_bin(bin_path):
+    """由 bin 路径派生 `.off` sidecar 路径（同目录、同前缀）：train_char_v2.bin → train_char_v2.off。
+
+    与 `training/packing.py:offsets_name_for_bin` 同一规则（那边只处理文件名）。
+    """
+    return os.path.splitext(bin_path)[0] + '.off'
+
+
+def write_offsets(off, bin_path):
+    """把 block 边界表写成 int64 裸数组 sidecar，返回路径。"""
+    path = offsets_path_for_bin(bin_path)
+    np.asarray(off, dtype=np.int64).tofile(path)
+    return path
+
+
+def block_start_chars(samples, sep_len=2):
+    """给定 block 列表与拼接分隔符长度，返回每个 block 的**起始字符下标**（升序，首元素 0）。
+
+    `train_data = '\\n\\n'.join(samples)` ⇒ sep_len=2；pretrain 模式是 `''.join(parts)` ⇒ sep_len=0。
+    """
+    starts = []
+    pos = 0
+    n = len(samples)
+    for i, s in enumerate(samples):
+        starts.append(pos)
+        pos += len(s) + (sep_len if i < n - 1 else 0)
+    return starts
+
 
 EOS_ID = 256  # 字节直入模式（dev-notes/48）：0-255 = UTF-8 字节，256 = <eos>
 
@@ -318,13 +432,19 @@ def write_manifest(args, tokenizer, train_samples, val_samples,
                    train_data, val_data, meta,
                    train_bin=None, val_bin=None, meta_path=None,
                    manifest_path=None, source_stats=None,
-                   n_train_samples=None, n_val_samples=None):
+                   n_train_samples=None, n_val_samples=None,
+                   source_dir=None, train_off=None, val_off=None):
     """把数据集的来源、切分、哈希等信息写进 manifest（默认 manifest.json）。
 
     train_bin/val_bin/meta_path 传入真实产物名（支持 --out-prefix），
     source_stats 传入逐来源 (blocks/train_chars/val_chars) 统计用于审计。
+    source_dir 是**扫描输入**目录（默认 DATA_DIR）；产物仍写在 DATA_DIR。
+    train_off/val_off（可选）：`--emit-offsets` 产出的 block 边界表数组；登记进
+    `artifacts`（文件名 + sha256 + elements = 元素数 = block 数 + 1）。
     """
     stem = getattr(args, 'out_prefix', '') or ''
+    if source_dir is None:
+        source_dir = DATA_DIR
     if manifest_path is None:
         manifest_path = os.path.join(DATA_DIR, named_output('manifest', stem, '.json'))
     if train_bin is None:
@@ -346,6 +466,10 @@ def write_manifest(args, tokenizer, train_samples, val_samples,
             "source_ratio": list(getattr(args, 'source_ratio', []) or []),
             "seed": getattr(args, 'seed', None),
             "out_prefix": getattr(args, 'out_prefix', ''),
+            # --emit-offsets：是否产出了 block 边界表 sidecar（train/val 的 .off）
+            "emit_offsets": bool(getattr(args, 'emit_offsets', False)),
+            # --source-dir：扫描输入目录（产物仍写 DATA_DIR）。默认 = DATA_DIR，行为不变。
+            "source_dir": getattr(args, 'source_dir', None) or DATA_DIR,
             # 完整命令行：2026-09 事故教训——旧构建的 source_ratio 没落盘，
             # 导致 train 缺口 9.5 万 block 无法从产物反查。以后一律留痕。
             "argv": list(sys.argv),
@@ -365,10 +489,10 @@ def write_manifest(args, tokenizer, train_samples, val_samples,
         "source_breakdown": source_stats or [],
         "artifacts": {},
     }
-    for fn in sorted(os.listdir(DATA_DIR)):
+    for fn in sorted(os.listdir(source_dir)):
         if not fn.endswith('.txt'):
             continue
-        path = os.path.join(DATA_DIR, fn)
+        path = os.path.join(source_dir, fn)
         manifest["source_files"].append({
             "file": fn,
             "size_bytes": os.path.getsize(path),
@@ -383,14 +507,34 @@ def write_manifest(args, tokenizer, train_samples, val_samples,
                 "size_bytes": os.path.getsize(path),
                 "sha256": sha256_file(path),
             }
+    # --emit-offsets 的 sidecar：登记文件名 + 哈希 + 元素数（= block 数 + 1 哨兵）
+    for _arr, _bin in ((train_off, train_bin), (val_off, val_bin)):
+        if _arr is None or _bin is None:
+            continue
+        _path = offsets_path_for_bin(_bin)
+        if os.path.exists(_path):
+            manifest["artifacts"][os.path.basename(_path)] = {
+                "size_bytes": os.path.getsize(_path),
+                "sha256": sha256_file(_path),
+                "elements": int(np.asarray(_arr).size),
+            }
     with open(manifest_path, 'w', encoding='utf-8') as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
     print(f'数据清单已写入：{manifest_path}')
 
 
-def main():
+def parse_args(argv=None):
+    """解析命令行。`argv=None` = 读 `sys.argv`（旧行为）。
+
+    独立成函数是为了让测试能直接检查默认值（如 `--source-dir` 默认 = DATA_DIR），
+    而不必真的跑一遍编码。
+    """
     import argparse
     ap = argparse.ArgumentParser(description='编码语料为 token ids')
+    ap.add_argument('--source-dir', default=None, metavar='DIR',
+                    help='**扫描输入**目录（默认 = data/chinese，即旧行为）。'
+                         '产物 bin/manifest/pkl 仍写在 data/chinese，tokenizer 路径也不变 —— '
+                         '这样可以直接指向 data/chinese/clean_v3 而不污染清洗源。')
     ap.add_argument('--with-books', action='store_true',
                     help='顺带下载四大名著补充语料（默认只用手头已有的 txt）')
     ap.add_argument('--task-ratio', type=float, default=1.0,
@@ -411,6 +555,12 @@ def main():
     ap.add_argument('--seed', type=int, default=None,
                     help='可选：固定 annotate_replies 的随机种子，使重建结果可复现。'
                          '不传则保持旧行为（不设种子，每次标注随机）。')
+    ap.add_argument('--emit-offsets', action='store_true',
+                    help='额外产出与 bin 逐 token 对齐的 block 边界表 sidecar：'
+                         'train_<...>.off / val_<...>.off（int64 裸数组，每个元素 = block 起始 '
+                         'token 下标，末尾补 len(bin) 哨兵；由 bin 名派生，如 '
+                         'train_char_v2.bin → train_char_v2.off）。供 training/train.py '
+                         '--use_doc_packing 做块对角注意力掩码。默认关，不影响既有产物。')
     ap.add_argument('--source-ratio', action='append', default=[], metavar='NAME=RATIO',
                     help='按文件名前缀降采样某源（仅 train 侧，val 不变保持可比）。'
                          '可重复：--source-ratio multi_turn=0.15 --source-ratio zhuangxialie=0.2')
@@ -431,9 +581,15 @@ def main():
                     help='预训练模式：所有 txt 按原始文本编码（不解析 用户：/模型： 结构、'
                          '不插 <eos>、无 loss mask 概念），输出 pretrain.bin/val.bin——'
                          '对应 train.py --stage=pretrain 的无掩码全 token 训练')
-    args = ap.parse_args()
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
     if args.no_insert_eos:
         args.insert_eos = False
+    # --source-dir：扫描输入用 source_dir；产物仍写 DATA_DIR（默认 = DATA_DIR，行为不变）。
+    source_dir = args.source_dir or DATA_DIR
 
     # 1) 可选：补齐四大名著（次要语料，网络不稳时默认跳过）
     if args.with_books:
@@ -451,10 +607,10 @@ def main():
     #    输出 pretrain.bin（train.py --stage=pretrain 读它做无掩码全 token 训练）。
     if args.pretrain:
         train_parts, val_parts = [], []
-        for fn in sorted(os.listdir(DATA_DIR)):
+        for fn in sorted(os.listdir(source_dir)):
             if not fn.endswith('.txt'):
                 continue
-            with open(os.path.join(DATA_DIR, fn), 'r', encoding='utf-8', errors='replace') as f:
+            with open(os.path.join(source_dir, fn), 'r', encoding='utf-8', errors='replace') as f:
                 text = f.read()
             n = int(len(text) * 0.9)
             train_parts.append(text[:n])
@@ -465,8 +621,18 @@ def main():
         pretrain_bin = os.path.join(DATA_DIR, named_output('pretrain', pfx, '.bin'))
         val_bin = os.path.join(DATA_DIR, named_output('val', pfx, '.bin'))
         meta_path = os.path.join(DATA_DIR, named_output('meta', pfx, '.pkl'))
-        encode_to_bin(train_data, tokenizer, pretrain_bin)
-        encode_to_bin(val_data, tokenizer, val_bin)
+        train_off = val_off = None
+        if args.emit_offsets:
+            # pretrain 是 ''.join(parts)：block = 每个文件的片段，分隔符长度 0
+            train_off = encode_to_bin(train_data, tokenizer, pretrain_bin,
+                                      block_starts=block_start_chars(train_parts, sep_len=0))
+            val_off = encode_to_bin(val_data, tokenizer, val_bin,
+                                    block_starts=block_start_chars(val_parts, sep_len=0))
+            write_offsets(train_off, pretrain_bin)
+            write_offsets(val_off, val_bin)
+        else:
+            encode_to_bin(train_data, tokenizer, pretrain_bin)
+            encode_to_bin(val_data, tokenizer, val_bin)
         meta = {'vocab_size': vocab_size, 'tokenizer_path': os.path.basename(TOKENIZER_PATH)}
         print(f'预训练数据：{len(train_data):,} 训练字符 / {len(val_data):,} 验证字符')
         print(f'pretrain token 数：{os.path.getsize(pretrain_bin) // 2:,}')
@@ -475,7 +641,8 @@ def main():
             pickle.dump(meta, f)
         write_manifest(args, tokenizer, train_parts, val_parts,
                        train_data, val_data, meta,
-                       train_bin=pretrain_bin, val_bin=val_bin, meta_path=meta_path)
+                       train_bin=pretrain_bin, val_bin=val_bin, meta_path=meta_path,
+                       source_dir=source_dir, train_off=train_off, val_off=val_off)
         print('完成 ✅ pretrain.bin / val.bin / meta.pkl / manifest.json 已生成（预训练模式）')
         return
 
@@ -487,10 +654,10 @@ def main():
     #    切分逻辑见 split_one_source()（模块级函数，审计脚本可复用）。
     train_samples, val_samples = [], []
     source_stats = []
-    for fn in sorted(os.listdir(DATA_DIR)):
+    for fn in sorted(os.listdir(source_dir)):
         if not fn.endswith('.txt'):
             continue
-        with open(os.path.join(DATA_DIR, fn), 'r', encoding='utf-8', errors='replace') as f:
+        with open(os.path.join(source_dir, fn), 'r', encoding='utf-8', errors='replace') as f:
             text = f.read()
         blocks = [b.strip() for b in text.split('\n\n') if b.strip()]
         # --source-ratio NAME=RATIO：按文件名降采样该源（只作用于 train 侧，
@@ -506,7 +673,7 @@ def main():
         val_samples += val_blocks
         source_stats.append({
             'file': fn,
-            'size_bytes': os.path.getsize(os.path.join(DATA_DIR, fn)),
+            'size_bytes': os.path.getsize(os.path.join(source_dir, fn)),
             'blocks': len(blocks),
             'train_blocks': len(train_blocks),
             'val_blocks': len(val_blocks),
@@ -523,23 +690,37 @@ def main():
     val_data = '\n\n'.join(val_samples)
     # 释放 block 列表（~2GB），降低编码阶段峰值内存
     n_train_samples, n_val_samples = len(train_samples), len(val_samples)
+    # --emit-offsets：block 起始字符下标（必须在 del samples 之前算，只有开了才占内存）
+    train_starts = block_start_chars(train_samples) if args.emit_offsets else None
+    val_starts = block_start_chars(val_samples) if args.emit_offsets else None
     del train_samples, val_samples
     print(f'{len(train_data):,} 训练字符 / {len(val_data):,} 验证字符')
 
     # 5) 编码 + 写 bin（--char-level：字级；--byte-level：字节直入；默认：BPE）
     #    --out-prefix 给所有产物加后缀（如 v2），绝不覆盖既有数据集。
     pfx = args.out_prefix or ''
+    train_off = val_off = None
     if args.char_level:
         train_bin = os.path.join(DATA_DIR, named_output('train_char', pfx, '.bin'))
         val_bin = os.path.join(DATA_DIR, named_output('val_char', pfx, '.bin'))
         char_tok = Tokenizer.from_file(CHAR_TOKENIZER_PATH)   # WordLevel 字级（dev-notes/50）
-        encode_to_bin(train_data, char_tok, train_bin)
-        encode_to_bin(val_data, char_tok, val_bin)
+        if args.emit_offsets:
+            train_off = encode_to_bin(train_data, char_tok, train_bin, block_starts=train_starts)
+            val_off = encode_to_bin(val_data, char_tok, val_bin, block_starts=val_starts)
+            write_offsets(train_off, train_bin)
+            write_offsets(val_off, val_bin)
+        else:
+            encode_to_bin(train_data, char_tok, train_bin)
+            encode_to_bin(val_data, char_tok, val_bin)
         vocab_size = char_tok.get_vocab_size()
         meta = {'vocab_size': vocab_size, 'char_level': True,
                 'tokenizer_path': os.path.basename(CHAR_TOKENIZER_PATH)}
         meta_path = os.path.join(DATA_DIR, named_output('meta_char', pfx, '.pkl'))  # 独立 meta
     elif args.byte_level:
+        if args.emit_offsets:
+            # 不静默：byte bin 的 char→token 映射（UTF-8 变长字节）未实现边界对齐
+            raise SystemExit('错误：--emit-offsets 暂不支持 --byte-level。'
+                             'char-level / BPE / pretrain 已支持；byte 模式请勿使用打包。')
         train_bin = os.path.join(DATA_DIR, named_output('train_byte', pfx, '.bin'))
         val_bin = os.path.join(DATA_DIR, named_output('val_byte', pfx, '.bin'))
         encode_bytes_to_bin(train_data, train_bin)
@@ -550,8 +731,14 @@ def main():
     else:
         train_bin = os.path.join(DATA_DIR, named_output('train', pfx, '.bin'))
         val_bin = os.path.join(DATA_DIR, named_output('val', pfx, '.bin'))
-        encode_to_bin(train_data, tokenizer, train_bin)
-        encode_to_bin(val_data, tokenizer, val_bin)
+        if args.emit_offsets:
+            train_off = encode_to_bin(train_data, tokenizer, train_bin, block_starts=train_starts)
+            val_off = encode_to_bin(val_data, tokenizer, val_bin, block_starts=val_starts)
+            write_offsets(train_off, train_bin)
+            write_offsets(val_off, val_bin)
+        else:
+            encode_to_bin(train_data, tokenizer, train_bin)
+            encode_to_bin(val_data, tokenizer, val_bin)
         vocab_size = tokenizer.get_vocab_size()
         meta = {
             'vocab_size': vocab_size,
@@ -574,7 +761,8 @@ def main():
                    train_data, val_data, meta,
                    train_bin=train_bin, val_bin=val_bin, meta_path=meta_path,
                    source_stats=source_stats,
-                   n_train_samples=n_train_samples, n_val_samples=n_val_samples)
+                   n_train_samples=n_train_samples, n_val_samples=n_val_samples,
+                   source_dir=source_dir, train_off=train_off, val_off=val_off)
     print(f'完成 ✅ {os.path.basename(train_bin)} / {os.path.basename(val_bin)} / '
           f'{os.path.basename(meta_path)} / '
           f'{named_output("manifest", pfx, ".json")} 已生成')
