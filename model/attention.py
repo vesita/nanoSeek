@@ -149,12 +149,20 @@ class CausalSelfAttention(nn.Module):
         k = F.normalize(k, dim=-1)
         return q, k
 
-    def forward(self, x, rope_offset=0, is_eos=None):
+    def forward(self, x, rope_offset=0, is_eos=None, sample_id=None):
+        """is_eos：<eos> 位置 bool（B,T），只服务 CSA / KV 记忆两条路径（旧行为）。
+
+        sample_id：可选的 (B,T) 整型**样本号**（来自 prepare 的 `.off` 边界表，
+        见 training/packing.py）。非 None 时，标准因果路径（含 MLA）也会把
+        「同一样本」与因果掩码相与，杜绝一个窗口内跨样本的注意力污染。
+        ★ 不传 sample_id 时行为与旧实现**逐位一致**（is_eos 在 MLA/标准路径依旧被忽略，
+        不把 sample_boundary_reset 从死旋钮变成默认生效 —— 那会改变 base_v2 的既有语义）。
+        """
         B, T, C = x.size() # batch 大小、序列长度、嵌入维度 (n_embd)
 
         if self.use_csa:
             # CSA/HCA 混合注意力（V4 简化版）：走独立的压缩稀疏路径
-            y = self._csa_forward(x, rope_offset, is_eos=is_eos)
+            y = self._csa_forward(x, rope_offset, is_eos=is_eos, sample_id=sample_id)
             y = self.resid_dropout(self.c_proj(y))
             return y
 
@@ -203,6 +211,13 @@ class CausalSelfAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
+        # 块对角掩码（document packing）：sample_id 非 None 时，注意力只允许同一样本内。
+        # 用 bool (B,T,T) broadcast（不展开 head 维），内存 = B·T² 个 bool。
+        doc_allowed = None
+        if sample_id is not None:
+            tril = torch.tril(torch.ones(T, T, device=q.device, dtype=torch.bool))
+            doc_allowed = (sample_id.unsqueeze(2) == sample_id.unsqueeze(1)) & tril.unsqueeze(0)
+
         # 因果自注意力；自注意力：(B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         # QK-Norm 时 q 已自带 qk_scale（初始 = sqrt(d)），scale 必须传 1.0：
         # 若传 None/省略，SDPA 会按默认 1/sqrt(head_dim) 再除一次，与下方手动路径
@@ -219,11 +234,22 @@ class CausalSelfAttention(nn.Module):
                 k_pad = torch.cat([k, k.new_zeros(Bn, nh, 1, d)], dim=2)   # (B,nh,T+1,d)
                 v_pad = torch.cat([v, v.new_zeros(Bn, nh, 1, d)], dim=2)
                 mask = torch.zeros(Bn, nh, Tq, Tq + 1, device=q.device, dtype=q.dtype)
-                causal = torch.triu(torch.ones(Tq, Tq, device=q.device, dtype=torch.bool), diagonal=1)
-                mask[:, :, :, :Tq].masked_fill_(causal.view(1, 1, Tq, Tq), float('-inf'))
+                if doc_allowed is not None:
+                    # 块对角：因果已经含在 doc_allowed 里（=same_sample & tril）
+                    mask[:, :, :, :Tq].masked_fill_(~doc_allowed.unsqueeze(1), float('-inf'))
+                else:
+                    causal = torch.triu(torch.ones(Tq, Tq, device=q.device, dtype=torch.bool), diagonal=1)
+                    mask[:, :, :, :Tq].masked_fill_(causal.view(1, 1, Tq, Tq), float('-inf'))
                 mask[:, :, :, Tq] = self.attn_sink.view(1, nh, 1)
                 y = torch.nn.functional.scaled_dot_product_attention(
                     q, k_pad, v_pad, attn_mask=mask,
+                    dropout_p=self.dropout if self.training else 0,
+                    is_causal=False, scale=attn_scale)
+            elif doc_allowed is not None:
+                # 块对角 + 因果：bool mask（True=参与）broadcast 到 (B,nh,T,T)，
+                # 不物化 (B,nh,T,T) 的 float 掩码。
+                y = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=doc_allowed.unsqueeze(1),
                     dropout_p=self.dropout if self.training else 0,
                     is_causal=False, scale=attn_scale)
             else:
@@ -236,13 +262,17 @@ class CausalSelfAttention(nn.Module):
             att = q @ k.transpose(-2, -1)
             if not self.use_qk_norm:
                 att = att * (1.0 / math.sqrt(k.size(-1)))
-            if hasattr(self, 'bias'):
+            if doc_allowed is not None:
+                # 块对角（含因果）：与 (B,1,T,T) 广播
+                att = att.masked_fill(~doc_allowed.unsqueeze(1), float('-inf'))
+            elif hasattr(self, 'bias'):
                 causal_mask = self.bias[:, :, :T, :T] == 0
             else:
                 # 观测台强制走手动路径时没有 bias buffer（flash 模式才不注册），就地构造
                 tril = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
                 causal_mask = ~tril.unsqueeze(0).unsqueeze(0)
-            att = att.masked_fill(causal_mask, float('-inf'))
+            if doc_allowed is None:
+                att = att.masked_fill(causal_mask, float('-inf'))
             if self.use_attn_sink:
                 # Attention Sink：追加一列 sink[h]（value 用零向量占位）。
                 # 这列 softmax 后有 exp(sink) 的概率质量，但乘零向量 → 贡献为 0，
@@ -265,7 +295,7 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-    def _csa_forward(self, x, rope_offset=0, is_eos=None):
+    def _csa_forward(self, x, rope_offset=0, is_eos=None, sample_id=None):
         """CSA + HCA 混合注意力（DeepSeek-V4 的简化教育版）。
         CSA（压缩稀疏注意力）：把 K/V 按 m 个 token 一块，平均池化成 1 个潜在向量。
         每个 query 只稀疏地选 top-k 个「它之前」的压缩块（长程信号用摘要传递），
@@ -423,7 +453,12 @@ class CausalSelfAttention(nn.Module):
         # 因果滑窗掩码（[query, key] 取向）：query q 允许 key k ∈ [q-win, q]。
         # 注意方向：r 行允许 c 列当且仅当 c ≤ r 且 r-c ≤ win。
         win_causal = (i.unsqueeze(0) <= i.unsqueeze(-1)) & (i.unsqueeze(-1) - i.unsqueeze(0) <= win)
-        if is_eos is not None and getattr(self.config, 'sample_boundary_reset', True):
+        if sample_id is not None:
+            # 块对角（document packing）：直接用 .off 派生的样本号，比 <eos> 准
+            # （非对话 block 整块没有 <eos>）。sample_id=None 时此分支不生效 → 旧行为逐位不变。
+            same_sample = (sample_id.unsqueeze(2) == sample_id.unsqueeze(1))                # (B, T, T)
+            win_causal_b = win_causal.unsqueeze(0) & same_sample                            # (B, T, T)
+        elif is_eos is not None and getattr(self.config, 'sample_boundary_reset', True):
             # 样本边界因果阻断：跨 <eos> 的两段对话属于不同样本，禁止滑窗跨越
             sample_id = torch.cumsum(F.pad(is_eos[:, :-1].long(), (1, 0), value=0), dim=1)  # (B, T)
             same_sample = (sample_id.unsqueeze(2) == sample_id.unsqueeze(1))                # (B, T, T)
@@ -505,7 +540,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         if self.kv_memory_enabled:
             # KV 记忆输出是跨头的（nh·l → C），在合并后加入残差
-            mem_out = self._kv_memory_forward(x, is_eos=is_eos)
+            mem_out = self._kv_memory_forward(x, is_eos=is_eos, sample_id=sample_id)
             y = y + mem_out
             if self.capture:
                 self._cap_mag["mem"] = mem_out.float().norm(dim=-1).mean().item()
@@ -535,7 +570,7 @@ class CausalSelfAttention(nn.Module):
         gate = torch.sigmoid(self.csa_gate_linear(flat))     # 门控 (0,1)
         return (h * gate).view(B, nb, nh, d)
 
-    def _kv_memory_forward(self, x, is_eos=None):
+    def _kv_memory_forward(self, x, is_eos=None, sample_id=None):
         """KV 记忆路径（P1，GLA 式 chunk 并行版）：每头一个可写状态矩阵。
         递推（与顺序版数学等价，块内并行）：
             r_t = 1 − σ(W_f·x_t)         逐通道保留率（遗忘门 → 学出来的淘汰策略）
@@ -557,7 +592,14 @@ class CausalSelfAttention(nn.Module):
         qkv = self.mem_qkv(x).float().view(B, T, nh, 3, l)
         q_m, k_m, v_m = qkv.unbind(dim=3)                        # (B,T,nh,l)
         r = 1.0 - torch.sigmoid(self.mem_forget(x).float().view(B, T, nh, l))
-        if is_eos is not None and getattr(self.config, 'sample_boundary_reset', True):
+        if sample_id is not None:
+            # 块对角（document packing）：每个样本的第一个 token 处清空黑板（含样本内
+            # 第一个 token 本身 —— 它没有同样本历史，等价于从零开始）。sample_id=None
+            # 时走下面的旧 <eos> 分支，行为逐位不变。
+            new_sample = torch.zeros_like(sample_id, dtype=torch.bool)
+            new_sample[:, 1:] = sample_id[:, 1:] != sample_id[:, :-1]
+            r = r.masked_fill(new_sample.unsqueeze(2).unsqueeze(3), 0.0)
+        elif is_eos is not None and getattr(self.config, 'sample_boundary_reset', True):
             # 样本边界记忆重置：遇到 <eos> 时强制保留率 r=0.0，瞬时清空黑板，杜绝跨对话记忆污染
             r = r.masked_fill(is_eos.unsqueeze(2).unsqueeze(3), 0.0)
         if self.use_complement_gate:

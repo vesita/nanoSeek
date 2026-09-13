@@ -64,10 +64,17 @@ from training.masking import build_assistant_mask as _build_assistant_mask
 # 纯函数抽到 training/schedules.py：本文件是模块级脚本（import 即开训），
 # 写在里面的函数无法被 pytest 覆盖。这里只做「读全局 → 转调纯函数」。
 from training.schedules import lr_at as _lr_at, pick_bin_names
+# 样本打包（document packing）纯函数：.off 边界表读取/校验 + sample_id + 块对齐窗口。
+from training.packing import (load_offsets as _load_offsets,
+                              offsets_name_for_bin as _offsets_name_for_bin,
+                              sample_id_in_window as _sample_id_in_window,
+                              mask_cross_sample_labels as _mask_cross_sample_labels,
+                              aligned_pack_starts as _aligned_pack_starts)
 # 诊断用的纯函数（显存调试行 / 快照触发 / OOM 现场）：抽出来是为了能在 CPU 上
 # 单测 —— 诊断代码自己不能变成新的故障源（见 training/diag.py 的说明）。
 from training.diag import mem_debug_line, should_dump_snapshot
-from training.checkpoints import DEFAULT_KEEP_STEP_CKPTS, prune_step_checkpoints
+from training.checkpoints import prune_step_checkpoints_sparse
+from training.run_logs import count_csv_rows, open_run_csv
 
 # -----------------------------------------------------------------------------
 # 默认配置：small 模型在字符级莎士比亚上训练（与 config/train_shakespeare_char.yaml 一致）。
@@ -84,6 +91,14 @@ eval_iters = 200
 eval_train_split = True
 eval_only = False # 如果为 True，脚本在第一次评估后立即退出
 always_save_checkpoint = False # 如果为 True，每次评估后总是保存 checkpoint；否则只在 val 变优时保存
+# 归档检查点的保留策略（2026-09-11 晚：从外部脚本搬进训练内部，见 training/checkpoints.py 的模块文档）
+#   ★ 这两个键**必须定义在下面 config_keys 快照之前**，否则 yaml 里设了会被静默忽略
+#     （load_config 只覆盖已存在的全局）。旧代码用的是
+#     `getattr(config, 'keep_step_ckpts', 5)`，而那个全局从未定义过 ⇒ 该旋钮其实**永远是 5**。
+#   策略 = 每 ckpt_sparse_every 步留一个回溯点 + 最新 ckpt_newest_keep 个；best/last 永不删。
+#   ≤0 表示关闭对应那条规则；两条都 ≤0 会在 steps_to_keep 里直接抛错（防"删光"）。
+ckpt_sparse_every = 5000   # 阶段回溯点间隔（70000 步 ⇒ 约 15 个）
+ckpt_newest_keep = 2       # 再额外保留最新的几个，防止"刚写的就被删"
 # 早停：val loss 连续 patience 次评估无实质改善就提前终止（不用手动估算步数）
 enable_early_stop = True   # 默认开；设为 False 则训满 max_iters
 patience = 3               # val 连续 3 次评估不改善就停（激进；保守可调 5-8）
@@ -271,6 +286,22 @@ factorized_emb_dim = 0  # 因式分解嵌入维度：>0 启用低秩嵌入（ALB
 # ★ 必须定义在下面 config_keys 快照**之前**：load_config 只覆盖已存在的全局，
 #   定义在它之后会被这里的赋值静默改回默认值（本项目已经栽过一次同类坑）。
 data_prefix = ''
+# --- document packing（样本打包 + 块对角注意力掩码，analysis/doc_packing.md）---
+# 语料是一条扁平 token 流，全域随机窗口会横跨多个样本；<eos> 不足以当边界（非对话 block
+# 整块没有 <eos>）。prepare.py --emit-offsets 产出与 bin 对齐的 block 边界表 `.off`，
+# 训练时据此算 sample_id 传给模型，注意力只在同一样本内（杜绝跨样本污染）。
+# ★ 默认 False = 完全走旧路径（不读 .off、不传 sample_id），逐位向后兼容。
+# ★★ 两个键都必须定义在下面 config_keys 快照**之前**（铁律 8），否则 yaml/CLI 设了会被静默改回默认。
+use_doc_packing = False   # True：启用样本打包（需同名 .off sidecar，缺失则报错不静默退化）
+pack_align = False        # ★★ 2026-09-13 由 True 翻成 False：块对齐模式有**结构性覆盖漏洞** ——
+                          # 窗口只有 T 长且必须结束在 block 边界 ⇒ 位置 p 可达 ⟺ p 落在某个边界前
+                          # T 个 token 内 ⇒ 比 T 长的块，前 L−T 个 token **永远进不了任何窗口**
+                          # （最后一个 block 整体不可达）。实测不可达 train token：
+                          # v3_dlg 67.39% / v3_lang 67.05% / v3_know 72.91% / v2 70.67%
+                          # （analysis/packing_audit.md；packing.unreachable_token_fraction 可复算）。
+                          # False = 全域随机窗口 + **同一张块对角掩码**（覆盖 ≈100%，I1 一样成立；
+                          # 代价 analysis/doc_packing.md §3.4：+2.3% vs 块对齐 +5.2%）。
+                          # True 仅保留用于复现旧实验 / A-B 对照。
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 load_config(globals()) # 从 YAML 配置文件或命令行覆盖
 config = {k: globals()[k] for k in config_keys} # 对日志记录很有用
@@ -340,14 +371,26 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # 简易数据加载器
 data_dir = os.path.join('data', dataset)
 
-# 数据溯源：记录 data/<dataset>/manifest.json 的哈希，方便追查“这个模型用的哪版数据”
-data_manifest_path = os.path.join(data_dir, 'manifest.json')
-if os.path.exists(data_manifest_path):
+# 数据溯源：记录数据清单的哈希，方便追查“这个模型用的哪版数据”。
+# ★ 2026-09-13 修：原来只找 manifest.json，而 v3 的清单叫 manifest_v3_*.json ⇒ **根本没读到**
+#   （manifest.json 还是 9 月 8 日 v2 时代的旧文件）。现在按 data_prefix 优先找
+#   manifest_<prefix>.json，找不到再回退 manifest.json，并**打印到底读了哪个**（或"没找到"）。
+_manifest_candidates = []
+if data_prefix:
+    _manifest_candidates.append(os.path.join(data_dir, f'manifest_{data_prefix}.json'))
+_manifest_candidates.append(os.path.join(data_dir, 'manifest.json'))
+data_manifest_path = next((p for p in _manifest_candidates if os.path.exists(p)), None)
+if data_manifest_path is not None:
     try:
         with open(data_manifest_path, 'rb') as _f:
-            config['data_manifest_sha256'] = hashlib.sha256(_f.read()).hexdigest()
+            _man_sha = hashlib.sha256(_f.read()).hexdigest()
+        config['data_manifest_sha256'] = _man_sha
+        config['data_manifest_name'] = os.path.basename(data_manifest_path)
+        print(f'数据清单：{data_manifest_path}（sha256 {_man_sha[:16]}…）')
     except OSError as _e:
         print(f'warning: 读取数据清单 {data_manifest_path} 失败：{_e}')
+else:
+    print(f'warning: 未找到数据清单（试过 {_manifest_candidates}）')
 
 # 数据集文件名统一解析：train / val / meta 三个名字只在这里算一次，
 # 下游（get_batch / meta 加载 / summary 打印）一律复用，杜绝"改一处漏一处"。
@@ -360,6 +403,38 @@ try:
     steps_per_epoch = max(1, _train_tokens // tokens_per_iter)
 except OSError:
     steps_per_epoch = None
+
+# --- document packing：加载与 bin 逐 token 对齐的 block 边界表（.off）---
+# 路径由 pick_bin_names 的产物名派生（同一解析点，不另写文件名拼接）。
+# 缺失 / 与 bin token 数对不上 → **明确报错**（绝不在"打包开着"的假象下静默退回随机窗口）。
+_doc_off = {}
+if use_doc_packing:
+    if distill_bin and p_distill > 0:
+        raise SystemExit('错误：use_doc_packing 与 distill_bin/p_distill 混采不兼容'
+                         '（蒸馏流没有 .off 边界表，掩码会静默漏掉那条支路）。')
+    _off_sha = {}
+    for _split, _bn in (('train', _train_bin), ('val', _val_bin)):
+        _op = os.path.join(data_dir, _offsets_name_for_bin(_bn))
+        if not os.path.exists(_op):
+            raise SystemExit(
+                f'错误：use_doc_packing=True 但找不到样本边界文件 {_op}。\n'
+                f'  .off 是 `prepare.py --emit-offsets` 的产物，与 {_bn} 逐 token 对齐。\n'
+                f'  请用同一条 prepare 命令加 --emit-offsets 重建数据；'
+                f'不要静默退回随机窗口（那会让人以为打包开着）。')
+        _ntok = os.path.getsize(os.path.join(data_dir, _bn)) // 2
+        _doc_off[_split] = _load_offsets(_op, _ntok)   # 不合法会大声抛错
+        # ★ 2026-09-13：记下 .off 的 sha256 进 config（→ 日志 + checkpoint）。
+        # 长度/哨兵校验抓不到"同长度、不同批次"的错配；内容指纹让"这批权重用了哪份边界表"
+        # 事后可查、可核对 manifest 里登记的 sha256。
+        with open(_op, 'rb') as _f:
+            _off_sha[_split] = hashlib.sha256(_f.read()).hexdigest()
+    config['doc_off_sha256'] = _off_sha
+    print(f"样本打包：train {len(_doc_off['train']) - 1:,} 个 block / "
+          f"val {len(_doc_off['val']) - 1:,} 个 block（.off 已校验与 bin 对齐）")
+    print(f"  pack_align={bool(pack_align)}"
+          f"（True=块对齐，实测有覆盖漏洞；False=全域随机窗口 + 块对角掩码）")
+    for _split, _h in _off_sha.items():
+        print(f"  .off sha256[{_split}] = {_h}")
 
 def build_assistant_mask(y):
     """(B, T) bool mask 的薄包装：标记 id 来自配置，实现见 training/masking.py。
@@ -406,18 +481,49 @@ def get_batch(split):
     else:
         path = os.path.join(data_dir, _val_bin)
     data = np.memmap(path, dtype=np.uint16, mode='r')
-    ix = _sample_nonempty_ix(data) if _pack_terms else torch.randint(len(data) - block_size, (batch_size,))
+    sid = None        # 给模型的 (B,T) 样本号（与 x 对齐；未启用打包 = None）
+    sid_ext = None    # 给 label 掩码的 (B,T+1) 样本号（多一格，见下面的 -100 注释）
+    if use_doc_packing:
+        # 样本打包：窗口起点来自 .off 边界（块对齐贪心，仅 pack_align=True）或全域随机；
+        # 两种都算块对角 sample_id。用对应 split 的边界表（train/val 各自一份），保证两端口径一致。
+        _off = _doc_off['train'] if split == 'train' else _doc_off['val']
+        if pack_align:
+            ix = torch.from_numpy(_aligned_pack_starts(_off, block_size, batch_size)).long()
+        else:
+            ix = torch.randint(len(data) - block_size, (batch_size,))
+        # ★ 边界：T+1 视图多看一格，所以要求 max(start)+T+1 <= len(data)。
+        #   随机路径 start ∈ [0, len-T-1] ⇒ 恰好 <= len；对齐路径
+        #   start+T = off[e] <= off[n_blocks-1] < len ⇒ 也成立。这里显式验一次，
+        #   免得将来改采样逻辑时静默越界（data[i:i+T] 会切成短片段，stack 才报一句看不懂的错）。
+        _max_start = int(ix.max())
+        if _max_start + block_size + 1 > len(data):
+            raise ValueError(
+                f'打包窗口越界：max(start)+T+1 = {_max_start + block_size + 1} > len(data) = {len(data)}'
+                f'（split={split}, pack_align={bool(pack_align)}）。'
+                f'sample_id 用 T+1 视图需要多看一格。')
+        sid_ext = _sample_id_in_window(_off, ix, block_size + 1, device=device)   # (B, T+1)
+        sid = sid_ext[:, :block_size]        # ★ 模型侧仍必须是 (B,T)：attention 的 tril 是 T×T
+    else:
+        ix = _sample_nonempty_ix(data) if _pack_terms else torch.randint(len(data) - block_size, (batch_size,))
     if ndb_store:
         # NDB：记录本 batch 每个窗口的 chunk 起始位置，供 hook 做「排除自匹配」检索
         _cs = torch.arange(0, block_size, ndb_chunk)
         _ndb_state['q_pos'] = (ix[:, None] + _cs[None, :]).to(torch.int32).to(device)
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    if sid_ext is not None:
+        # ★ 样本打包下的**边界 label 泄漏**：位置 t 的 label 是 token t+1，若 t 与 t+1
+        # 不属于同一样本，这条标签就是在要求"用 A 样本的结尾预测 B 样本的开头" —— 纯噪声
+        # （且正是打包要消除的跨样本污染）。掩码只管注意力，管不到 y 的错位，必须显式置 -100。
+        # ★★ 2026-09-13：这里传的是 (B, T+1)（比 y 多一格）—— 旧版只算 T 格，导致
+        # **每个块对齐窗口的最后一位 label 固定跨样本却漏屏蔽**（实测 100% 命中，
+        # 占全部 label 的 0.3906%）。模型侧拿的仍是上面的 (B,T)。
+        # 详见 analysis/packing_audit.md 与 packing.py 的 docstring。
+        y = _mask_cross_sample_labels(y, sid_ext)
     # loss masking：两阶段框架——pretrain 无掩码全 token 语言建模（DeepSeek 路线）；
-    # sft/full 只对 assistant 回复 token 算 loss（chat 微调惯例），
-    # 用户轮次和分隔符设 ignore_index=-1，不参与梯度计算。
-    # loss masking：只对 assistant 回复 token 算 loss（chat 微调惯例），
-    # 用户轮次和分隔符设 ignore_index=-1，不参与梯度计算。
+    # sft/full 只对 assistant 回复 token 算 loss（chat 微调惯例）。
+    # ★ 哨兵值是 **-100**（model/gpt.py 的 F.cross_entropy(ignore_index=-100)）；
+    #   旧注释写的 -1 是错的（-1 是合法 token id）。见 analysis/packing_audit.md Q4。
     # use_loss_masking=False 时全部 token 参与训练（非对话语料 / 纯预训练）。
     if use_loss_masking and ('stage' not in globals() or stage != 'pretrain'):
         y[~build_assistant_mask(y)] = -100
@@ -426,7 +532,7 @@ def get_batch(split):
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
-    return x, y
+    return x, y, sid
 
 # 在这里初始化，如果 init_from='resume'（即从 checkpoint）可以覆盖
 iter_num = 0
@@ -707,12 +813,12 @@ def estimate_loss(splits=('train', 'val')):
     for split in splits:
         tot, n = 0.0, 0
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y, SID = get_batch(split)
             n_i = int((Y != -100).sum().item())
             if n_i == 0:
                 continue  # 全 mask 窗口：无有效 token，跳过（否则 loss 为 nan）
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X, Y, sample_id=SID)
             # NaN 防护：train 数据某些窗口无 <eos>/<cont> → mask 全 -100 → loss 为 nan。
             # 跳过这些无效 batch，只对有限 loss 求均值（与训练循环的 step_nan 防护对齐）。
             if torch.isfinite(loss):
@@ -755,12 +861,12 @@ def ndb_eval():
             if ndb.per_token:
                 ndb.vals = _ndb_held['vals']
         tot, n = 0.0, 0
-        for X, Y in batches:
+        for X, Y, SID in batches:
             n_i = int((Y != -100).sum().item())
             if n_i == 0:
                 continue
             with ctx:
-                _, loss = model(X, Y)
+                _, loss = model(X, Y, sample_id=SID)
             if torch.isfinite(loss):
                 tot += loss.item() * n_i  # token 级加权，与训练损失同口径
                 n += n_i
@@ -925,21 +1031,31 @@ if tensorboard_log and master_process:
     writer.add_text("config", str(config), 0)
 
 # YOLO 式 results.csv：每个评估点一行，纯文本、随时可读、不依赖任何工具
+# ★ 续训时**追加**而不是截断（2026-09-11 修）：原来无条件用 'w'，
+#   暂停/重启一次就把之前的指标历史清空（实测：step 22000 重启后 967 字节 → 0 字节）。
+#   策略实现在 training/run_logs.py，有单测覆盖。
 results_csv = None
 csv_writer = None
 if master_process:
-    results_csv = open(os.path.join(out_dir, 'results.csv'), 'w', newline='', encoding='utf-8')
-    csv_writer = csv.writer(results_csv)
-    csv_writer.writerow(['step', 'train/loss', 'val/loss', 'lr', 'mfu', 'time'])
+    _rcsv_path = os.path.join(out_dir, 'results.csv')
+    _had = count_csv_rows(_rcsv_path) if init_from == 'resume' else 0
+    results_csv, csv_writer, _rcsv_appended = open_run_csv(
+        _rcsv_path, ['step', 'train/loss', 'val/loss', 'lr', 'mfu', 'time'],
+        resuming=(init_from == 'resume'))
+    if _rcsv_appended:
+        print(f"📈 results.csv 已存在 {_had} 行 → **追加**（不截断历史）")
+    elif init_from == 'resume':
+        print("📈 results.csv 为空或不存在 → 新建")
 
-# NDB 监控 CSV（启用 NDB 时；每评估点一行）
+# NDB 监控 CSV（启用 NDB 时；每评估点一行）—— 同样的续写策略
 ndb_csv = None
 ndb_csv_writer = None
 if master_process and ndb_store:
-    ndb_csv = open(os.path.join(out_dir, 'ndb.csv'), 'w', newline='', encoding='utf-8')
-    ndb_csv_writer = csv.writer(ndb_csv)
-    ndb_csv_writer.writerow(['iter', 'base_off', 'mem', 'delta', 'rand', 'delta_rand',
-                             'held', 'delta_held', 'gate', 'delta_norm'])
+    ndb_csv, ndb_csv_writer, _ = open_run_csv(
+        os.path.join(out_dir, 'ndb.csv'),
+        ['iter', 'base_off', 'mem', 'delta', 'rand', 'delta_rand',
+         'held', 'delta_held', 'gate', 'delta_norm'],
+        resuming=(init_from == 'resume'))
 
 # 健康体检初始化（health_enabled 时加载分词器 + 打开 health.csv；失败则本次跳过体检）
 health_tok = None
@@ -1043,9 +1159,14 @@ def _plot_loss_curve(loss_history, out_dir, best_val_loss):
         print(f"生成 loss 曲线图失败（不影响训练）：{e}")
 
 # 训练循环
-X, Y = get_batch('train') # 获取第一个 batch
+X, Y, SID = get_batch('train') # 获取第一个 batch
 t0 = time.time()           # t0 在每轮迭代末尾会被重置（用于测单步速度算 MFU）
-train_start = time.time()  # 训练总起点，results.csv 里的 time 列用这个（不会随迭代重置）
+train_start = time.time()  # results.csv 里 time 列的零点（不会随迭代重置）
+# ⚠️ 注意 `time` 是**本进程内**的累计秒数，**续训会归零**：
+#    它只保证「同一次进程生命周期内单调」，不保证跨 resume 单调。
+#    实测（2026-09-12）：step 22000 那行是 75120.0，续训后 step 23000 那行变成 3480.0。
+#    ⇒ 想算整段训练时长/吞吐，请用 `time` 列的**相邻差值**，不要去和 22000 之前的历史比。
+#    （改成跨 resume 累加需要先读上一行的 time 做偏移，属于待办，见 TECH_DEBT P3。）
 local_iter_num = 0 # 本进程生命周期内的迭代次数
 raw_model = model.module if ddp else model # 如果需要，解开 DDP 容器
 running_mfu = -1.0
@@ -1209,14 +1330,23 @@ while True:
                 step_ckpt = os.path.join(out_dir, f'ckpt_step_{iter_num}.pt')
                 save_checkpoint_async(checkpoint, step_ckpt)
                 pbar.write(f"💾 归档检查点 → {step_ckpt}")
-                # 保留策略（2026-09-11 加）：只留最近 keep_step_ckpts 个归档检查点。
-                # 起因：每个 ckpt ≈ 0.6GB，70000 步 / 1000 = 70 个 → 42GB，
-                # 加上 out/ 已有 74GB，曾把 87GB 剩余空间逼到临界。best.pt / last.pt
-                # 是固定文件名不受影响，续训只依赖 last.pt，历史归档仅用于阶段回溯。
-                # 用 getattr(config, ...) 而非全局变量：避免踩 config_keys 快照陷阱（§8 铁律 4）。
-                _keep = int(getattr(config, 'keep_step_ckpts', DEFAULT_KEEP_STEP_CKPTS))
-                for _f in prune_step_checkpoints(out_dir, _keep):
-                    pbar.write(f"🧹 清理旧归档检查点 → {_f}（保留最近 {_keep} 个）")
+                # 保留策略（2026-09-11 晚搬进训练内部）：每 ckpt_sparse_every 步留一个回溯点
+                # + 最新 ckpt_newest_keep 个；best.pt / last.pt 是固定文件名，永不删。
+                # 起因：每个 ckpt ≈ 0.6GB，70000 步 / 1000 = 70 个 → 42GB。
+                # ★ 为什么不再只留「最新 N 个」：那会在 step 25000 之后把
+                #   ckpt_step_5000/10000/15000 这些**阶段回溯点**静默删掉。
+                # ★ 为什么搬进来：外部 scripts/prune_ckpts.sh 靠巡检看守调用，
+                #   而看守会在会话重启时被 SIGKILL（2026-09-11 实测丢过一次训练），
+                #   ⇒ 清理不再依赖任何外部进程。策略实现在 training/checkpoints.py（有单测）。
+                try:
+                    _rm, _kept = prune_step_checkpoints_sparse(
+                        out_dir, int(ckpt_sparse_every), int(ckpt_newest_keep))
+                    if _rm:
+                        pbar.write(f"🧹 清理归档 {len(_rm)} 个（每 {ckpt_sparse_every} 步留一个"
+                                   f" + 最新 {ckpt_newest_keep} 个）")
+                    pbar.write(f"   现存归档步号 {_kept}")
+                except Exception as _e:  # 清理是尽力而为，绝不能有能力搞崩训练
+                    pbar.write(f"⚠ 归档清理跳过：{type(_e).__name__}: {_e}")
 
             # 神经网络数据库 GC 例程：逢 gc_interval（默认 200 步）触发一次僵尸槽位清理与变异复活
             if getattr(config, 'use_neural_db', False) and iter_num > 0:
@@ -1269,15 +1399,15 @@ while True:
     micro_batches = []
     micro_qpos = []  # 每个 microbatch 自己的 q_pos：NDB 的 exclude_radius 靠它排除自匹配
     for _ in range(gradient_accumulation_steps):
-        _mx, _my = get_batch('train')
-        micro_batches.append((_mx, _my))
+        _mx, _my, _msid = get_batch('train')
+        micro_batches.append((_mx, _my, _msid))
         micro_qpos.append(_ndb_state.get('q_pos') if ndb is not None else None)
-    micro_counts = [float((Y != -100).sum().item()) for _, Y in micro_batches]
+    micro_counts = [float((Y != -100).sum().item()) for _, Y, _ in micro_batches]
     n_valid_total = sum(micro_counts)
     last_valid_idx = max((i for i, n in enumerate(micro_counts) if n > 0), default=-1)
     if n_valid_total == 0:
         step_nan = True  # 整步全 mask（概率 ~0.1%），无事可做
-    for micro_step, ((X, Y), n_i) in enumerate(zip(micro_batches, micro_counts)):
+    for micro_step, ((X, Y, SID), n_i) in enumerate(zip(micro_batches, micro_counts)):
         if n_i == 0:
             continue  # 该 microbatch 无有效 token：跳过（旧版会 NaN 掉整步）
         if ddp:
@@ -1296,7 +1426,7 @@ while True:
             ndb.noise_seed = iter_num * 1000 + micro_step
         try:
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X, Y, sample_id=SID)
                 loss = loss * (n_i / n_valid_total)  # token 级加权 → 全步等价于 token 均值
             # NaN 防护：loss 非有限值（nan/inf）时跳过该微步的反向，
             # 避免 NaN 梯度污染参数（一旦参数变 NaN 就永远救不回来）。

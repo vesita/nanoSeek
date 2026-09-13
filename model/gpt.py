@@ -132,14 +132,19 @@ class GPT(nn.Module):
             return F.linear(self.head_down(x), self.transformer.wte.weight)
         return self.lm_head(x)
 
-    def forward(self, idx, targets=None, rope_offset=0):
+    def forward(self, idx, targets=None, rope_offset=0, sample_id=None):
         """rope_offset（dev-notes/46 推理状态续传）：输入序列的全局起始位置。
-        窗口截断推理时传窗口起点的绝对位置，RoPE 保持绝对坐标（默认 0 = 训练/全序列）。"""
+        窗口截断推理时传窗口起点的绝对位置，RoPE 保持绝对坐标（默认 0 = 训练/全序列）。
+
+        sample_id（document packing，training/packing.py）：可选的 (B,T) 整型样本号。
+        非 None 时每层的标准/MLA 因果注意力会与「同一样本」相与，杜绝窗口内跨样本污染。
+        默认为 None ⇒ 与旧实现逐位一致（is_eos 仍只被 CSA / KV 记忆路径消费）。
+        """
         device = idx.device
         b, t = idx.size()
         if self.config.byte_level:
             # 字节直入（dev-notes/48）：输入 UTF-8 字节流，3:1 聚合后进 transformer
-            return self._forward_byte(idx, targets, rope_offset)
+            return self._forward_byte(idx, targets, rope_offset, sample_id=sample_id)
         assert t <= self.config.block_size, f"无法前向传播长度为 {t} 的序列，block size 只有 {self.config.block_size}"
 
         # 前向传播 GPT 模型本身
@@ -168,9 +173,10 @@ class GPT(nn.Module):
             use_ckpt = False
         for block in self.transformer.h:
             if use_ckpt:
-                x = torch.utils.checkpoint.checkpoint(block, x, rope_offset, is_eos, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(block, x, rope_offset, is_eos, sample_id,
+                                                      use_reentrant=False)
             else:
-                x = block(x, rope_offset=rope_offset, is_eos=is_eos)
+                x = block(x, rope_offset=rope_offset, is_eos=is_eos, sample_id=sample_id)
         if self.config.use_mhc:
             # 4 流均值回到 1 流，再给 ln_f / lm_head（V4 用可学习合并，这里用均值简化）
             x = x.mean(dim=2)
@@ -193,7 +199,8 @@ class GPT(nn.Module):
                 loss = loss + moe_loss
             if self.config.use_mtp:
                 # 多 token 预测：额外预测 t+2、t+3...，按权重加进总损失
-                loss = loss + self.config.mtp_weight * self._compute_mtp_loss(x, targets, is_eos=is_eos)
+                loss = loss + self.config.mtp_weight * self._compute_mtp_loss(
+                    x, targets, is_eos=is_eos, sample_id=sample_id)
             if self.config.use_lightning_indexer:
                 # Lightning Indexer 辅助损失：让 indexer 的选块分布逼近真实注意力分布
                 # （权重 0.01，作为辅助信号，不喧宾夺主）
@@ -210,7 +217,7 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def _forward_byte(self, idx, targets, rope_offset=0):
+    def _forward_byte(self, idx, targets, rope_offset=0, sample_id=None):
         """字节直入 + 3:1 可学习聚合（dev-notes/48，Mamba-Byte 思想）。
 
         idx: (B, 3T) 字节 id（0-256，256=<eos>）；byte_agg 把 3 字节 → 1 token
@@ -231,7 +238,7 @@ class GPT(nn.Module):
             # mHC：4 个残差流（与主 forward 一致）
             x = x.unsqueeze(2).expand(b, x.size(1), self.config.hc_mult, self.config.n_embd)
         for block in self.transformer.h:
-            x = block(x, rope_offset=rope_offset)
+            x = block(x, rope_offset=rope_offset, sample_id=sample_id)
         if self.config.use_mhc:
             x = x.mean(dim=2)
         x = self.transformer.ln_f(x)
@@ -287,7 +294,7 @@ class GPT(nn.Module):
         for i, s in states.items():
             self.transformer.h[i].attn.set_mem_state(s)
 
-    def _compute_mtp_loss(self, x, targets, is_eos=None):
+    def _compute_mtp_loss(self, x, targets, is_eos=None, sample_id=None):
         """MTP 损失：第 k 个模块用「位置 t 的隐藏状态 + 目标 t+k+1 的嵌入」预测 t+k+2。
         x: (B, T, n_embd) 主模型 ln_f 的输出；targets: (B, T) 训练目标（即 t+1 的正确答案）。
         """
@@ -311,7 +318,9 @@ class GPT(nn.Module):
             next_emb = self.get_token_emb(safe_targets[:, off : off+length])       # (B, len, C)
             mtp_targets = targets[:, off+1 : off+1+length]                      # (B, len)
             is_eos_mtp = is_eos[:, off : off+length] if is_eos is not None else None
-            h = self.mtp_modules[k](hidden, next_emb, is_eos=is_eos_mtp)       # (B, len, C)
+            sample_id_mtp = sample_id[:, off : off+length] if sample_id is not None else None
+            h = self.mtp_modules[k](hidden, next_emb, is_eos=is_eos_mtp,
+                                    sample_id=sample_id_mtp)                    # (B, len, C)
             logits = self.compute_logits(h)
             mtp_loss = mtp_loss + F.cross_entropy(
                 logits.view(-1, logits.size(-1)), mtp_targets.reshape(-1), ignore_index=-100)
