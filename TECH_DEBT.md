@@ -9,12 +9,13 @@
 
 ## 1. 本轮已偿还
 
-### 1.1 建立了单元测试（0 → 289 条）
+### 1.1 建立了单元测试（0 → 数百条）
 
 ```bash
-uv run pytest          # 289 条，跳过 slow 时 < 1 秒跑完
-uv run pytest -m 'not slow'
+.venv/bin/python -m pytest -q -m 'not slow'   # 全绿；跳过 slow 时 < 1 秒跑完
 ```
+⚠️ 用 `.venv/bin/python`，**不要** `uv run`（会另解析一套环境，见 `PROJECT_STATE §11.1`）。
+⚠️ 条数不写死（会过期）。
 
 覆盖面与**每条为什么值得测**见 `tests/README.md`。重点不是数量，而是：
 
@@ -117,14 +118,16 @@ uv run pytest -m 'not slow'
 库表 2~3GB）还要占盘。**这是一个"跑得越久越危险"的隐性故障**，不修的话
 最坏情况是跑到第 60k 步时 `OSError: No space left on device` 杀死 2.7 天的训练。
 
-**修法**：
+**修法**（⚠ 这一节记的是**第一版**做法，已被 §1.8 取代，保留以见演进）：
 - `training/checkpoints.py` —— 纯函数 `prune_step_checkpoints(out_dir, keep)`，
-  只保留最近 `keep` 个；`training/train.py` 记完归档就调它，`keep` 取自
-  `getattr(config, 'keep_step_ckpts', 5)`（**故意不用模块级全局**，避开配置快照陷阱）。
-- `tests/test_checkpoints.py` —— **11 条单测**。这块代码**会删文件**，写错就是数据丢失，
+  只保留最近 `keep` 个；`training/train.py` 记完归档就调它。
+  ⚠ 第一版写的 `getattr(config, 'keep_step_ckpts', 5)` 其实是个**死旋钮**
+  （该全局从未定义在 `config_keys` 之前 ⇒ 永远是 5），已在 §1.8 修正。
+  ⚠ "只留最近 N 个"这个策略本身也有副作用，也已在 §1.8 换成稀疏保留。
+- `tests/test_checkpoints.py` —— 单测。这块代码**会删文件**，写错就是数据丢失，
   所以必须离线覆盖，不能只靠"起一次真训练看看"。
-- `scripts/prune_ckpts.sh` —— 外部稀疏化（每 5000 步留一个 + 最新 2 个），
-  专治**当前已在跑的旧代码进程**（改代码对它无效）。已挂进巡检命令，幂等。
+- `scripts/prune_ckpts.sh` —— 外部稀疏化，专治**当时已在跑的旧代码进程**。
+  ⚠ 它依赖巡检看守调用，而看守会被会话重启杀掉（§1.9）⇒ 已不再可靠，见 §1.8。
 
 **★ 关键回归点（写进测试）**：必须按**整数步号**排序，不能按文件名字典序 ——
 字典序下 `ckpt_step_9000.pt > ckpt_step_10000.pt`（`'9' > '1'`），
@@ -133,6 +136,160 @@ uv run pytest -m 'not slow'
 
 **通用教训**：长期训练的资源消耗要**按"最坏情况 × 总时长"算一遍**，
 而不是看"现在还剩多少"。以及：**巡检时顺手看一眼 `df`，成本近乎为零。**
+
+### 1.8 保留/清理策略从外部搬进训练内部（2026-09-11 晚）
+
+**症状 A —— `results.csv` 续训被清空**：`train.py` 无条件用 `'w'` 打开它，
+暂停在 step 22000 后重启，967 字节（22 行评估记录）→ **0 字节**，无任何提示。
+**症状 B —— 两个清理策略互相打架**：训练内"只留最新 5 个" vs 外部
+`prune_ckpts.sh`"每 5000 步留一个"。前者会在 step 25000 之后把
+`ckpt_step_5000/10000/15000` 这些**阶段回溯点**当旧文件删掉。
+**症状 C —— 外部清理靠不住**：它由巡检看守调用，而看守会在会话重启时被
+SIGKILL（见 §1.9）⇒ 清理实际没跑，而文档以为在跑。
+
+**修法（唯一实现 + 内置）**：
+- `training/checkpoints.py` 新增 `steps_to_keep` 作为**唯一决策函数**
+  （每 `sparse_every` 步留一个 + 最新 `newest_keep` 个；两条规则都关时**直接抛错**，
+  因为那等于"删光全部归档"，绝不该是任何人的意图）。
+  `prune_step_checkpoints` 退化为 `sparse_every=0` 的薄包装，旧测试全绿。
+- `train.py` 每次存档后调用 `prune_step_checkpoints_sparse`，并把**保留了什么步号**
+  打进 tqdm 日志（看不见的策略等于没有策略）。策略异常被 try/except 吞掉 ——
+  **清理绝不允许有能力搞崩训练**。
+- `scripts/prune_ckpts.sh` 退化成 `python -m training.checkpoints` 的薄包装，
+  shell 与 Python 不再各有一份实现。
+- `training/run_logs.py` 新增续写策略：`resuming` + 文件非空 ⇒ **追加且不重写表头**；
+  0 字节文件（上次启动被 SIGKILL 的残留）⇒ 当作新建。`results.csv` / `ndb.csv` 都改用它。
+- 顺带修掉一个**死旋钮**：旧代码写 `getattr(config, 'keep_step_ckpts', 5)`，
+  但 `keep_step_ckpts` **从未**被定义为 `config_keys` 快照之前的全局
+  ⇒ `load_config` 不会覆盖它、`config` 里也没这个键 ⇒ 该旋钮**永远是 5**，
+  在 yaml 里设了也没用。新键 `ckpt_sparse_every` / `ckpt_newest_keep`
+  定义在快照之前，是真的可覆盖。
+
+**测试**：`tests/test_checkpoints.py`（20 条，含"step 25000 不得删掉 5000/10000/15000"的
+回归）、`tests/test_run_logs.py`（9 条）。
+端到端也验过：连跑两次（scratch → resume），`results.csv` 从 3 行变 5 行、旧行保留、表头唯一。
+
+### 1.9 长跑被会话重启 SIGKILL —— 改用 systemd 用户单元（2026-09-11 晚）
+
+**症状**：23:18 用 `setsid nohup ... & disown` 启动训练，23:22 训练**凭空消失**。
+日志无 traceback、无 OOM，内核无 OOM 记录，系统内存还剩 12G 可用。
+`journalctl` 里找到真凶：
+```
+dsh-subprocess-14240-<hash>.scope: Killed unit cgroup '...' with SIGKILL on client request.
+```
+**根因**：harness 每次工具调用建一个 systemd scope；**会话重启会 SIGKILL 整条 cgroup**。
+`setsid` 只脱离会话/tty，**脱离不了 cgroup** ⇒ 照死。看守进程同样死。
+
+**修法**：改用 `systemd-run --user --unit=<name> --collect ...`，
+它建**独立的用户单元**（`/user.slice/.../app.slice/<name>.service`），不在 dsh 的 scope 里。
+已实测：重启训练 + 看守后，两者 cgroup 与当前 dsh scope 完全不同。
+命令固化在 `PROJECT_STATE §0.4`，纪律固化在 `AGENTS.md` 铁律 0 / `PROJECT_STATE §8` 铁律 0。
+
+**通用教训**：**"后台"不等于"持久"**。判断一个后台任务能否活过宿主的生命周期，
+要看它落在哪个 **cgroup/unit**，而不是看有没有 `nohup`/`setsid`。
+
+### 1.10 `out/` 老实验清理（只删派生物，留证据）
+
+`out/` 曾有 120+ 个实验目录、78.6 GB。实测体积构成：`.pt` 74.06 GB（94.2%）、
+`.npz` 4.50 GB（5.7%）、**其余全部（.log/.json/.csv/.png）只有 35 MB（0.04%）**。
+⇒ 整目录删会连结论一起丢；只删 `.pt`/`.npz` 能释放 98% 空间、丢 0 条结论。
+
+已清理 **72.51 GB**（`out/` 78.6G → 6.1G，磁盘可用 64G → 112G），
+保留 `base_v2`（当前 run）与 `nanoseek_100m`（v1 基座，§0.5.6 配对比较要用）的权重，
+并生成 `out/CLEANUP_MANIFEST.md` 记录每个目录删了什么。
+工具：`scripts/cleanup_out.py`（默认 dry-run，`--apply` 才删）。
+
+### 1.11 文档里残留的 `setsid nohup` 启动命令 + 已退役的"守夜人"仍在被推荐（2026-09-11 晚）
+
+**问题**：§0.4 已改成 `systemd-run --user`（铁律 0），但**另外两处没跟着改**：
+
+1. `PROJECT_STATE §5` 的**两阶段命令块**（阶段一启动、65000 暂停看守、阶段二退火）
+   仍写着 `setsid nohup ... & disown`。这是**最危险的一处** ——
+   阶段二的对话退火命令会被照着抄，而按铁律 0，那样起的训练**会话一重启就被 SIGKILL**。
+2. `PROJECT_STATE §0.1` 把 `scripts/ckpt_janitor.sh` 称作「★ 守夜人」并推荐启动，
+   而它的启动说明同样是 `setsid nohup`；更根本的是**它的职责已被铁律 11 取消**
+   （保留策略搬进了训练内部，每次归档落盘就地稀疏化），
+   留着一个"会被误当成第二道防线"的进程本身就是负资产。
+
+同批修掉的过期内容：`§0.4` 里重复粘贴了两遍的「前提」段落；
+`§5` 里写死的旧 PID（`297961`，每次续训都会变）；`§0.1` 里"当前这个运行进程是旧代码"、
+"`keep_step_ckpts` 默认 5"（那是已修的死旋钮）；「恢复上下文三件事」里的
+`pgrep -f "training/train.py configs/base_v2"`（**这个模式字面量会匹配到执行它的 shell 自己**，
+正是铁律 4 的坑）与写死的测试条数。
+
+**已修**：
+- `§5` 两阶段命令全部改为 `systemd-run --user`（单元名 `nanoseek-base-v2` /
+  `nanoseek-pause-65000` / `nanoseek-base-v2-p2`），并补上阶段二启动前的**顺序自检**
+  （阶段一单元必须 `inactive`，否则两个训练抢同一张卡与同一个 `out_dir`）。
+- `ckpt_janitor.sh` 改为**拒绝运行的退役桩**（打印退役理由 + 替代命令，`exit 64`），
+  而不是只加注释 —— 注释挡不住复制粘贴，退出码挡得住。
+- `§0.1` 写明退役记录与两条理由；`§0.4` 去重；"三件事"改用
+  `systemctl --user is-active`（既不会自我匹配，也不依赖会变的 PID）。
+
+**教训（写进 `AGENTS.md` 判据）**：改掉一条铁律后，必须**全文 grep 那条旧写法**，
+而不是只改你当时看到的那一处 —— 一处旧命令留在文档里，比整篇没写更危险，
+因为它带着"这是本项目认可的做法"的权威。
+
+---
+
+### 1.12 归档清理报的「释放 XMB」**恒为 0**（2026-09-12 巡检发现并修复）
+
+**症状**：巡检日志出现 `删除 1 个，释放 0MB`。看着像"文件是空的"或"只是硬链接"，
+实际那个 `ckpt_step_21000.pt` 是 **0.59 GiB**。
+
+**根因**：`training/checkpoints.py` 的 `main()` 先调 `_remove()` 删文件，
+**删完再**对同一批文件名做 `os.path.getsize()` → 每个都 `OSError` → 被
+`except OSError: pass` 吞掉 → `freed` 永远是 0。
+
+```python
+removed = _remove(out_dir, doomed)          # 文件在这里已经没了
+for name in removed:
+    try: freed += os.path.getsize(...)      # ← 必然抛 OSError，恒加 0
+    except OSError: pass
+```
+
+**为什么这么久没被发现**：这是个**"测量函数自己坏了"**的 bug —— 它的输出是 0，
+而 0 恰好等于"没有可删对象"时的正确输出，所以**两种情况长得一模一样**。
+只有拿**已知答案的输入**当对照才会暴露（`AGENTS.md` §5.4 的同一条纪律）。
+
+**已修**：大小在**删除之前**采集，`dry-run` 也报告"将会释放"多少。
+新增 3 条测试，其中一条是**对照**（无可删对象时必须仍报 0，不能把"算不出"包装成"释放很多"），
+另两条断言报告的 MB 数与磁盘上真实减少的字节数**相等**。
+
+**过程中顺带验证了纪律有效性**：我第一版测试的期望值写错了（把 `newest_keep=1` 下
+只删 1 个写成了删 2 个），**是测试先失败、暴露出我的期望错了，而不是代码错了** ——
+这正是"先拿已知答案的输入跑一遍"该有的效果。修正期望后全绿。
+
+---
+
+### 1.13 对话自然度评估的两个入口对 v2 语料误配（2026-09-13 评审时发现并修复）
+
+**症状**（三个叠在一起，都让"对话自然度"测不准）：
+
+1. `eval_multiturn.py` 的 prompt **和**轮次判定都写死 `用户：/模型：`（v1 约定）。
+   评 v2 基座（语料是 `A：/B：`）时是**喂 OOD 输入**；而且模型自己开的 `A：` 轮次
+   **不计入**「自开轮次率」→ 该指标恒 0%，把"会开轮次"误报成"不会"。
+2. `sample_py.py::_truncate_at_turn`（`stop_on_turn` 的唯一实现）同样只认两套 v1 标签，
+   v2 模型自己开 `\nA：/\nB：` 时**检测不到** → 截断不触发：`chat.py` 表现为"收不住"，
+   评估里回复一路顶到 `max_new_tokens`。
+3. `eval_multiturn` 的「EOS率」用 `eos_pos != -1` 统计，而它传的是
+   `stop_on_eos=False` —— 那条路径下 `<eos>` **根本不置** `eos_pos`，
+   于是统计到的其实是**轮次截断**。step 20000 那份报「EOS率 100%」就是这么来的。
+
+**已修**：
+
+* `sample_py.TURN_MARKERS = ("\n用户：", "\n模型：", "\nA：", "\nB：", "\nUser:", "\nModel:")`，
+  `_truncate_at_turn` 与逐步 tail 检测统一用它（`A：/B：` 必须带换行前缀，避免英文 `A:` 误判）。
+* `eval_multiturn` 增加 `--style`（默认 `ab`，与 `eval_dialogue.py` 同一约定），
+  prompt 由 `build_scenarios(style)` 生成；停止原因改用 `stop_kind_ref`，
+  汇总拆成 **收尾率 / 自开轮次率 / 收不住率**，不再用文本里有没有标签去猜。
+
+**对照（已知答案的输入，`AGENTS.md` §5.4）**：v2 自开 `A：`、v1 自开 `模型：` 都必须截断；
+行内 `Option A: ...` 与**无换行**的 `这是A：标记` 都必须不截断 —— 四条全过。
+
+**为什么当初漏了**：9-11 的 P1 只修了 `eval_dialogue.py` 这**一个**入口
+（见 §"已偿还"那条），而 `sample_py` 的轮次标签、`eval_multiturn` 的 prompt 都还在用
+v1 约定 —— **同一类缺陷有几个入口，就得逐个改**，改一个不等于改一类。
 
 ---
 
@@ -164,17 +321,27 @@ uv run pytest -m 'not slow'
 (b) 对话模型：改名义配比，把 c4_zh/wikipedia 的权重让给对话源。
 **证据**：全库逐来源终止符精确计数（`c4_zh` = 0）+ 拒绝采样后的实际来源分布。
 
-### P1 — `eval_dialogue.py` 的提示词是「用户：/模型：」格式，v2 语料已去标签
+### ✅ 已偿还（2026-09-11 晚）—— `eval_dialogue.py` 的提示词格式
 
-**位置**：`inference/scripts/eval_dialogue.py` 的 `DIALOGUE_PROMPTS`。
-**代价**：v2 语料已改成 `A：`/`B：`、且项目整体删掉了 `用户：/模型：` 标签
-（dev-notes/61）。用旧格式 prompt 评 v2 模型 → 输入 OOD，`turns` 指标
-**三个模型全是 0.0**，看起来像"碎片拼贴"其实只是提示词不匹配；
-更糟的是 **v1 基座是在带标签语料上训的，在这套 prompt 上有主场优势**，
-所以 `d1/d2` 那一列**不能用来比较 v1 与 v2**（会得出反向结论）。
-**动作**：把 prompt 集按语料实际格式（`A：`/`B：`，或裸文本）参数化，
-或至少加一组去标签 prompt 并分开报告；顺带把"提示词格式必须与语料一致"写进
-指标说明。
+**原症状**：`DIALOGUE_PROMPTS` 写死「用户：/模型：」，而 v2 语料早已去标签改成 `A：`/`B：`
+（dev-notes/61）。后果全是静默的：`turns` **三个模型全是 0.0**（看着像"碎片拼贴"，
+其实只是提示词不匹配），而且 **v1 基座在旧标签上有主场优势**，
+`d1/d2` 那一列拿去比 v1/v2 **会得出反向结论**。
+
+**修法**：
+- `PROMPT_STYLES = {'ab': [...], 'user-model': [...]}`，`--style` 显式选择，
+  **默认 `ab`**（v2 主线）；评 v1 及更早显式 `--style=user-model`。
+- `dialogue_turn_structure()` 改成**同时识别两套约定**，并返回 `style_detected`：
+  这样既能兼容新旧模型，也能发现**格式漂移**（用 `A：` 提示却生成 `用户：`）。
+  顺带修掉一个旧逻辑错误：旧实现 `user+model >= 2 and has_model` 会把
+  "`B：` 刷屏"这种**单侧复读**误判成"有轮次结构"；现在要求两侧各至少出现一次。
+- 命令行会打印 `样式=X(给了 Y)`，不一致时直接打警告。
+
+**测试**：`tests/test_eval_dialogue_prompts.py`（10 条），含"默认样式必须是 ab"、
+"两套样式不得串味"、"单侧复读不算结构"、"格式漂移可见"等回归。
+
+**仍成立的告诫**：真要比较 v1/v2，**不要**用本脚本的 d1/d2 —— 用**配对 CE**
+（`scripts/ckpt_paired_eval.py`），CE 只吃 token，不受标签格式影响。
 **证据**：`out/eval_dialogue.log`（2026-09-11）。
 
 ### P2 — `inference/scripts/*` 只认 `out_dir/best.pt`，评不了任意 checkpoint
@@ -185,6 +352,20 @@ uv run pytest -m 'not slow'
 **噪声选出来的**（`PROJECT_STATE §0.5.4`），所以"评估工具默认评 best.pt"
 这件事本身就在**推荐用噪声点**。
 **动作**：加 `--ckpt <path>` / `--ckpt-name` 参数，默认仍 best.pt 但允许覆盖。
+
+
+### P2 — 训练摘要框写「续训自动从 best.pt 恢复」，与代码相反（会误导重启决策）
+
+**位置**：`training/train.py` 的 `print_summary()` 里
+`"last.pt（最新）· 续训自动从 best.pt 恢复"`。
+**实际**：`train.py:536-538` 是 **`last.pt` 优先**，只有 `last.pt` 不存在才回退 `best.pt`：
+```python
+ckpt_path = last_path if os.path.exists(last_path) else best_path
+```
+**代价**：`best.pt` 是**噪声选出来的**（§0.5.4：step 20000 的 1.6432 是 2.31σ 好运，
+而 `last.pt` 是 22000）。如果有人信了这句摘要，会以为"续训会退到 20000"，
+从而做出错误的重启安排（或反过来，以为能用 best.pt 挑便宜）。
+**动作**：把摘要框那半句改成 `last.pt 优先，缺失才回退 best.pt`。
 
 
 ### P0 — `training/train.py` 仍是 1466 行的模块级脚本
@@ -293,11 +474,24 @@ ruff check --select F841 --output-format concise   # 27 处，逐个看，可能
 
 ### P3 — 无 CI / 无 pre-commit
 
-**代价**：289 条测试和 lint 门禁目前只能靠人记得跑。
+**代价**：测试和 lint 门禁目前只能靠人记得跑。（条数不写死在这里 —— 写死的数字会过期，
+`AGENTS.md §11` 给的是命令。）
 
-**建议动作**：加一个 `scripts/check.sh`（`ruff check && pytest -q`），
+**建议动作**：加一个 `scripts/check.sh`（`ruff check && pytest -q -m 'not slow'`），
 再考虑 `.pre-commit-config.yaml`。本机是单机开发，CI 不是必需，
 但"一条命令跑完所有检查"应该有。
+
+### P3 — `results.csv` 的 `time` 列会随每次续训归零
+
+**位置**：`training/train.py` 的 `train_start`（`time.time()`）。
+**现象**（[实测] 2026-09-12）：`results.csv` 里 `22000` 那行 `time=75120.0`，
+续训后 `23000` 那行 `time=3480.0`。`time` 只是**本进程内**的累计秒数。
+**代价**：低。它只被当作进度参考，不影响任何决策（MFU 是单独一列）。
+但有人若想"用最后一行的 time 减去第一行"算总训练时长，会得到**严重偏小**的数。
+**已做的缓解**：在 `train.py` 那一行加注释写明"续训会归零、只能用相邻差值"。
+**建议动作**：续训时读 `results.csv` 最后一行的 `time` 作为偏移量累加。
+需要 `training/run_logs.py` 加一个 `last_csv_row()`（现有 `count_csv_rows` 是同一类工具），
+改完按铁律 7 跑冒烟。
 
 ---
 
