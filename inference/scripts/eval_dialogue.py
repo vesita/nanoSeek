@@ -28,15 +28,45 @@ import torch
 from inference.scripts.sample_py import build_model_from_checkpoint, generate_ids, load_tokenizer
 
 # 统一评估用的一批对话 prompt（覆盖寒暄/问询/情绪/建议等不同对话意图，模拟真实对话开场）
-DIALOGUE_PROMPTS = [
-    "用户：你好\n模型：",
-    "用户：最近工作压力好大，怎么办啊？\n模型：",
-    "用户：帮我推荐一本小说吧。\n模型：",
-    "用户：你觉得人生最重要的是什么？\n模型：",
-    # 真实数据里的对话风格更多是口语短轮次，这里加两个贴近语料的
-    "用户：吃了没\n模型：",
-    "用户：好想出去玩\n模型：",
-]
+#
+# ★ 2026-09-11 修（TECH_DEBT P1）：**prompt 的格式必须和模型训练语料一致**，
+#   否则等于喂 OOD 输入 —— 表现为 `turns` 假性全 0，而且会在新旧模型之间
+#   产生**虚假的主场优势**（谁见过这套标签谁占便宜），足以把结论评反。
+#   * v2 语料（dev-notes/61 去标签后）用 `A：` / `B：` —— 已实测确认
+#   * v1 及更早的基座用 `用户：` / `模型：`
+#   ⇒ 用 `--style` 显式声明，**别混着眼**。
+#   ⚠ 真要比较 v1 / v2，**不要**用本脚本的 d1/d2（见 `PROJECT_STATE §0.5.5`），
+#     要用**配对 CE**（`scripts/ckpt_paired_eval.py`）—— CE 只吃 token，不受标签格式影响。
+PROMPT_STYLES = {
+    # v2 主线（当前）
+    'ab': [
+        "A：你好\nB：",
+        "A：最近工作压力好大，怎么办啊？\nB：",
+        "A：帮我推荐一本小说吧。\nB：",
+        "A：你觉得人生最重要的是什么？\nB：",
+        # 真实数据里的对话风格更多是口语短轮次，这里加两个贴近语料的
+        "A：吃了没\nB：",
+        "A：好想出去玩\nB：",
+    ],
+    # v1 及更早（带「用户：/模型：」标签，prompt 里不该带引号，语料也没有）
+    'user-model': [
+        "用户：你好\n模型：",
+        "用户：最近工作压力好大，怎么办啊？\n模型：",
+        "用户：帮我推荐一本小说吧。\n模型：",
+        "用户：你觉得人生最重要的是什么？\n模型：",
+        "用户：吃了没\n模型：",
+        "用户：好想出去玩\n模型：",
+    ],
+}
+DEFAULT_STYLE = 'ab'
+DIALOGUE_PROMPTS = PROMPT_STYLES[DEFAULT_STYLE]
+
+# 各套对话约定下的「轮次标记」。识别时**同时看两套** —— 这样既能兼容新旧模型，
+# 也能顺带发现"格式漂移"（用 A：提示、却生成 用户：）。
+TURN_MARKERS = {
+    'ab': ('A', 'B'),
+    'user-model': ('用户', '模型'),
+}
 
 MAX_NEW_TOKENS = 200
 TEMPERATURE = 0.8
@@ -83,21 +113,35 @@ def distinct_n(s: str, n: int) -> float:
 
 
 def dialogue_turn_structure(s: str) -> dict:
-    """检查是否形成『用户/模型』交替的对话轮次结构（碎片拼贴的反面）。"""
+    """检查是否形成『交替的对话轮次』结构（碎片拼贴的反面）。
+
+    ★ 2026-09-11：**同时识别两套约定**（`A：/B：` 与 `用户：/模型：`），而不是只看一套。
+    理由：
+      1. 模型可能"格式漂移"—— 用 `A：` 提示却生成 `用户：`。只看一套会把它误判成
+         "完全没有轮次结构"，而真相恰恰相反（结构对，只是标签换了）。
+      2. 这样本函数不需要知道调用方用了哪套 prompt，少一个出错面。
+    `style_detected` 会告诉我们实际命中哪一套，用于观察漂移。
+    """
     clean = unify_ws(s)
-    user_turns = len(re.findall(r"用户[:：]", clean))
-    model_turns = len(re.findall(r"模型[:：]", clean))
-    # 是否有『模型开头』且形成一定轮次
-    has_model = "模型" in clean or "model" in clean.lower()
+    counts = {name: len(re.findall(rf"{u}[:：]", clean))
+              for name, (u, m) in TURN_MARKERS.items()}
+    turns = {name: len(re.findall(rf"{m}[:：]", clean))
+             for name, (u, m) in TURN_MARKERS.items()}
+    total = {k: counts[k] + turns[k] for k in counts}
+    best = max(total, key=lambda k: total[k]) if total else 'ab'
+    # 交替结构：两侧至少各出现一次，才算真的形成了轮次（单侧重复不算）
+    has_structure = any(counts[k] >= 1 and turns[k] >= 1 for k in counts)
     return {
-        "user_turns": user_turns,
-        "model_turns": model_turns,
-        "turns": max(user_turns, model_turns),
-        "has_structure": user_turns + model_turns >= 2 and has_model,
+        "user_turns": counts[best],
+        "model_turns": turns[best],
+        "turns": max(counts[best], turns[best]),
+        "has_structure": has_structure,
+        "style_detected": best if total.get(best, 0) > 0 else "none",
     }
 
 
-def evaluate_one(model, tok, out_dir: str) -> dict:
+def evaluate_one(model, tok, out_dir: str, prompts: list[str] | None = None) -> dict:
+    prompts = DIALOGUE_PROMPTS if prompts is None else prompts
     torch.manual_seed(SEED)
     torch.cuda.manual_seed(SEED)
     all_text = ""
@@ -107,8 +151,9 @@ def evaluate_one(model, tok, out_dir: str) -> dict:
     ws = 0.0
     d1 = d2 = 0.0
     turns_struct = 0
+    styles_seen: Counter = Counter()
     all_prompt_samples = []
-    for p in DIALOGUE_PROMPTS:
+    for p in prompts:
         n_prompts += 1
         # dev-notes/61：新字级模型支持 <cont> 待续停止，避免吐出 <cont> 后继续自说自话
         gen_ids, _ = generate_ids(model, tok, p, MAX_NEW_TOKENS, TEMPERATURE, TOP_K,
@@ -124,6 +169,7 @@ def evaluate_one(model, tok, out_dir: str) -> dict:
         d2 += distinct_n(text, 2)
         ts = dialogue_turn_structure(text)
         turns_struct += ts["turns"]
+        styles_seen[ts["style_detected"]] += 1
         all_prompt_samples.append(text)
     n = n_prompts
     return {
@@ -136,6 +182,8 @@ def evaluate_one(model, tok, out_dir: str) -> dict:
         "distinct1": round(d1 / n, 4),
         "distinct2": round(d2 / n, 4),
         "turn_structure": round(turns_struct / n, 1),
+        # 生成文本实际命中的对话约定（用于发现"用 A：提示、却生成 用户："的格式漂移）
+        "style_detected": styles_seen.most_common(1)[0][0] if styles_seen else "none",
         "samples": all_prompt_samples,
     }
 
@@ -148,7 +196,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dirs", nargs="*", default=None,
                     help="要评估的 out/ 子目录；默认 = 新的两臂 + 已有全部")
+    ap.add_argument("--style", choices=sorted(PROMPT_STYLES), default=DEFAULT_STYLE,
+                    help="prompt 的对话标签格式 **必须和模型训练语料一致**（默认 ab = v2 主线）。"
+                         "ab = `A：/B：`（v2 起）；user-model = `用户：/模型：`（v1 及更早）。"
+                         "选错 = 喂 OOD 输入，turns 会假性归零（TECH_DEBT「已偿还」那条）")
     a = ap.parse_args()
+    prompts = PROMPT_STYLES[a.style]
 
     default_dirs = [
         # 当前默认模型（v0.2 定版；历史实验在 out/archive/，缺失的自动跳过）
@@ -171,17 +224,19 @@ def main():
             print(f"   原因: {type(e).__name__}: {str(e)[:120]}")
             continue
         print(f"\n=== 评估 {d} ===")
-        r = evaluate_one(model, tok, d)
+        r = evaluate_one(model, tok, d, prompts)
         results.append(r)
         # 打印指标 + 一条代表样本
         print(f"  avg_len={r['avg_len_tokens']} rep2={r['rep2']} rep3={r['rep3']} "
               f"rep4={r['rep4']} ws={r['ws_ratio']} d1={r['distinct1']} d2={r['distinct2']} "
-              f"turns={r['turn_structure']}")
+              f"turns={r['turn_structure']} 样式={r['style_detected']}(给了 {a.style})")
+        if r['style_detected'] not in (a.style, 'none'):
+            print(f"  ⚠ 格式漂移：用 {a.style} 提示、却生成了 {r['style_detected']} 约定")
         print(f"  模型配置: mhc={ckpt['model_args'].get('use_mhc')} "
               f"lse={ckpt['model_args'].get('use_lse_residual')} "
               f"no_attn_layers={ckpt['model_args'].get('no_attn_layers')} "
               f"block_order={ckpt['model_args'].get('block_order')}")
-        print(f"  [代表样本] prompt={DIALOGUE_PROMPTS[0]!r}")
+        print(f"  [代表样本] prompt={prompts[0]!r}")
         print(f"    → {r['samples'][0][:150]}")
 
     # 汇总表

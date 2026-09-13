@@ -84,16 +84,25 @@ def load_tokenizer(ckpt):
     return Tokenizer.from_file("data/chinese/tokenizer.json")
 
 
-def _truncate_at_turn(gen_ids, tok, byte_mode=False):
-    """生成内容里出现下一轮标签（\n用户：/\n模型：）→ 截断到标签之前（治喋喋不休）。
+# 轮次标签 = 换行 + 说话人。★ 必须同时覆盖两套约定（2026-09-13 修）：
+#   `用户：/模型：` = v1 及更早；`A：/B：` = v2 起（PROJECT_STATE §5）。
+# 只认一套的实测后果：v2 基座自己开 `\nA：\nB：` 轮次时检测不到 →
+#   * stop_on_turn 永不触发，回复一路顶到 max_new_tokens（chat.py 表现为「收不住」）
+#   * eval_multiturn 的「自开轮次率」恒为 0%（漏报模型其实会开轮次）
+# `A：`/`B：` 必须带换行前缀，避免英文正文里的 `A:` 误判。
+TURN_MARKERS = ("\n用户：", "\n模型：", "\nA：", "\nB：", "\nUser:", "\nModel:")
 
-    模型学会对话骨架后常自己续写"用户：…"，这是天然轮次边界：话已说"完"才开下一轮。
+
+def _truncate_at_turn(gen_ids, tok, byte_mode=False):
+    """生成内容里出现下一轮标签（见 TURN_MARKERS）→ 截断到标签之前（治喋喋不休）。
+
+    模型学会对话骨架后常自己续写"用户：…"/"A：…"，这是天然轮次边界：话已说"完"才开下一轮。
     在字符层找标签位置，再回退到最近的 token 边界（BPE 标签可能跨 token）。
     字节模式（byte_mode）：标签按 UTF-8 字节序列在字节流里精确匹配（无跨 token 问题，
     decode 前缀长度匹配退化为字节索引直接截断）。
     """
     if byte_mode:
-        for marker in ("\n用户：", "\n模型：", "\nUser:", "\nModel:"):
+        for marker in TURN_MARKERS:
             mb = list(marker.encode("utf-8"))
             n = len(mb)
             for j in range(len(gen_ids) - n + 1):
@@ -101,7 +110,7 @@ def _truncate_at_turn(gen_ids, tok, byte_mode=False):
                     return gen_ids[:j], True
         return gen_ids, False
     text = tok.decode(gen_ids)
-    for marker in ("\n用户：", "\n模型：", "\nUser:", "\nModel:"):
+    for marker in TURN_MARKERS:
         pos = text.find(marker)
         if pos >= 0:
             if pos == 0:
@@ -245,7 +254,7 @@ def generate_ids(model, tok, prompt, max_new_tokens, temperature, top_k, repeat_
                 tail = tok.decode(gen_ids[-48:])   # 48 字节 ≈ 16 字（字节模式放宽窗口）
             else:
                 tail = tok.decode(gen_ids[-16:])
-            if any(m in tail for m in ("\n用户：", "\n模型：", "\nUser:", "\nModel:")):
+            if any(m in tail for m in TURN_MARKERS):
                 truncated, hit = _truncate_at_turn(gen_ids, tok, byte_mode=byte_mode)
                 if hit:
                     keep = torch.tensor([truncated], dtype=torch.long, device=idx.device)

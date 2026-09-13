@@ -2,16 +2,24 @@
 """多轮对话压力测试：终结符（EOS）+ 多轮崩溃检测。
 
 针对项目反复记录的失败模式：
-  1. 终结符：模型有没有学会在回复结束时吐 <eos>（turn-level EOS 训练的目标，
+  1. 终结符：模型有没有学会在回复结束时吐 <eos>/<cont>（turn-level 训练的目标，
      dev-notes/26：自吐终止符才算学会"话说完"）；不吐 = 回复收不住、上下文越滚越长。
   2. 多轮崩溃：连续追问 N 轮后是否退化——回复变极短/变长失控、重复率飙升、
      上下文越长越崩（重复坍缩、碎片的累积效应）。
-  3. 轮次结构：回复里是否自己重开 用户：/模型： 轮次（碎片拼贴的反面）。
+  3. 轮次结构：回复里是否自己开了下一轮（碎片拼贴的反面）。
 
-用 generate_ids 的 token 级结果（eos_pos / 轮次截断），不依赖字符串检测。
+用 generate_ids 的 token 级结果（stop_kind / 轮次截断），不依赖字符串检测。
+
+★ 2026-09-13 修（上一版测不了 v2 基座，实测踩过）：
+  * prompt 标签写死成 `用户：/模型：`（v1 约定）→ 评 v2（`A：/B：`）时喂 OOD 输入。
+    现在用 `--style` 显式声明，**默认 ab = v2 主线**（与 eval_dialogue.py 同一约定）。
+  * 「EOS率」以前用 `eos_pos != -1` 统计，而那时 `stop_on_eos=False` —— 该路径下
+    <eos> 根本不置 eos_pos，统计到的其实是**轮次截断**（step 20000 那份报 100%
+    就是这么来的）。现在打开 stop_on_eos/stop_on_cont，并用 stop_kind_ref 把
+    eos / cont / turn / maxlen 分开统计。
 
 用法（从项目根目录）：
-    uv run python inference/scripts/eval_multiturn.py --dirs out/obs_zh_base out/obs_zh_mem
+    .venv/bin/python inference/scripts/eval_multiturn.py --dirs out/xxx --style ab
 """
 import argparse
 import sys
@@ -31,18 +39,29 @@ REPEAT_PENALTY = 1.2
 SEED = 1337
 N_TURNS = 4
 
-# 三个对话场景 + 固定追问（模拟真实多轮对话，追问与首轮风格一致）
-SCENARIOS = [
-    ("压力", "用户：最近工作压力好大，怎么办啊？\n模型：",
-     ["用户：具体说说怎么放松吧。\n模型：", "用户：可是我没时间运动啊。\n模型：",
-      "用户：那熬夜工作是不是更不行？\n模型："]),
-    ("闲聊", "用户：好想出去玩\n模型：",
-     ["用户：可是没钱去远地方。\n模型：", "用户：那周边游呢？\n模型：",
-      "用户：周末两天够不够？\n模型："]),
-    ("荐书", "用户：帮我推荐一本小说吧。\n模型：",
-     ["用户：有没有轻松一点的？\n模型：", "用户：悬疑的也行。\n模型：",
-      "用户：最近有什么新书吗？\n模型："]),
+# 三个对话场景的「内容」（不含标签）+ 固定追问。标签由 --style 决定（见 build_scenarios）。
+SCENARIO_SCRIPTS = [
+    ("压力", "最近工作压力好大，怎么办啊？",
+     ["具体说说怎么放松吧。", "可是我没时间运动啊。", "那熬夜工作是不是更不行？"]),
+    ("闲聊", "好想出去玩",
+     ["可是没钱去远地方。", "那周边游呢？", "周末两天够不够？"]),
+    ("荐书", "帮我推荐一本小说吧。",
+     ["有没有轻松一点的？", "悬疑的也行。", "最近有什么新书吗？"]),
 ]
+
+# ★ prompt 的对话标签必须和模型训练语料一致：ab = `A：/B：`（v2 起）；
+#   user-model = `用户：/模型：`（v1 及更早）。喂错 = OOD，结论会被评反。
+PROMPT_STYLES = {
+    'ab': ('A', 'B'),
+    'user-model': ('用户', '模型'),
+}
+
+
+def build_scenarios(style):
+    """按标签样式拼出 (场景名, 开场 prompt, 追问 prompts)。"""
+    u, m = PROMPT_STYLES[style]
+    return [(name, f"{u}：{opening}\n{m}：", [f"{u}：{f}\n{m}：" for f in followups])
+            for name, opening, followups in SCENARIO_SCRIPTS]
 
 
 def ngram_rep(s: str, n: int = 3) -> float:
@@ -68,11 +87,13 @@ def run_conversation(model, tok, scenario, window=None, no_resume=False, byte_mo
     norm = 3 if byte_mode else 1
     turns = []
     for t in range(N_TURNS):
+        stop_kind_ref = [None]
         gen, eos_pos = generate_ids(model, tok, ctx, MAX_NEW_TOKENS, TEMPERATURE,
                                     TOP_K, REPEAT_PENALTY,
-                                    stop_on_turn=True, stop_on_eos=False,
+                                    stop_on_turn=True, stop_on_eos=True, stop_on_cont=True,
                                     window=window, no_resume=no_resume,
-                                    resume_state=None if (no_resume or window is None) else mem_state)
+                                    resume_state=None if (no_resume or window is None) else mem_state,
+                                    stop_kind_ref=stop_kind_ref)
         if window is not None and not no_resume:
             mem_state = model.get_memory_state()      # 跨轮续传：存本轮末态
         # generate_ids 返回 (完整 token 列表, eos_pos)；文本 = prompt 之后的部分
@@ -81,17 +102,19 @@ def run_conversation(model, tok, scenario, window=None, no_resume=False, byte_mo
         text = tok.decode(new_tok)
         rep3 = ngram_rep(text)
         len_norm = len(new_tok) // norm
-        # 轮次截断：如果模型自己开了 用户：/模型： 轮次，generate_ids 会截断
-        turn_cut = len_norm < MAX_NEW_TOKENS and eos_pos == -1 and any(
-            s in text for s in ("用户：", "用户:", "模型：", "模型:"))
+        # ★ 停止原因只认 stop_kind（token 级，dev-notes/61）：轮次截断会把标签本身
+        #   从文本里删掉，所以**不能**再用「文本里有没有标签」判断自开轮次。
+        kind = stop_kind_ref[0] or "maxlen"
         turns.append(dict(
             turn=t, len_tokens=len_norm, rep3=round(rep3, 3),
-            eos_hit=eos_pos != -1, turn_cut=turn_cut,
+            kind=kind,
+            eos_hit=kind in ("eos", "cont"),   # 自己把话说完了（收尾或递回）
+            turn_cut=kind == "turn",           # 自己开了下一轮（轮次结构信号）
             text=text.strip()[:100],
         ))
         # 把模型回复接回上下文（模型没吐 EOS 也截断到轮次/上限，避免上下文失控）
         reply = tok.decode(new_tok)
-        # 去掉回复里可能自己开的 用户： 之后的尾巴（保留到轮次截断点即可）
+        # 去掉回复里可能自己开的 用户：/A： 之后的尾巴（保留到轮次截断点即可）
         ctx = ctx + reply + "\n"
         if t < len(followups):
             ctx += followups[t]
@@ -105,7 +128,13 @@ def main():
                     help="窗口+状态续传（dev-notes/46）：输入只保留最近 N token（字节模型 = N 字节，"
                          "如 192 ≈ 64 字），记忆状态跨轮续传")
     ap.add_argument("--no-resume", action="store_true", help="窗口模式下禁用状态续传（对照）")
+    ap.add_argument("--style", choices=sorted(PROMPT_STYLES), default='ab',
+                    help="prompt 的对话标签格式 **必须和模型训练语料一致**（默认 ab = v2 主线）。"
+                         "ab = `A：/B：`（v2 起）；user-model = `用户：/模型：`（v1 及更早）。"
+                         "选错 = 喂 OOD 输入，既会答非所问、也会漏计模型自己开的轮次")
     a = ap.parse_args()
+    scenarios = build_scenarios(a.style)
+    print(f"prompt 样式 = {a.style}（开场示例: {scenarios[0][1]!r}）")
 
     results = {}
     for d in a.dirs:
@@ -117,9 +146,10 @@ def main():
         tok = load_tokenizer(ckpt)      # 字节直入模型自动切 ByteTokenizer（按目录各自检测）
         byte_flag = bool(ckpt["model_args"].get("byte_level"))
         model.eval()
-        print(f"\n===== {d} (window={a.window}, resume={not a.no_resume}, byte_level={byte_flag}) =====")
+        print(f"\n===== {d} (window={a.window}, resume={not a.no_resume}, "
+              f"byte_level={byte_flag}) =====")
         per_model = []
-        for sname, opening, followups in SCENARIOS:
+        for sname, opening, followups in scenarios:
             torch.manual_seed(SEED)
             torch.cuda.manual_seed(SEED)
             turns = run_conversation(model, tok, (opening, followups),
@@ -129,19 +159,20 @@ def main():
             print(f"  [{sname}] 开场: {opening.strip()[:20]}…")
             for tt in turns:
                 flag = " ⚠" if (tt["rep3"] > 0.3 or tt["len_tokens"] <= 2
-                                or (tt["len_tokens"] >= MAX_NEW_TOKENS - 1 and tt["turn"] == 0)) else ""
+                                or (tt["kind"] == "maxlen" and tt["turn"] == 0)) else ""
                 print(f"    轮{tt['turn']+1}: {tt['len_tokens']:>3} tok | rep3 {tt['rep3']:.3f} | "
-                      f"EOS {tt['eos_hit']} | 自开轮次 {tt['turn_cut']}{flag} | {tt['text'][:60]}")
+                      f"停因 {tt['kind']:<6} | 自开轮次 {tt['turn_cut']}{flag} | {tt['text'][:60]}")
         results[d] = per_model
 
     print("\n\n======== 多轮汇总 ========")
-    print(f"{'模型':<22} | {'EOS率':>6} | {'自开轮次率':>7} | {'平均len':>7} | {'rep3':>6} | "
-          f"{'末轮len':>7} | {'末轮rep3':>8} | {'崩溃数':>5}")
-    print("-" * 100)
+    print(f"{'模型':<22} | {'收尾率':>6} | {'自开轮次率':>7} | {'收不住率':>6} | {'平均len':>7} | "
+          f"{'rep3':>6} | {'末轮len':>7} | {'末轮rep3':>8} | {'崩溃数':>5}")
+    print("-" * 110)
     for d, turns in results.items():
         n = len(turns)
-        eos_rate = sum(t["eos_hit"] for t in turns) / n
-        cut_rate = sum(t["turn_cut"] for t in turns) / n
+        eos_rate = sum(t["eos_hit"] for t in turns) / n        # eos/cont = 自己把话说完了
+        cut_rate = sum(t["turn_cut"] for t in turns) / n       # 自己开了下一轮
+        maxlen_rate = sum(t["kind"] == "maxlen" for t in turns) / n
         avg_len = sum(t["len_tokens"] for t in turns) / n
         avg_rep3 = sum(t["rep3"] for t in turns) / n
         # 末轮（第 4 轮）平均
@@ -150,11 +181,12 @@ def main():
         last_rep3 = sum(t["rep3"] for t in last) / len(last)
         # 崩溃 = rep3>0.3 或 len<=2 或 首轮就打满上限（收不住）
         crash = sum(1 for t in turns if t["rep3"] > 0.3 or t["len_tokens"] <= 2
-                    or (t["len_tokens"] >= MAX_NEW_TOKENS - 1 and t["turn"] == 0))
-        print(f"{d:<22} | {eos_rate:>5.0%} | {cut_rate:>6.0%} | {avg_len:>7.1f} | "
-              f"{avg_rep3:>6.3f} | {last_len:>7.1f} | {last_rep3:>8.3f} | {crash:>5}")
-    print("\n指标：EOS率=自然吐<eos>的比例 | 自开轮次=回复里自己重开用户/模型轮次(碎片信号) | "
-          "崩溃=rep3>0.3 或长度≤2 或首轮顶满上限 | len 单位：BPE=token，字节模型=聚合组（字节÷3）")
+                    or (t["kind"] == "maxlen" and t["turn"] == 0))
+        print(f"{d:<22} | {eos_rate:>5.0%} | {cut_rate:>6.0%} | {maxlen_rate:>5.0%} | "
+              f"{avg_len:>7.1f} | {avg_rep3:>6.3f} | {last_len:>7.1f} | {last_rep3:>8.3f} | {crash:>5}")
+    print("\n指标：收尾率=自己吐 <eos>/<cont> 结束本轮（话说完了）| 自开轮次=自己开了下一轮"
+          "（轮次结构的正面信号）| 收不住率=顶满 max_new_tokens 被硬截断 | "
+          "崩溃=rep3>0.3 或长度≤2 或首轮顶满上限 | len 单位：BPE/字级=token，字节模型=聚合组（字节÷3）")
 
 
 if __name__ == "__main__":
