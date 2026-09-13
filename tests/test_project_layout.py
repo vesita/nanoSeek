@@ -155,6 +155,10 @@ def test_base_v2_matches_documented_decisions():
         'muon_ns_steps': 7,
         'muon_ns_aggressive': 4,
         'lr_decay_iters': 70000,
+        # 2026-09-11 由 true 改成 false（全量语料预训练）。这是**有意**的路线切换，
+        # 不是笔误：masking=true 时只有 6.14% 的语料能产生梯度（c4_zh 一个终止符都没有）。
+        # 详见 PROJECT_STATE §0.5 与 configs/base_v2.yaml 里那段注释。
+        'use_loss_masking': False,
         'ndb_store': '',
         'ndb_heldout': '',
     }
@@ -271,3 +275,95 @@ def test_no_test_imports_train_py():
                 if node.module in ('training.train', 'train'):
                     offenders.append((tp.name, node.lineno, f"from {node.module}"))
     assert not offenders, f"测试里 import 了 train.py（会直接开训）：{offenders}"
+
+
+# ==========================================================================
+# 7) ★ v3 三阶段配方的不变量（2026-09-13 新增）
+# ==========================================================================
+V3_STAGE_CONFIGS = sorted(glob.glob(str(ROOT / 'configs' / 'base_v3_*.yaml')))
+
+# 每段的步数在这里再写一遍，逼着"改配置就必须同时改这里"（和 §5 配方表同一个套路）。
+# 依据 PROJECT_STATE §0.5.10：
+#   - A 段 `base_v3_know.yaml`（3k，v3_know 知识/CoT）**已被用户 2026-09-13 拍板跳过**
+#     —— 它唯一能实测的理由"冲刷 <eos> 先验"被 `scripts/eos_prior_probe.py` 推翻。
+#     ★ **配置保留**（配方不删，将来补知识段仍用它），所以步数继续登记在这里；
+#       但它不再是 B 段的前置条件。
+#   - B 段 `base_v3_dlg.yaml`（14k = 1 epoch 对话专修）**直接接 `out/base_v2/last.pt`**。
+V3_STAGE_STEPS = {
+    'base_v3_know.yaml': 3000,
+    'base_v3_dlg.yaml': 14000,
+}
+
+
+def test_v3_stage_configs_exist():
+    """三阶段配方文件必须存在（否则下面那些参数化测试会静默变成 0 项、恒真通过）。"""
+    assert V3_STAGE_CONFIGS, "找不到 configs/base_v3_*.yaml —— 三阶段配方没落地"
+
+
+def test_all_config_out_dirs_are_pairwise_distinct():
+    """所有配置（含 base_v2）的 out_dir 必须互不相同。
+
+    两个 run 共用一个 out_dir ⇒ 后启动的会触发 `_backup_old_run` 把前一个的产物
+    整体挪进 `old/`。
+    """
+    seen = {}
+    for cfg_path in CONFIGS:
+        cfg = load_yaml(cfg_path)
+        out_dir = os.path.abspath(cfg.get('out_dir', ''))
+        name = os.path.basename(cfg_path)
+        assert out_dir not in seen, (
+            f"{name} 与 {seen[out_dir]} 共用 out_dir={cfg.get('out_dir')!r} —— "
+            f"后启动的那个会触发 _backup_old_run 把前一个挪进 old/")
+        seen[out_dir] = name
+
+
+@pytest.mark.parametrize("cfg_path", V3_STAGE_CONFIGS, ids=os.path.basename)
+def test_v3_stage_config_safety(cfg_path):
+    """★ v3 分阶段配方的五条硬不变量。
+
+    这条测试的存在理由是一次**真实险情**：方案文档（PROJECT_STATE §0.5.10）里那串参数
+    只列了 `--init_from=out/base_v2/last.pt --data-prefix v3_know …`，**没写 `--out_dir`**。
+    而 `train.py:1022` 在 `init_from != 'resume'` 时会对 out_dir 调 `_backup_old_run()` ——
+    warm start 用的正是 `<路径>.pt` 这种形式，**不是** 'resume'。
+    照抄文档命令 + `configs/base_v2.yaml`（out_dir=out/base_v2）
+    ⇒ 基座 61000 步的全部归档 ckpt（**含 last.pt 自己**）会被静默挪进
+    `out/base_v2/old/`，新旧两个 run 的产物混在同一目录。
+    文档拦不住手滑，这条断言可以。
+    """
+    cfg = load_yaml(cfg_path)
+    name = os.path.basename(cfg_path)
+
+    # (1) 权重来源：必须是 warm start（<路径>.pt），不能是 resume/scratch。
+    init_from = cfg['init_from']
+    assert init_from not in ('resume', 'scratch'), (
+        f"{name}: init_from={init_from!r} —— 本阶段是 warm start；"
+        f"用 resume 会把 base_v2 的 WSD 进度带进来（只剩 9000 步就退到 min_lr）")
+    assert init_from.endswith('.pt'), f"{name}: init_from 必须是 <路径>.pt"
+
+    # (2) ★ 核心：out_dir 不能是权重来源所在目录（_backup_old_run 会归档它）。
+    out_dir = os.path.abspath(cfg['out_dir'])
+    src_dir = os.path.abspath(os.path.dirname(init_from))
+    assert out_dir != src_dir, (
+        f"{name}: out_dir 与 init_from 所在目录相同（{cfg['out_dir']}）—— "
+        f"warm start 会触发 _backup_old_run 把该目录下的 ckpt 全部挪进 old/")
+
+    # (3) 打包：必须开打包，且必须是全域随机窗口（块对齐有 67~73% 覆盖漏洞）。
+    assert cfg['use_doc_packing'] is True, f"{name}: 必须 use_doc_packing=True"
+    assert cfg['pack_align'] is False, (
+        f"{name}: pack_align 必须 False —— True 时 v3_know 有 72.91% 的 train token "
+        f"永远进不了任何窗口（PROJECT_STATE §0.5.12）")
+
+    # (4) loss masking 三阶段必须全关（v3_lang 一个终止符都没有）。
+    assert cfg['use_loss_masking'] is False, f"{name}: use_loss_masking 必须 False"
+
+    # (5) 退火覆盖整段 + 语料前缀 + 步数与方案表一致。
+    assert cfg['lr_decay_iters'] == cfg['max_iters'], (
+        f"{name}: lr_decay_iters={cfg['lr_decay_iters']} != max_iters={cfg['max_iters']}")
+    assert cfg['data_prefix'].startswith('v3_'), (
+        f"{name}: data_prefix={cfg['data_prefix']!r} 不是 v3 阶段数据")
+    assert name in V3_STAGE_STEPS, (
+        f"{name}: 新增的 v3 阶段配置必须同时登记进 V3_STAGE_STEPS"
+        f"（并更新 PROJECT_STATE §0.5.10 的方案表）")
+    assert cfg['max_iters'] == V3_STAGE_STEPS[name], (
+        f"{name}: max_iters={cfg['max_iters']} 与登记的 {V3_STAGE_STEPS[name]} 不符 —— "
+        f"改步数必须同时改这里和 PROJECT_STATE §0.5.10 的方案表")

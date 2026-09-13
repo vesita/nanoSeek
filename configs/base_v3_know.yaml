@@ -1,0 +1,72 @@
+# ============================================================================
+# v3 三阶段训练 · A 段：知识 / CoT 修正阶段（v3_know，3k 步 ≈3.2h）
+# ============================================================================
+# 继承 base_v2.yaml（架构、优化器、正则等全部不变），只覆盖"这一段训练的配方"。
+# 用法：
+#     .venv/bin/python training/train.py configs/base_v3_know.yaml
+#
+# 依据：PROJECT_STATE.md §0.5.10「训练方案」。
+#
+extends: base_v2.yaml
+
+# --- 1) 产物隔离（★ 最危险的一条，写错会毁掉基座）---------------------------
+# `train.py:1022` 在 `init_from != 'resume'` 时会对 out_dir 调 `_backup_old_run()`，
+# 把 out_dir 里**所有**已有文件整体挪进 `out_dir/old/`。
+# warm start 用的 `init_from=<路径>.pt` **恰好不是** 'resume' ⇒ 若 out_dir 仍写
+# `out/base_v2`，61000 步的全部归档 ckpt（含 last.pt 本身）会被移进 old/，
+# 新旧两个 run 的产物混在同一目录里。
+# ⇒ 每一段**必须**有自己的 out_dir。tests/test_project_layout.py 有断言钉住这一条。
+out_dir: out/base_v3_know
+
+# --- 2) 权重来源：warm start，只搬权重 ---------------------------------------
+# `train.py:669` 的 `init_from.endswith('.pt')` 分支：加载模型权重，
+# **优化器状态与 LR 进度全部重置**（正是我们要的 —— 开一段新的 WSD 循环）。
+# ✗ 不要用 `init_from: resume`：那会把 step 61000 的 WSD 进度带进来，
+#   而 WSD 只剩 9000 步就退到 min_lr ⇒ 相当于一启动就是退火尾巴，学不到东西。
+init_from: out/base_v2/last.pt
+
+# --- 3) 语料 + 打包 ---------------------------------------------------------
+data_prefix: v3_know
+
+# 打包：v2 实测 28.4% 的随机窗口跨 >1 个样本（A→B 污染）。
+use_doc_packing: true
+
+# ★★ 必须 False！块对齐模式把窗口锚在块尾，比 256 长的块其**前 L−256 个 token
+#    永远进不了任何窗口** ⇒ 不可达 train token：v3_know 72.91% / v3_dlg 67.39% /
+#    v3_lang 67.05%（对抗审计实测，主 AI 独立复算逐位一致）。
+#    `pack_align=False` = 全域随机窗口 + 同一张块对角掩码，覆盖 ≈100%。
+#    这与当年 `use_loss_masking` 是**同一类失败**：语料在无声地不产生梯度。
+#    详见 PROJECT_STATE §0.5.12 与 AGENTS §5.10。
+pack_align: false
+
+# ★ 三阶段都必须关：v3_lang 一个终止符都没有，开了直接零梯度；
+#   v3_know/v3_dlg 的终止符密度也远低于老口径的拒绝采样门槛。
+#   （base_v2.yaml 已是 false，这里显式再写一遍，防止继承链被改动。）
+use_loss_masking: false
+
+# --- 4) 这一段的学习率配方 --------------------------------------------------
+# 相对 base_v2 的三处改动，都是"这一段是**新循环**、不是续训"的直接推论：
+#   learning_rate 3e-4 → 2e-4：warm start 的权重已在旧 LR 下收敛，重启到同等
+#     峰值会把刚学到的表示打散（[推断]，本轮唯一的未实测参数）。
+#   min_lr 1e-4 → 2e-5：原 min_lr/max_lr = 1/3，退火空间太小；改成 1/10。
+#   warmup_iters 100 → 200：100 步在 8192 tok/step 下只有 0.8M token，重启期太陡。
+schedule: wsd
+stage: full
+learning_rate: 0.0002
+min_lr: 0.00002
+warmup_iters: 200
+stable_frac: 0.8
+
+# --- 5) 步数 ----------------------------------------------------------------
+# 3k 步 × 8192 tok/step = 24.6M token ≈ **0.05 epoch**（v3_know 全量 487.8M）。
+# ★ 2026-09-13 用户拍板由 10k 缩短到 3k。理由：这一段的目的**不是**"把知识背完"
+#   （0.17 epoch 本来也背不完），而是
+#     (a) 用可控代价冲刷旧 `<eos>` 先验（旧数据的终止符错插在 `<think>` 之后，
+#         deepseek 占 27.3% 字符、100% 回复首行是 `<think>`）；
+#     (b) 吃进一点新 QA + 修好终止符位置的 CoT。
+#   而"清洗后的对话数据到底修好没有"是当前**最大的未知数**，不该被 10h 的知识段
+#   挡在后面 ⇒ 用 ≈3h 买"先验冲刷"，把剩下的算力尽早给 B 段（对话）。
+# ★ lr_decay_iters 必须 == max_iters（退火要覆盖整段），有单测钉着。
+#   warmup 200 / stable_frac 0.8 ⇒ 稳定段 2400 步、退火段 400 步。
+max_iters: 3000
+lr_decay_iters: 3000

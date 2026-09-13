@@ -1,0 +1,54 @@
+# ============================================================================
+# v3 分段训练 · B 段：对话专修阶段（v3_dlg，14k 步 ≈ 1 epoch）
+# ============================================================================
+# 继承 base_v2.yaml，并覆盖本段配方。用法：
+#     .venv/bin/python training/train.py configs/base_v3_dlg.yaml
+#
+# ★★ 2026-09-13 用户拍板：**跳过 A 段（v3_know）**，本段直接从基座权重启动。
+#   理由（见 PROJECT_STATE §0.5.10）：A 段唯一能实测的理由"冲刷 <eos> 先验"
+#   已被 scripts/eos_prior_probe.py 推翻（P(<eos>) 只比随机位置高 1.9×），
+#   而 3k 步 = 0.05 epoch 本来就短到做不成任何可测的事。
+#   `configs/base_v3_know.yaml` **保留**（配方不删，将来补知识段可再跑），
+#   但它**不再是**本段的前置条件。
+#
+# 依据：PROJECT_STATE.md §0.5.10「训练方案」。
+#
+extends: base_v2.yaml
+
+# --- 1) 产物隔离 ------------------------------------------------------------
+# warm start 会触发 `_backup_old_run(out_dir)`，所以本段必须有独立 out_dir。
+# **绝不要**和 A 段共用，也绝不要写 out/base_v2。
+out_dir: out/base_v3_dlg
+
+# --- 2) 权重来源：直接接基座（A 段已跳过）-----------------------------------
+# `out/base_v2/last.pt` = **step 61000**（实测 `iter_num=61000`，与
+# `out/base_v2/ckpt_step_61000.pt` 权重逐张量相同）。
+# ⚠ v2 训练于 2026-09-13 12:48 被 stop 在 **step 61776**，从未到达 65000/70000
+#   ⇒ 基座的"阶段二对话退火"同样不存在，它被本段（纯 v3_dlg 语料 1 epoch）
+#   整体取代。代价：v3 新知识（QA/CoT）这一轮完全不吃。
+# ★ 若将来补跑了 A 段，这里要改回 `out/base_v3_know/last.pt`，
+#   否则 A 段的修正会被整个丢掉（等于 A 段白跑）。
+init_from: out/base_v2/last.pt
+
+# --- 3) 语料 + 打包 ---------------------------------------------------------
+data_prefix: v3_dlg
+
+use_doc_packing: true
+pack_align: false        # ★★ 见 base_v3_know.yaml 的长注释 / PROJECT_STATE §0.5.12
+use_loss_masking: false  # ★ 三阶段都必须关
+
+# --- 4) 学习率配方（开一段新的 WSD 循环，不是续训）--------------------------
+# 基座 step 61000 的 WSD 已退火到自己的 min_lr（1e-4），这里重新爬回 2e-4 再退火。
+schedule: wsd
+stage: full
+learning_rate: 0.0002
+min_lr: 0.00002
+warmup_iters: 200
+stable_frac: 0.8
+
+# --- 5) 步数 ----------------------------------------------------------------
+# v3_dlg 全量 114.2M token / 8192 tok/step = 13,941 步 ≈ 1 epoch ⇒ 取 14k。
+# ★ 只跑 1 遍：对话语料跑多 epoch 会加剧复读坍缩（[推断]，B 段结束后的闸门
+#   会用 rep3 + eval_multiturn 验证这一点）。
+max_iters: 14000
+lr_decay_iters: 14000

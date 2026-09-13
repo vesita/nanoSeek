@@ -101,7 +101,19 @@ use_csa_learnable: true
 use_hca: false
 use_kv_memory: false
 use_lightning_indexer: false
-use_loss_masking: true
+# ★ 2026-09-11 由 true 改为 **false**：全量语料预训练（用户已确认的路线）。
+#   依据（PROJECT_STATE §0.5 / §6）：masking 是**行级**判据（一行里有 <eos>/<cont> 才整行
+#   算 loss），而全库终止符密度只有 0.1427% ⇒ 只有 6.14% 的语料能产生梯度：
+#     * c4_zh 名义 20.25%（1.89 亿字符）终止符 **0 个** → 恒不可见
+#     * 全库有效语料仅 57.6M token；multi_turn_dialogue 独占 40.2% 的终止符
+#   后果实测：模型只会背窄域语料（心理咨询腔），"介绍一下北京" 答不出东西。
+#   改为 false 后：每步有效 token 3216→8192（2.55×）、语料覆盖 57.6M→937.8M（16.3×），
+#   且 `_pack_terms` 变空、拒绝采样自动关闭（train.py:409 走 torch.randint 均匀采样）。
+#   ⚠ 代价：训练分布不再是对话分布 ⇒ **val 数值与历史不可比，必须重新立基线**。
+#   ⚠ 末尾 5000 步要切回对话退火（step 65000 起，用 --use_loss_masking=true 显式覆盖）；
+#     本文件保持 false = 阶段一的配方。切换用 scripts/pause_after_eval.sh 65000。
+#   ⚠ `pack_nonempty` 此时是**惰性键**（train.py:300 的 and 短路），保持 true 不影响行为。
+use_loss_masking: false
 use_lse_gate: false
 use_lse_residual: false
 use_mhc: false
