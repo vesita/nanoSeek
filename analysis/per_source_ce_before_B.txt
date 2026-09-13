@@ -1,0 +1,39 @@
+val=data/chinese/val_char_v2.bin (9,417,945 tok)  源=25  窗口/源=32  block=256  特殊id=2075
+  [对齐对照] c4_zh.txt                          token/raw_chars = 1.0021
+  [对齐对照] classical_poetry.txt               token/raw_chars = 1.0223
+  [对齐对照] deepseek_r1_distill_dialogue.txt   token/raw_chars = 0.9987
+参数量：75.15M
+
+=== step 61000  (out/base_v2/last.pt) ===
+来源                                  组          real CE   top1%  shuf CE  unigram  real-uni   n_tok
+c4_zh.txt                           散文/语言       2.5935   50.36   4.8423   6.5297   -3.9362   8,168
+classical_poetry.txt                散文/语言       2.3528   52.96   4.7370   6.4003   -4.0475   8,147
+code_alpaca_dialogue.txt            代码          2.2596   55.15   4.8565   6.5155   -4.2559   8,065
+coig_code_dialogue.txt              代码          2.6082   48.27   4.8477   6.6742   -4.0661   8,159
+coig_cqia_dialogue.txt              代码          2.0126   57.68   4.6723   6.1894   -4.1768   8,109
+coig_logic_dialogue.txt             数学/推理       2.4182   52.46   4.9738   6.6164   -4.1982   8,158
+coig_math_dialogue.txt              数学/推理       2.5246   51.09   4.8273   6.5289   -4.0043   8,074
+coig_other_dialogue.txt             对话          2.5325   50.33   4.7958   6.5168   -3.9844   8,087
+coig_wiki_dialogue.txt              知识/长文       2.3239   54.86   4.9037   6.6433   -4.3194   8,131
+dailychat_dialogue.txt              对话          2.1699   56.44   4.8132   6.6361   -4.4662   8,111
+deepseek_r1_distill_dialogue.txt    对话          2.7237   47.88   4.9967   6.7037   -3.9800   8,095
+glm_dialogue.txt                    对话          2.5821   50.44   4.9668   6.6969   -4.1148   8,105
+gsm8k_cot_dialogue.txt              数学/推理       2.5060   50.77   4.8155   6.5238   -4.0178   8,147
+kdconv_dialogue.txt                 对话          2.4376   52.09   5.0092   6.5538   -4.1163   8,113
+lccc_dialogue.txt                   对话          2.4994   51.48   5.0068   6.5920   -4.0925   8,117
+muice_dialogue.txt                  对话          2.7229   48.10   4.9377   6.6708   -3.9479   8,062
+multi_turn_dialogue.txt             对话          2.5498   51.54   4.9970   6.6371   -4.0874   8,120
+qwen3_235b_distill_dialogue.txt     对话          3.2287   39.52   5.0512   6.8476   -3.6189   8,147
+wikipedia_cn.txt                    散文/语言       3.4787   36.26   5.2180   6.8863   -3.4076   8,095
+zhihu_kol_dialogue.txt              知识/长文       3.7103   33.02   4.9286   6.8008   -3.0904   8,064
+三国演义.txt                            散文/语言       4.9752   19.13   5.7654   7.5166   -2.5414   7,937
+水浒传.txt                             散文/语言       4.8581   20.37   5.6948   7.3895   -2.5314   7,878
+红楼梦.txt                             散文/语言       5.0760   18.56   5.7767   7.4533   -2.3773   7,855
+西游记.txt                             散文/语言       5.3218   16.71   6.0043   7.7103   -2.3885   7,877
+
+=== 分组汇总（token 加权）===
+   step         散文/语言        知识/长文           代码        数学/推理           对话
+  61000        4.0757       3.0143       2.2942       2.4828       2.6054
+
+=== 全库 token 加权（= 逐源明细的加权和，可与训练日志交叉核对）===
+  step  61000  real 3.0095   shuffled 5.0599   unigram 6.7561   n_tok 193,821

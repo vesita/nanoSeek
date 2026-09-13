@@ -1,0 +1,73 @@
+ M AGENTS.md
+ M PROJECT_STATE.md
+ M TECH_DEBT.md
+ M configs/base_v2.yaml
+ M data/chinese/prepare.py
+ M dev-notes/eval_dialogue_samples.json
+ M inference/scripts/eval_dialogue.py
+ M inference/scripts/eval_multiturn.py
+ M inference/scripts/sample_py.py
+ M model/attention.py
+ M model/block.py
+ M model/gpt.py
+ M scripts/ckpt_janitor.sh
+ M scripts/prune_ckpts.sh
+ M tests/test_checkpoints.py
+ M tests/test_prepare_split.py
+ M tests/test_project_layout.py
+ M training/checkpoints.py
+ M training/train.py
+?? analysis/_cleanup_git_before.txt
+?? analysis/_cleanup_out_dryrun.txt
+?? analysis/_cleanup_sha_before.txt
+?? analysis/belle_wildchat_import.md
+?? analysis/corpus_health_audit.md
+?? analysis/corpus_quality_v2.md
+?? analysis/doc_packing.md
+?? analysis/escov_inclusion.md
+?? analysis/packing_audit.md
+?? analysis/translate_escov.md
+?? analysis/turn_taking_v2.md
+?? analysis/val_leakage_v2.md
+?? analysis/wildchat_pii.md
+?? analysis/zh_dialogue_sourcing.md
+?? configs/base_v3_dlg.yaml
+?? configs/base_v3_know.yaml
+?? data/chinese/build_stages.py
+?? data/chinese/clean_corpus.py
+?? data/chinese/clean_v3/
+?? data/chinese/filter_mt_translation.py
+?? data/chinese/import_external.py
+?? data/chinese/manifest_v3_dlg.json
+?? data/chinese/manifest_v3_know.json
+?? data/chinese/manifest_v3_lang.json
+?? data/chinese/meta_char_v3_dlg.pkl
+?? data/chinese/meta_char_v3_know.pkl
+?? data/chinese/meta_char_v3_lang.pkl
+?? data/chinese/new_dialogue/
+?? data/chinese/new_sources/
+?? data/chinese/pii_scrub.py
+?? data/chinese/raw_all/
+?? data/chinese/stages/
+?? data/chinese/train_char_v2.off
+?? data/chinese/train_char_v3_dlg.off
+?? data/chinese/train_char_v3_know.off
+?? data/chinese/train_char_v3_lang.off
+?? data/chinese/val_char_v2.off
+?? data/chinese/val_char_v3_dlg.off
+?? data/chinese/val_char_v3_know.off
+?? data/chinese/val_char_v3_lang.off
+?? data/chinese/verify_clean_corpus.py
+?? data/chinese/verify_import_belle_wildchat.py
+?? scripts/cleanup_out.py
+?? scripts/per_source_ce_probe.py
+?? scripts/throughput_focus.sh
+?? scripts/throughput_sweep.sh
+?? scripts/translate_escov.py
+?? tests/test_clean_corpus.py
+?? tests/test_eval_dialogue_prompts.py
+?? tests/test_packing.py
+?? tests/test_prepare_source_dir.py
+?? tests/test_run_logs.py
+?? training/packing.py
+?? training/run_logs.py
