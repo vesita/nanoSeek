@@ -29,7 +29,11 @@ data/*/*.bak*
 # 数据治理快照（govern_dialogue_data.py 产出：治理前备份 + 被剔除源，本地可回滚、不进库）
 data/*/_backup_*/
 data/*/_discarded/
-data/chinese/clean_v3/
+# ⚠ 用 clean_v3/*（而非 clean_v3/）忽略内容：整目录忽略会让下面的 ! 例外失效，
+#   于是清洗证据报告（AGENTS.md §9/§10 的交付物）会被静默藏起来。
+data/chinese/clean_v3/*
+!data/chinese/clean_v3/CLEANING_REPORT.md
+!data/chinese/clean_v3/VERIFY_REPORT.md
 data/chinese/raw_all/
 data/chinese/stages/
 data/chinese/new_sources/
