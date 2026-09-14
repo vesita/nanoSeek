@@ -86,12 +86,18 @@ STAGES = {
         'escov_zh.txt',                           # 新导入：翻译后的多轮对话
     ],
     'v3_persona': [
-        'persona_identity.txt',                   # 单流 <resp> 人设绑定层（~87k token）
+        'persona_identity.txt',    # 身份事实层（名字/自称/边界，须反复重复才钉得住）
+        'persona_monologue.txt',   # 第一人称独白层（给它"有话说"）
+        'persona_dialogue.txt',    # 长对话层（**说话方式的主力**）
     ],
 }
 
 # 已知但**故意不进任何阶段**的源（写下来是为了让"漏了"和"有意排除"可区分）
-EXCLUDED = {'mix_tables.txt'}
+EXCLUDED = {'mix_tables.txt', 'persona_contrast_probe.txt'}
+# ★ `persona_contrast_probe.txt` 是**评估探针不是训练数据**：同一情境的"希望版/鸡汤版"
+#   成对文本。普通 next-token 训练把它放进 loss 只会让模型**同时学会两种答法**
+#   （产生不了对比），所以它**故意不进任何阶段**。要真做对比得上 RL/DPO（另一件事）。
+#   写进 EXCLUDED 是为了让"漏了"和"有意排除"可区分。
 
 
 def resolve(src_dirs):
