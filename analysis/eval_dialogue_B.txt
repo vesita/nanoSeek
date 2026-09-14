@@ -1,0 +1,26 @@
+参数量：75.15M
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+
+=== 评估 out/_eval_v2base ===
+  avg_len=22.5 rep2=0.0 rep3=0.0 rep4=0.0 ws=0.0109 d1=0.9519 d2=0.8333 turns=0.0 样式=none(给了 ab)
+  模型配置: mhc=False lse=False no_attn_layers=[] block_order=attn_ffn
+  [代表样本] prompt='A：你好\nB：'
+    → 你还是老
+参数量：75.15M
+
+=== 评估 out/_eval_B_final ===
+  avg_len=33.7 rep2=0.038 rep3=0.0088 rep4=0.0 ws=0.0 d1=0.9295 d2=0.981 turns=0.0 样式=none(给了 ab)
+  模型配置: mhc=False lse=False no_attn_layers=[] block_order=attn_ffn
+  [代表样本] prompt='A：你好\nB：'
+    → 你好！今天我能为您做什么？
+
+
+======== 智能度对比汇总 ========
+模型                           |   len |   rep2 |   rep3 |   rep4 |    ws% |     d1 |     d2 | turns
+----------------------------------------------------------------------------------------------------
+out/_eval_v2base             |  22.5 |    0.0 |    0.0 |    0.0 |     1% | 0.9519 | 0.8333 |   0.0
+out/_eval_B_final            |  33.7 |  0.038 | 0.0088 |    0.0 |     0% | 0.9295 |  0.981 |   0.0
+
+指标说明：repN=字符 n-gram 重复率(越低越好·重复坍缩) | ws%=空白占比(越低越好·loss骗低) | d1/d2=多样性(越高越好) | turns=对话轮次结构(越高越好·碎片拼贴反面)
+
+完整样本已写入 dev-notes/eval_dialogue_samples.json

@@ -1,0 +1,53 @@
+val=data/chinese/val_char_v3_dlg.bin (1,104,890 tok)  源=9  窗口/源=32  block=256  特殊id=2075
+  [对齐对照] 本 manifest 不含 v2 对照源名，改用其前 3 个源：['belle_multiturn.txt', 'dailychat_dialogue.txt', 'escov_zh.txt']
+  [对齐对照] belle_multiturn.txt                token/raw_chars = 1.0142
+  [对齐对照] dailychat_dialogue.txt             token/raw_chars = 1.0172
+  [对齐对照] escov_zh.txt                       token/raw_chars = 1.0332
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+参数量：75.15M
+
+=== step 61000  (out/base_v2/last.pt) ===
+来源                                  组          real CE   top1%  shuf CE  unigram  real-uni   n_tok
+belle_multiturn.txt                 对话          2.6759   46.13   4.7651   6.2677   -3.5918   8,072
+dailychat_dialogue.txt              对话          2.6860   47.10   4.6915   6.3511   -3.6651   7,994
+escov_zh.txt                        对话          2.7346   46.46   4.7915   6.3835   -3.6489   8,121
+glm_dialogue.txt                    对话          2.6808   46.85   4.6431   6.3272   -3.6464   8,105
+kdconv_dialogue.txt                 对话          2.7724   44.89   4.7829   6.3383   -3.5659   8,149
+lccc_dialogue.txt                   对话          2.6831   46.41   4.7052   6.3123   -3.6293   8,134
+sharegpt_zh_38k.txt                 对话          2.7803   44.98   4.7213   6.3633   -3.5830   7,930
+wildchat_zh.txt                     对话          2.9255   43.01   4.8184   6.6233   -3.6978   7,810
+参数量：75.15M
+
+=== step 5000  (out/base_v3_dlg/ckpt_step_5000.pt) ===
+来源                                  组          real CE   top1%  shuf CE  unigram  real-uni   n_tok
+belle_multiturn.txt                 对话          2.1388   54.56   4.6620   6.2677   -4.1290   8,072
+dailychat_dialogue.txt              对话          2.3057   52.51   4.5794   6.3511   -4.0454   7,994
+escov_zh.txt                        对话          2.2894   53.69   4.6891   6.3835   -4.0942   8,121
+glm_dialogue.txt                    对话          2.2742   53.60   4.5404   6.3272   -4.0531   8,105
+kdconv_dialogue.txt                 对话          2.3954   50.60   4.6573   6.3383   -3.9429   8,149
+lccc_dialogue.txt                   对话          2.2405   53.54   4.5793   6.3123   -4.0718   8,134
+sharegpt_zh_38k.txt                 对话          2.3849   51.31   4.6124   6.3633   -3.9784   7,930
+wildchat_zh.txt                     对话          2.3560   51.64   4.5480   6.6233   -4.2673   7,810
+参数量：75.15M
+
+=== step 14000  (out/base_v3_dlg/last.pt) ===
+来源                                  组          real CE   top1%  shuf CE  unigram  real-uni   n_tok
+belle_multiturn.txt                 对话          2.0218   56.60   4.6779   6.2677   -4.2459   8,072
+dailychat_dialogue.txt              对话          2.1976   54.53   4.5954   6.3511   -4.1535   7,994
+escov_zh.txt                        对话          2.1830   55.17   4.6970   6.3835   -4.2005   8,121
+glm_dialogue.txt                    对话          2.1557   55.21   4.5483   6.3272   -4.1715   8,105
+kdconv_dialogue.txt                 对话          2.3011   52.24   4.6494   6.3383   -4.0371   8,149
+lccc_dialogue.txt                   对话          2.1264   55.61   4.6029   6.3123   -4.1859   8,134
+sharegpt_zh_38k.txt                 对话          2.2799   52.40   4.6406   6.3633   -4.0834   7,930
+wildchat_zh.txt                     对话          2.2371   54.10   4.5480   6.6233   -4.3862   7,810
+
+=== 分组汇总（token 加权）===
+   step         散文/语言        知识/长文           代码        数学/推理           对话
+  61000             -            -            -            -       2.7415
+   5000             -            -            -            -       2.2977
+  14000             -            -            -            -       2.1875
+
+=== 全库 token 加权（= 逐源明细的加权和，可与训练日志交叉核对）===
+  step  61000  real 2.7415   shuffled 4.7399   unigram 6.3698   n_tok 64,315
+  step   5000  real 2.2977   shuffled 4.6085   unigram 6.3698   n_tok 64,315
+  step  14000  real 2.1875   shuffled 4.6199   unigram 6.3698   n_tok 64,315

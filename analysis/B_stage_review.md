@@ -1,0 +1,206 @@
+# B 段（`base_v3_dlg`）训练效果审查 —— 证据与结论
+
+> 审查人：主 AI（2026-09-14 晚）。所有数字都来自**可复跑的命令**，命令附在每节末尾。
+> 标注：**[实测]** = 本次亲自跑出；**[对照]** = 已知答案对照；**[未测]** = 明确没测到的东西。
+
+---
+
+## 0. 训练本身：健康收尾 [实测]
+
+| 项 | 值 |
+|---|---|
+| 单元 | `nanoseek-v3-dlg.service` → `Result=success` / `ExecMainStatus=0` / `NRestarts=0` |
+| 步数 | **14000 / 14000**（轮次 1.00） |
+| 起止 | 09-14 00:28:29 → 13:28（累计 **46794.8s = 12:59:55**，3.34 s/it） |
+| 训练 val | 2.7039 → **2.1465**；`best_val_loss` 2.1193（step 10000） |
+| train loss | 2.7125 → 2.0718 |
+| 显存 | peak 1.70G，`oom=0 retry=0` |
+| 异常关键字 | **0**（会话侧巡检 12 次 + systemd 定时器 23 次） |
+| 归档 | `ckpt_step_{5000,10000,13000,14000}.pt` + `last.pt`(=14000) + `best.pt` |
+| 孤儿进程 | 无（`pgrep -af "training/tra[i]n.py"` 空） |
+
+`loss_curve.png`：train/val 同步下降，末端 val 2.15 略高于 train 2.07 —— **没有发散、没有过拟合上扬**。
+`best.pt` 仍然是**噪声选出来的**（val 最优点在 step 10000，而 13000/14000 更高），验收一律用 `last.pt`（§5.2）。
+
+---
+
+## 1. 尺子 A：v2 的 val（`val_char_v2.bin`，25 源 / 800 窗口）
+
+与 `analysis/per_source_ce_before_B.txt` **同口径、同窗口、确定性**（24 源 768 窗口实际有效：
+1 个源没有可用窗口）。
+
+| step | real CE | shuffled | real−shuffled |
+|---|---:|---:|---:|
+| 61000（v2 基座，起跑前） | 3.0095 | 5.0599 | **−2.0504** |
+| 5000 | 3.6510 | 5.3318 | −1.6808 |
+| 10000 | 3.7392 | 5.3763 | −1.6371 |
+| 13000 | 3.7531 | 5.4011 | −1.6520 |
+| **14000（B 终态）** | **3.7458** | 5.3967 | **−1.6509** |
+| [对照] 随机权重 | 9.0416 | 9.0431 | **+0.0015** |
+
+分组（token 加权）：
+
+| step | 散文/语言 | 知识/长文 | 代码 | 数学/推理 | 对话 |
+|---|---:|---:|---:|---:|---:|
+| 61000 | 4.0757 | 3.0143 | 2.2942 | 2.4828 | 2.6054 |
+| 14000 | 4.6876 | 3.6475 | 3.1431 | 3.2526 | 3.4111 |
+| Δ | **+0.61** | **+0.63** | **+0.85** | **+0.77** | **+0.81** |
+
+**读数**：25 源**无一例外**变差；全库 real CE **+0.736**、上下文净利用 **−0.40**。
+[对照] 随机权重落在 log(8192)=9.01、`real−shuffled=+0.0015` ⇒ **尺子有效、判据非恒真**。
+
+两个决定解释方式的细节：
+1. 变差**在 step 5000 就基本完成**（那时 25 源 Δreal 已 +0.19~+0.97），之后 9000 步走平
+   ⇒ **一次性位移**，不是渐进漂移。
+2. 散文（四大名著，B **完全没训过**）的 `real−shuffled` 几乎没动（+0.02~+0.09），
+   而 real 与 shuffled **同步**涨约 0.7 ⇒ 这一类是**整体分布位移**；
+   对话类则 real 掉得比 shuffled 多（`dailychat`：Δreal +1.09、Δ(real−shuffled) +0.79）
+   ⇒ 这一类**连"用上下文"都退化了**。
+
+```bash
+.venv/bin/python scripts/per_source_ce_probe.py --ckpts out/base_v2/last.pt out/base_v3_dlg/ckpt_step_5000.pt out/base_v3_dlg/ckpt_step_10000.pt out/base_v3_dlg/ckpt_step_13000.pt out/base_v3_dlg/last.pt > analysis/per_source_ce_after_B.txt
+.venv/bin/python scripts/per_source_ce_probe.py --ckpts out/base_v3_dlg/last.pt --control-random --no-unigram > analysis/per_source_ce_B_controlcheck.txt
+```
+
+---
+
+## 2. 尺子 B：B 段**自己的** val（`val_char_v3_dlg.bin`，9 源）
+
+★ 这条**原来跑不出来**：探针的"源对齐对照"硬编码了 manifest_v2 的三个源名，
+换成 v3_dlg manifest 直接 `KeyError` 崩（早期版本留痕在 `analysis/per_source_ce_B_ownval.txt`）。
+已修为 `align_control_names()`（有 v2 对照源就用它、没有就退化成该 manifest 自己的前 3 个源），
+并补 4 条测试钉住 —— 修完才拿到下表。
+
+| step | real CE | shuffled | real−shuffled |
+|---|---:|---:|---:|
+| 61000（v2 基座） | 2.7415 | 4.7399 | −1.9984 |
+| 5000 | 2.2977 | 4.6085 | −2.3108 |
+| **14000（B 终态）** | **2.1875** | 4.6199 | **−2.4324** |
+
+逐源（real CE，8 个非空源**全部**变好）：
+
+| 源 | v2 61000 | B 14000 | Δ |
+|---|---:|---:|---:|
+| belle_multiturn.txt | 2.6759 | 2.0218 | −0.654 |
+| dailychat_dialogue.txt | 2.6860 | 2.1976 | −0.488 |
+| escov_zh.txt | 2.7346 | 2.1830 | −0.552 |
+| glm_dialogue.txt | 2.6808 | 2.1557 | −0.525 |
+| kdconv_dialogue.txt | 2.7724 | 2.3011 | −0.471 |
+| lccc_dialogue.txt | 2.6831 | 2.1264 | −0.557 |
+| sharegpt_zh_38k.txt | 2.7803 | 2.2799 | −0.500 |
+| wildchat_zh.txt | 2.9255 | 2.2371 | −0.688 |
+
+```bash
+.venv/bin/python scripts/per_source_ce_probe.py --data data/chinese/val_char_v3_dlg.bin --offsets data/chinese/val_char_v3_dlg.off --manifest data/chinese/manifest_v3_dlg.json --train-bin data/chinese/train_char_v3_dlg.bin --ckpts out/base_v2/last.pt out/base_v3_dlg/ckpt_step_5000.pt out/base_v3_dlg/last.pt > analysis/per_source_ce_B_ownval.txt
+```
+
+---
+
+## 3. ★ 两把尺子给出**相反符号**（同一个源也相反）
+
+| 源 | 在 v2 val 上 | 在 v3_dlg val 上 |
+|---|---:|---:|
+| `dailychat_dialogue.txt` | 2.1699 → 3.2627（**+1.09**） | 2.6860 → 2.1976（**−0.49**） |
+| `lccc_dialogue.txt` | 2.4994 → 3.3155（**+0.82**） | 2.6831 → 2.1264（**−0.56**） |
+
+同一个源名、同一个模型、**符号相反** ⇒ 两个 val 集**不是同一把尺子**
+（v2 的 `prepare.py` 与 v3 的清洗+重建是两条数据管线；§5.11 的"先核对源集合与口径"）。
+
+---
+
+## 4. 污染率：val 窗口**不是**训练集的逐字重复 [实测]
+
+方法：`scripts/val_train_contamination_probe.py` —— 把探针**实际用的那批窗口起点**
+（`--dump-windows` 落盘，避免"照抄采样逻辑"走样）取前 32 token 做定长滚动哈希，
+**流式**扫训练 bin（不建全量索引：v2 那个 9.4 亿 token 的 bin 建索引要 ~7.5GB，
+前面两次尝试就是被 OOM 杀掉的）。
+
+| val 侧 | 对 `train_char_v3_dlg.bin` | 对 `train_char_v2.bin` |
+|---|---|---|
+| v2 的 val | **0 / 369 = 0.00%** | **0 / 369 = 0.00%** |
+| v3_dlg 的 val | **0 / 153 = 0.00%** | **0 / 153 = 0.00%** |
+
+**已知答案对照**（同一次扫描、同一条代码路径、四个组合全过）：
+在当前扫的那个 bin 里随机截的片段 **5/5 命中**，同段打乱 **0/5 命中**
+（如方向 1 对 v3_dlg train：`train_raw 5/5`、`train_shuffled 0/5`；对 v2 train 则反过来
+`ctrl_raw 5/5`）⇒ 判据能区分"查得到"和"查不到"两种情形，不是恒真。
+
+**边界（必须一起读）**：
+- 只有**前 32 token 全是普通字符**的窗口可查：v2 val 覆盖 **369/768（48%）**、
+  v3_dlg val 覆盖 **153/256（60%）**。被跳过的恰恰是**含 `<eos>`/`<cont>` 的对话窗口**，
+  所以覆盖面偏向长段正常文本，`wildchat_zh.txt` 只剩 5/32。
+- 判据是**逐字 32-gram**。**近重复**（例如同一句话只差一个终止符位置、或重新切分）
+  **不能**被这条排除。
+- 碰撞上界 ≈ 2.4e-9 ⇒ 可视为精确等值匹配。
+
+**★ 顺带纠正一条文档说法**：`AGENTS.md §1` 写着"warm start 之后 `v3_*` 的 val 基本失效
+（v2 见过同批 block 的 99%）"。本次实测在**逐字 32-gram** 口径下，
+`val_char_v3_dlg` 在 `train_char_v2` 里命中 **0/153**。⇒ 那句话要么指的是**另一种口径**
+（同源/同分布，而非同文本），要么需要更正。**不要**再把它当成"v3 val 已被 v2 背下来"的实测依据。
+
+```bash
+.venv/bin/python scripts/per_source_ce_probe.py --ckpts out/base_v2/last.pt --dump-windows out/val_windows_v2.json --no-unigram
+.venv/bin/python scripts/val_train_contamination_probe.py --windows out/val_windows_v2.json --train-bin data/chinese/train_char_v3_dlg.bin --control-train-bin data/chinese/train_char_v2.bin --out analysis/val_train_contamination_v2val.md
+.venv/bin/python scripts/val_train_contamination_probe.py --windows out/val_windows_v3dlg.json --train-bin data/chinese/train_char_v3_dlg.bin --control-train-bin data/chinese/train_char_v2.bin --out analysis/val_train_contamination_v3dlgval.md
+```
+
+---
+
+## 5. 生成质量（不依赖 CE 口径的独立证据）[实测]
+
+同一批 prompt、同一个 `--style=ab`、同一套解码参数，两个 ckpt 硬链接进 `out/_eval_*`：
+
+| 指标 | v2 基座 (61000) | B 终态 (14000) | 方向 |
+|---|---:|---:|---|
+| avg_len | 22.5 | 33.7 | 更长 |
+| 空白占比 ws% | 1.09% | **0.00%** | 好 |
+| distinct-2 | 0.833 | **0.981** | 好 |
+| rep2 / rep3 | 0.0 / 0.0 | 0.038 / 0.0088 | 略升（≪0.3 阈值） |
+| 收尾率 | 100% | 83% | 略降 |
+| **自开轮次率** | 0% | **17%** | 好 |
+| 收不住率 | 0% | 0% | 同 |
+| 崩溃数 | 0 | 1 | 略差 |
+
+代表样本（同 prompt）：
+
+| prompt | v2 基座 | B |
+|---|---|---|
+| `A：你好` | `你还是老` | `你好！今天我能为您做什么？` |
+| `A：帮我推荐一本小说吧。` | `你可以陪我一起跳舞啦` | `你想看什么类型的书呢？` → `我推荐你阅读《百年孤独》…` |
+| `A：最近工作压力好大，怎么办啊？` | `你还是老师，也有学生关注哪些安全发展情况。一直没法拿到专业知识啊。` | `你还有老师，也有老师关注你，安稳发展哦` |
+
+**口径自证**：当年存档的 `out/_nat_61000` 与本次 `out/_eval_v2base` 并排 ——
+`avg_len 22.5 / rep3 0.0 / ws 0.0109 / turns 0.0` 与样本 `你还是老` **逐字复现**
+⇒ 评估器没有漂移，B 的差异不是换脚本换出来的。
+
+⚠ `turns` 两个模型都是 0.0，且**历史 8 个模型全是 0.0**（`style=none`）⇒ 已知债
+（`TECH_DEBT` §1.13 一带），**不要**把它读成"B 的轮次结构退化"。
+
+---
+
+## 6. 结论（逐条标注证据强度）
+
+1. **[实测·配对·确定性]** B 段在自己那一段的数据分布上**确实变好了**：
+   v3_dlg val real CE **−0.554**、上下文净利用 **+0.434**、8/8 非空源同向；
+   污染率 **0/153** ⇒ **不是"背下来"**。
+2. **[实测·配对·确定性]** 生成侧同向变好：空白 1.09%→0%、distinct-2 0.83→0.98、
+   自开轮次 0%→17%、样本从残句变成像样的对话回复。
+3. **[实测·配对·确定性]** 但 v2 那套 val 上**全 25 源变差 +0.736**，
+   且污染率同为 **0/369** ⇒ 这**不是**"B 见了那些 block"，而是**真的漂离了 v2 的分布**：
+   散文类（B 没训过）是整体分布位移，对话类是连上下文利用都退化。
+4. **[实测]** 两个 val 集对同一个源给出**相反符号** ⇒ 两条数据管线产出的文本不是同一把尺子。
+   ⇒ **不能**只凭 §1 说"B 把模型训坏了"，也**不能**只凭 §2 说"B 全面变好"：
+   正确读法是**"B 向 v3 管线那套分布迁移，并为此付出 v2 分布的代价"**。
+5. **[实测]** 训练过程本身健康（`success`、无 OOM、无异常关键字、曲线无发散）。
+6. **[未测]** 只跑了**一个训练 seed**；没有 ablation（没有"混通用数据""降 lr""跑完 A 再跑 B"的对照臂）
+   ⇒ "代价是不是 lr 太高 / 数据太窄造成的"**无法归因**，只能列为嫌疑。
+
+## 7. 留给下一轮的债
+
+| # | 事项 |
+|---|---|
+| 1 | **验收口径要写清**：warm start 后的分段训练，必须**同时报两把尺子**（stage 自己的 val + v2 val），并明说两者量的是"自己的分布"与"离旧分布多远"。已写进 `AGENTS.md §5.12` |
+| 2 | `AGENTS.md §1` 里"v2 见过 v3 val 的 99%"**待更正或注明口径**（本次逐字口径实测 0/153） |
+| 3 | `turns` 指标恒 0（历史 8 模型全 0）—— 空指标，别用它下结论 |
+| 4 | `best.pt` 噪声选点（step 10000），验收用 `last.pt`（已有铁律，但本次又是活例） |
+| 5 | 污染率只覆盖"前 32 token 全普通"的窗口（48%/60%），且只测**逐字**；**近重复**未测 |
