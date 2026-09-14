@@ -66,6 +66,25 @@ def special_mask(tokenizer_path, vocab_size=8192):
     return m
 
 
+V2_ALIGN_CONTROLS = ('c4_zh.txt', 'classical_poetry.txt', 'deepseek_r1_distill_dialogue.txt')
+
+
+def align_control_names(spans, order, raw):
+    """挑「源对齐对照」用哪几个源，并回传要打印的说明。
+
+    优先用 manifest_v2 的三个对照源（历史存档用了它们，口径可比）；
+    换 manifest 时（v3_dlg / v3_know 的源名集不同）退化成**该 manifest 自己的前 3 个源**，
+    并回一句说明 —— 免得读者以为对照源还是那三个。
+    ★ 没有这条退化路径就会 KeyError 崩在对照上（2026-09-14 实测：在 v3_dlg val 上崩过一次，
+      导致"B 段在自己 val 上到底怎样"这个问题整轮没答案）。
+    """
+    names = [n for n in V2_ALIGN_CONTROLS if n in spans and n in raw]
+    if names:
+        return names, ''
+    fallback = [n for n in order if n in raw][:3]
+    return fallback, f"本 manifest 不含 v2 对照源名，改用其前 3 个源：{fallback}"
+
+
 def source_spans(manifest_path, off):
     """按 manifest 的 source_files 顺序把 val 的 block 区间切成逐源 token 区间。
 
@@ -152,16 +171,23 @@ def score(model, starts, data, spec, uni, block_size, batch_size, device, ctx,
     return tot / n, hit / n, (uni_tot / n if uni_t is not None else float('nan')), n
 
 
-def eval_all_sources(model, args, data, off, spans, order, spec, uni, dev, ctx, seed):
+def eval_all_sources(model, args, data, off, spans, order, spec, uni, dev, ctx, seed,
+                     dump_path=None):
     """逐来源算 (real, shuffled, unigram) CE。
 
     抽成函数是为了让**随机初始化对照**复用同一条代码路径 —— 对照必须和实测走同一段代码，
     否则它证明的是另一段代码没坏（`ml-experiment-attribution` §2.2）。
+
+    `dump_path` 非空时，把**实际用到的窗口起点**逐源落盘（JSON）。
+    ★ 为什么需要它：要审"这批 val 窗口是不是训练集的近重复"，
+      审计脚本必须用**和探针完全同一批窗口**，靠"照抄采样逻辑"很容易差一个 rng 消耗
+      （本函数的 rng 还被 shuffled 的 permutation 消耗）。落盘是唯一不会走样的做法。
     """
     rng = np.random.default_rng(seed)
     print(f"{'来源':<36}{'组':<9}{'real CE':>9}{'top1%':>8}{'shuf CE':>9}"
           f"{'unigram':>9}{'real-uni':>10}{'n_tok':>8}")
     rows = {}
+    dumped = {}
     for name in order:
         s0, s1 = spans[name]
         if s1 - s0 <= args.block_size + 1:
@@ -183,8 +209,15 @@ def eval_all_sources(model, args, data, off, spans, order, spec, uni, dev, ctx, 
             raise SystemExit(f"错误：{name} 的有效 token 为 0 —— 掩码或采样坏了，"
                              f"不要拿 nan 当结论")
         rows[name] = dict(ce=ce, acc=acc, sce=sce, uce=uce, n=n)
+        dumped[name] = [int(s) for s in starts]
         print(f"{name:<36}{group_of(name):<9}{ce:>9.4f}{acc * 100:>8.2f}{sce:>9.4f}"
               f"{uce:>9.4f}{ce - uce:>+10.4f}{n:>8,}")
+    if dump_path:
+        json.dump(dict(block_size=args.block_size, seed=seed, data=args.data,
+                       offsets=args.offsets, manifest=args.manifest,
+                       windows_per_source=args.windows_per_source, starts=dumped),
+                  open(dump_path, 'w'), ensure_ascii=False, indent=1)
+        print(f"已落盘窗口起点 → {dump_path}（{len(dumped)} 源）")
     return rows
 
 
@@ -205,6 +238,9 @@ def main():
     ap.add_argument('--no-unigram', action='store_true', help='跳过 unigram 对照')
     ap.add_argument('--control-random', action='store_true',
                     help='★ 已知答案对照：再评一个随机初始化的模型，real 必须约等于 shuffled')
+    ap.add_argument('--dump-windows', default=None,
+                    help='把**第一个 ckpt** 实际用的窗口起点逐源落盘成 JSON，'
+                         '供"val 是否训练集近重复"的审计脚本复用同一批窗口')
     args = ap.parse_args()
 
     spec = special_mask(args.tokenizer)
@@ -215,9 +251,16 @@ def main():
           f"block={args.block_size}  特殊id={int(spec.sum())}")
 
     # —— 对照 ①：切片是否与源对齐（c4_zh 无回复终止符 → token/chars 应 ≈ 1.0）
+    #   ⚠★ 这三个是 **manifest_v2** 的源名。换 manifest 时（如 v3_dlg / v3_know 只有 9 个源、
+    #   源名集不同）硬查会 KeyError 直接崩 —— 2026-09-14 实测踩到。
+    #   ⇒ 有 v2 对照源就用它（口径可比），没有就退化成"该 manifest 自己的前 3 个源"，
+    #     并在输出里**显式注明换过对照源**，免得读者以为还是那三个。
     m = json.load(open(args.manifest))
     raw = {s['file']: s['val_chars_raw'] for s in m['source_breakdown']}
-    for name in ['c4_zh.txt', 'classical_poetry.txt', 'deepseek_r1_distill_dialogue.txt']:
+    ctrl_names, ctrl_note = align_control_names(spans, order, raw)
+    if ctrl_note:
+        print(f"  [对齐对照] {ctrl_note}")
+    for name in ctrl_names:
         s0, s1 = spans[name]
         r = (s1 - s0) / max(raw[name], 1)
         print(f"  [对齐对照] {name:<34} token/raw_chars = {r:.4f}")
@@ -237,7 +280,8 @@ def main():
         step = ck.get('iter_num', -1)
         print(f"\n=== step {step}  ({path}) ===")
         all_rows[step] = eval_all_sources(model, args, data, off, spans, order,
-                                          spec, uni, dev, ctx, args.seed)
+                                          spec, uni, dev, ctx, args.seed,
+                                          dump_path=(args.dump_windows if ci == 0 else None))
         del model
         torch.cuda.empty_cache()
 
