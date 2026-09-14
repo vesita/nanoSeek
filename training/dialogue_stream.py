@@ -1,58 +1,71 @@
-"""对话流与上下文窗口管理 —— 「按句滑窗 + `自己：` + `<resp>`」（v1）。
+"""对话流与上下文窗口管理 —— 「按句滑窗 + `<resp>` 内联 + 单流」（v2）。
 
-设计来源：用户 2026-09-14 提出。四条规则：
+设计来源：用户 2026-09-14 提出并拍板。四条规则：
 
 1. **按句分布** —— 对话流是一串「句子」，每句带说话人标签；
-2. **滑窗按句弹出** —— 总长超过上下文窗口时，从**头部弹出整句**，直到新的句子放得下；
-3. **`自己：` 自动补齐** —— 模型自己的轮次在**持久记录**里带 `自己：` 前缀；
-4. **`<resp>` cue** —— 轮到模型时，喂给它的上下文末尾加一行 cue；
-   模型**只生成内容**（不生成自己的标签），生成完把内容以 `自己：` 记回流里。
+2. **滑窗按句弹出** —— 总长超过上下文窗口时，从**头部弹出整句**，直到新句子放得下；
+3. **模型自己的轮次内联标记** —— 用**单 token** `<resp>`（id 140）标在轮首；
+4. **保持单条连续流**（用户 2026-09-14 选「乙」）—— 不再有"临时的尾部 cue"。
 
-★ 规则 3 与 4 的**关键区分**（本模块存在的理由）：
+★ 由此得到的**日志形态**（`render()`）：
 
-    【持久记录 transcript】  A：你好，我是李华。\\n自己：你好。
-    【模型看到的 prompt】    A：你好，我是李华。\\n<resp>
+    对象A：你好，我是李华。
+    <resp>你好呀。我是小寻。<eos>
+    对象A：你多大了？
+    <resp>还在长个儿呢。<eos>
 
-   ⇒ prompt **绝不带悬空的 `自己：` 结尾**。以标签结尾＝把模型自己的轮次变成
-     匿名「待填槽位」（`B：` 的老毛病），模型就永远学不会「我是谁」。
-      见 `tests/test_dialogue_stream.py::test_prompt_never_ends_with_self_label`。
+  而**模型输入**（`prompt()`）＝日志 + 末尾一行 `<resp>`。
 
-★ 与已有 `<eos>` / `<cont>` 的关系（**互补，不冲突**）：
+★★ **零替换的严格连续性**（这是选「乙」的全部意义，有测试钉住）：
 
-   - `<cont>`（id 130，见 `data/chinese/prepare.py::annotate_replies`）＝
-     「我说完了、**请对方继续**」——是**轮末**标记，**由模型生成**；
-   - `<resp>`＝「**该你说了**」——是**轮首**提示，**由外部（harness）插入**。
+    prompt_k + target_k  ==  日志_{k+1}          ← 逐字符相等，**没有任何替换**
 
-   所以一次完整往返大致是：
-       prompt（以 cue 结尾） → 模型生成 `你好。<cont>` → 记成 `自己：你好。<cont>`
-       → 对方说话 → prompt 再次以 cue 结尾 …
+  对比选「甲」时的形态：那里 `prompt_{k+1}` 里 cue 要被 `自己：` **替换**掉，
+  所以数据只能是 (prompt, target) **对**、喂不进「一条长流 + 按终止符掩码」的现有管线。
+  「乙」把它变成连续流，现有管线能用。
 
-★ `cue` 是**单 token**（`id=140`，2026-09-14 落地，见 `TURN_CUE_ID`）：
+★ **`自己：` 哪去了**（2026-09-14 实现时的一个判断，见 §决策）：
+  `自己：` 的角色被 `<resp>` **吸收**了 —— 两者都是"我的轮次从这里开始"。
+  合并的好处：**1 token 取代 3 token**（`自己：` = `自`+`己`+`：`），
+  而且消除"两个标记说同一件事"的冗余。**语义意图完全保留**（上下文里自动出现
+  一个自我标记），只是它现在叫 `<resp>`。
+  ⇒ 因此 `SELF_LABEL`（`'自己'`）只是**内部哨兵**，**永远不会被渲染成 `自己：`**。
 
-   机制符区间的第一个预留位 `<res0>` 被**改名**成 `<resp>` 并登记为 special，
-   用法与 `<eos>`(128) / `<cont>`(130) 同族 ⇒ `encode(cue) == [140]`（改前是 7 个 token）。
+★ **训练目标**（`iter_training_samples` 产出）＝「内容 + `<eos>`」，**不含** `<resp>`
+  （`<resp>` 由 harness 喂，不由模型生成）。哪些 token 该算 loss 见 `loss_token_spans()`。
 
-   ★ **为什么用新位（140）而不回收退休的 `<cont>`（130）** —— 2026-09-14 定：
-     回收是**零收益**（词表大小与 id 数都不变，130 和 140 都照样占位），
-     代价却是污染既有数据：id 130 在既有 bin 里共 **1,003,220** 个 `<cont>`
-     （v2 344,673 / know 174,405 / dlg 163,989 / 旧 char 320,153）—— 改名会让这
-     100 万 token 的含义变化。而且它违反 `train_tokenizer.py:57`
-     「命名机制符顺序即 id，**绝不更改**」；B 段 ckpt 还在这 16 万个 `<cont>`
-     上训过 1 epoch（强先验），换名是主动和已学关联对撞。**全新 id 零先验，严格更优。**
+★ 与已有 `<eos>` / 退休的 `<cont>` 的关系（用户 2026-09-14 决定：**合并 `<cont>`、保留 `<eos>`**）：
 
-   ★ 名字纯属可读性取舍：当天先叫 `<你该说话了>`（自解释），随后改成 `<resp>`
-     （短、与 `<eos>`/`<cont>`/`<pad>` 同族）——**同一个 id，纯改名**，
-     token 数不变，旧数据与 ckpt 不受影响。
+   - `<eos>`(128)＝「本轮说完，可以停」——**保留**，贴在每轮模型回复末尾；
+   - `<cont>`(130)＝「说完但请对方继续」——**新数据不再生成**（语义已被轮次机制取代）。
+     ⚠ **token 本身绝不能删**：既有 bin 里它有 **1,003,220** 个
+     （v2 344,673 / know 174,405 / dlg 163,989 / 旧 char 320,153），删了旧 bin 就解不出来。
 
-   ★ **安全性已实测**（这是能这么改的前提）：
-     - 词表仍是 **8192**；id `0..139` 逐位未变；**汉字区 `384..8191` 逐位未变**；
-     - 12 个语料源各取 5KB，编码**逐位相同**（改前 vs 改后）；
-     - 所有 char-level bin（`train_char` / `v2` / `v3_{lang,know,dlg}` + 5 个 val）
-       在 id `140..383` 区间**零命中**（只有废弃的旧 BPE `train.bin` 有命中，它属另一套 tokenizer）。
-     ⇒ **既有 bin 与 checkpoint 全部继续有效，不需要重建任何数据。**
+★ ★ **`prepare.py` 一个字都不用改**：`annotate_replies` 只认 `用户：`/`模型：`（`:222`），
+  非匹配行**原样保留**（`:251-255`）⇒ 我们的 `对象A：`/`<resp>` 格式**完全绕过**那套标注
+  （不插 `<eos>`/`<cont>`、不做 70% `A：/B：` 改写、不加引号、不走 `_should_continue`）。
+  **终止符由本模块自己插。**
 
-   注意：`Tokenizer.decode` 默认 `skip_special_tokens=True`，所以 `decode([140])` 返回 `''`；
-   要拿回文本得 `decode([140], skip_special_tokens=False)`（`<eos>` 一直也是这行为）。
+★ **`<resp>` 是单 token（`id=140`）**，2026-09-14 落地：
+  机制符区间的第一个预留位 `<res0>` 被改名成 `<resp>` 并登记为 special，
+  用法与 `<eos>`(128) / `<cont>`(130) 同族 ⇒ `encode('<resp>') == [140]`（改前是 7 个 token）。
+
+  ★ **为什么用新位（140）而不回收退休的 `<cont>`（130）**：
+    回收是**零收益**（词表大小与 id 数都不变，130 和 140 都照样占位），
+    代价却是污染既有数据 —— id 130 在既有 bin 里共 1,003,220 个 `<cont>`，改名会让这
+    100 万 token 的含义变化。而且它违反 `train_tokenizer.py:57`
+    「命名机制符顺序即 id，**绝不更改**」；B 段 ckpt 还在这 16 万个 `<cont>` 上训过
+    1 epoch（强先验），换名是主动和已学关联对撞。**全新 id 零先验，严格更优。**
+
+  ★ **安全性已实测**（这是能这么改的前提）：
+    - 词表仍 **8192**；id `0..139` 逐位未变；**汉字区 `384..8191` 逐位未变**；
+    - 29 个语料源各取 5KB，编码**逐位相同**（改前 vs 改后）；
+    - 所有 char-level bin 在 id `140..383` 区间**零命中**（只有废弃的旧 BPE `train.bin` 有，
+      它属另一套 tokenizer）。
+    ⇒ **既有 bin 与 checkpoint 全部继续有效，不需要重建任何数据。**
+
+  注意：`Tokenizer.decode` 默认 `skip_special_tokens=True`，所以 `decode([140])` 返回 `''`；
+  要拿回文本得 `decode([140], skip_special_tokens=False)`（`<eos>` 一直也是这行为）。
 
 ★ 本模块**不含任何人格内容**，是纯机制 —— 人格定义在仓库外（`~/datasets/persona/`）。
 """
@@ -64,22 +77,13 @@ from typing import Callable, Iterator, List, Sequence, Tuple
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-SELF_LABEL = '自己'
-TURN_CUE = '<resp>'
-TURN_CUE_ID = 140  # 机制符区间第一个预留位（原 <res0>）被改名为 cue；见模块 docstring
-EOS = '<eos>'
+SELF_LABEL = '自己'      # ★ 内部哨兵：表示"这是模型的轮次"。**不渲染成 `自己：`**，渲染成 `<resp>`
+TURN_CUE = '<resp>'      # 模型轮次的内联标记；tokenizer id = 140，**单 token**
+TURN_CUE_ID = 140
+EOS = '<eos>'            # 轮末终止符（保留；`<cont>` 已退休）
+EOS_ID = 128
 
-# ★ 2026-09-14 用户决定：**合并 `<cont>`、保留 `<eos>`**。
-#   - `<cont>`（id 130）在新格式里**不再生成** —— 它的语义（"我说完但请对方继续"）
-#     已被轮次机制取代：cue 标记「该你说了」，下一个说话人标签标记「我接上了」。
-#   - `<eos>`（id 128）**保留**，贴在每轮模型回复末尾（与仓库既有约定一致，
-#     见 `prepare.py:248`）。
-#   ⚠ **token 本身不能删**：既有 bin 里 `<cont>` 有 50 万个（v2 344,673 /
-#     v3_dlg 163,989），删了旧 bin 就解不出来。只是"新数据不再生成"。
-#   ★ 附带好处：`prepare.py::annotate_replies` **只认 `用户：`/`模型：`**（`:222`），
-#     非匹配行**原样保留**（`:251-255`）⇒ 我们的 `对象A：`/`自己：` 格式**完全绕过**
-#     那套标注（也不做 70% `A：/B：` 改写、不加引号、不走 `_should_continue`），
-#     **`prepare.py` 一个字都不用改**。
+Entry = Tuple[str, str]  # (speaker, sentence)
 
 
 def _load_split_line():
@@ -100,37 +104,32 @@ def _load_split_line():
 
 split_line = _load_split_line()
 
-Entry = Tuple[str, str]  # (speaker, sentence)
-
 
 class DialogueStream:
-    """按句滑窗的对话流 + 双视图渲染（持久记录 / 模型 prompt）。
+    """按句滑窗的对话流 + 单流渲染（模型输入 / 日志是**同一条流**）。
 
     参数
     ----
     encode : Callable[[str], Sequence[int]]
-        **必须传真实 tokenizer 的 encode** —— 窗口是按 token 算的，不是按字符。
+        **必须传真实 tokenizer 的 encode** —— 窗口按 token 算，不按字符算。
         测试里传 `lambda s: list(s)` 就能拿到「1 字 = 1 token」的已知答案。
     window : int
-        上下文窗口（token）。**约束的是模型输入**（含 cue），不是生成出来的回复。
+        上下文窗口（token）。**约束模型输入**（即日志 + 末尾 `<resp>`），
+        不含模型将要生成的回复。
     self_label : str
-        模型自己的持久标签，默认 `自己`。
+        内部哨兵，默认 `自己`；**不参与渲染**（渲染成 `<resp>`）。
     cue : str
-        轮首提示，默认 `<resp>`。
+        模型轮次的内联标记，默认 `<resp>`（单 token）。
     colon : str
-        标签后冒号，默认全角 `：`（与仓库既有语料一致）。
-        ⚠ 用户 2026-09-14 一条消息里写过半角 `A:`，**尚未最终定**，故做成参数。
+        其他人标签后的冒号，默认全角 `：`（与仓库既有语料一致）。
     max_sentence_len : int
         交给 `split_line` 的超长句二次切阈值。
     group_turns : bool
         True（默认）＝把连续同一说话人的句子**合并成一行**。
-        ⚠ 默认值是 True 而不是 False，理由是**训练目标要与渲染一致**：
-        模型一次生成的是"整轮回复"，若渲染成"一句一行"，`prompt + target`
-        就和下一轮的 prompt 对不上了（多出了重复标签）。见
-        `tests/test_dialogue_stream.py::test_samples_are_self_consistent`。
         内部仍**按句存储**，所以窗口照样在句子边界弹出。
+        这是保证「`prompt + target` 等于下一段日志」的必要条件。
     emit_eos : bool
-        True（默认）＝每轮模型回复末尾追加 `<eos>`（`<cont>` 已按用户决定废弃）。
+        True（默认）＝每轮模型回复末尾追加 `<eos>`。
     """
 
     def __init__(
@@ -163,6 +162,9 @@ class DialogueStream:
         return len(self.encode(text))
 
     def _label(self, speaker: str) -> str:
+        """模型自己的轮次用 `<resp>`（无冒号）；其他人用 `名字：`。"""
+        if speaker == self.self_label:
+            return self.cue
         return f'{speaker}{self.colon}'
 
     # ---------- 写入 ----------
@@ -175,21 +177,18 @@ class DialogueStream:
         self.enforce_window()
 
     def commit(self, text: str) -> None:
-        """把模型**生成的内容**以 `自己：` 记入持久记录（标签这里补）。
+        """把模型**生成的回复**记入日志（标记 `<resp>` 由 `_label` 补，函数只存正文）。
 
-        `emit_eos=True`（默认）时，在本轮**最后一句**末尾追加 `<eos>` ——
-        与仓库既有约定一致（`<eos>` 直接贴在整条回复末尾，见 `prepare.py:248`）。
-        `<cont>` 已按用户 2026-09-14 的决定**不再生成**。
+        `emit_eos=True`（默认）时在本轮**最后一句**末尾贴 `<eos>`，贴完**重新收窗**。
         """
         before = len(self._entries)
         self.append(self.self_label, text)
         if self.emit_eos and len(self._entries) > before:
             spk, sent = self._entries[-1]
             self._entries[-1] = (spk, sent + EOS)
-            # ★ 必须**重新收窗**：`<eos>` 是在 `append()` 的 `enforce_window()` **之后**
-            #   才贴上去的，会让最后一句话变长 5 个 token。漏了这一步就会出现
-            #   「context_len() > window 但 overflow 仍是 False」这种自相矛盾的状态。
-            #   （这个 bug 靠改名把 cue 从 7 字变 6 字、挪动了测试里的长度算术才暴露出来。）
+            # ★ 必须重新收窗：`<eos>` 是在 append() 的 enforce_window() **之后**贴上去的，
+            #   会让最后一句话变长。漏了这一步就会出现「context_len() > window 但
+            #   overflow 仍是 False」这种自相矛盾的状态。
             self.enforce_window()
 
     def rename(self, old: str, new: str) -> int:
@@ -210,7 +209,7 @@ class DialogueStream:
         return n
 
     def enforce_window(self) -> None:
-        """从头部弹出**整句**，直到模型输入（含 cue）放得进窗口。
+        """从头部弹出**整句**，直到模型输入（日志 + 末尾 `<resp>`）放得进窗口。
 
         - 只在**句子边界**弹 ⇒ 永远不会留下半句；
         - 至少保留 1 句 ⇒ 单句超窗时不死循环，而是置 `overflow=True`（软上限）。
@@ -222,8 +221,8 @@ class DialogueStream:
 
     # ---------- 渲染 ----------
 
-    def render(self, *, cue: bool = False) -> str:
-        """渲染对话流。`cue=True` 即**模型看到的 prompt**。"""
+    def render(self) -> str:
+        """渲染**日志**（持久记录）—— 模型自己的轮次带 `<resp>` 前缀。"""
         lines: List[str] = []
         if self.group_turns:
             cur_spk, buf = None, ''
@@ -238,25 +237,26 @@ class DialogueStream:
                 lines.append(self._label(cur_spk) + buf)
         else:
             lines = [self._label(spk) + sent for spk, sent in self._entries]
-        if cue:
-            lines.append(self.cue)
         return '\n'.join(lines)
 
     def prompt(self) -> str:
-        """喂给模型、请它说话的上下文：持久记录 + 末尾一行 cue。
+        """喂给模型、请它说话的输入 ＝ **日志 + 末尾一行 `<resp>`**。
 
-        ★ 末尾**永远**是 cue，**不是** `自己：` —— 见模块 docstring。
+        ★ 与日志是**同一条流**：`prompt()` 只是日志再往前推一格。
+          于是 `prompt_k + target_k == 日志_{k+1}`（**零替换**）——
+          这是选「乙」而不是「甲」的全部意义，见 `test_stream_is_strictly_contiguous`。
         """
-        return self.render(cue=True)
+        body = self.render()
+        return f'{body}\n{self.cue}' if body else self.cue
 
     # ---------- 度量 ----------
 
     def transcript_len(self) -> int:
-        """持久记录的 token 数（不含 cue）。"""
+        """日志的 token 数（不含末尾待生成的 `<resp>`）。"""
         return self._n(self.render())
 
     def context_len(self) -> int:
-        """模型输入的 token 数（**含 cue**）—— 窗口约束的就是它。"""
+        """模型输入的 token 数（含末尾 `<resp>`）—— 窗口约束的就是它。"""
         return self._n(self.prompt())
 
     def history(self) -> List[Entry]:
@@ -266,6 +266,36 @@ class DialogueStream:
         self._entries.clear()
         self.dropped = 0
         self.overflow = False
+
+    # ---------- loss 区间 ----------
+
+    def loss_token_spans(self, text: str | None = None) -> List[Tuple[int, int]]:
+        """返回日志里**该算 loss** 的 token 区间（半开区间 `[start, end)`）。
+
+        规则：每段 `<resp>` **之后**、到对应的 `<eos>`（含）为止 —— 即"模型自己说的话"。
+        提示词（别人的话 + `<resp>`）不算 loss。
+
+        实现不写死 id：它先 `encode(cue)` / `encode(EOS)` 拿到 token 序列再在流里搜，
+        所以真 tokenizer（`<resp>`=[140]、`<eos>`=[128]）和测试用的假编码器都能用。
+        """
+        ids = list(self.encode(self.render() if text is None else text))
+        cue_ids = list(self.encode(self.cue))
+        eos_ids = list(self.encode(EOS))
+        spans: List[Tuple[int, int]] = []
+        i = 0
+        while i < len(ids):
+            if ids[i:i + len(cue_ids)] == cue_ids:
+                k = i + len(cue_ids)
+                while k < len(ids) and ids[k:k + len(eos_ids)] != eos_ids:
+                    k += 1
+                if k < len(ids):
+                    spans.append((i + len(cue_ids), k + len(eos_ids)))
+                    i = k + len(eos_ids)
+                    continue
+            i += 1
+        return spans
+
+    # ---------- 杂项 ----------
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -285,20 +315,15 @@ def iter_training_samples(
     """把一段剧本滚成训练样本：每个「模型轮」产出一条 `(prompt, reply)`。
 
     `script` ＝ `[(speaker, text), ...]`。`speaker == SELF_LABEL`（`自己`）的条目
-    表示**这是模型该说的内容**：先产出当时的 `(prompt, reply)`，再以 `自己：` 记入流
-    （模拟真实回放）。非 `自己` 的条目直接加入流。
+    表示**这是模型该说的内容**：先产出当时的 `(prompt, reply)`，再记入日志。
 
-    产出：`prompt` **以 cue 结尾**（这就是训练输入），`reply` 是**训练目标** ——
-    等于「内容 + `<eos>`」（`emit_eos=True` 时）。
+    产出：
+      - `prompt` ＝ 日志 + 末尾 `<resp>`（模型输入，**不含**待生成的回复）
+      - `reply`  ＝ 训练目标 ＝ **内容 + `<eos>`**（不含 `<resp>`，那是 harness 喂的）
 
-    ★ **自洽不变量**（有测试钉着）：把第 k 条样本的 `prompt + reply` 拼起来，
-    必须是第 k+1 条 `prompt` 的前缀。**这条不成立就说明训练数据和推理时的上下文
-    不是同一种形态**，模型会学到一套、用时另一套。
-    见 `tests/...::test_samples_are_self_consistent`。
-
-    ⚠ 终止符由**本模块自己插**：`prepare.py::annotate_replies` 只认
-    `用户：`/`模型：`，我们的 `对象A：`/`自己：` 格式会被它**原样放行**（`:251-255`），
-    所以**不能指望上游补** `<eos>`。
+    ★★ **严格连续**（有测试钉住）：`prompt_k + reply_k == 日志_{k+1}`，逐字符相等、
+    **没有任何替换**。所以整条流可以直接拼成一个 bin，用「`<resp>` → `<eos>`」定区间
+    算 loss（`DialogueStream.loss_token_spans()`）。
 
     ⚠ 样本之间的**窗口状态是连续的**（同一条流滚下去）——这正是要训的东西：
     模型得在「已经有若干轮历史、头部可能已被弹掉」的状态下接话。
@@ -306,9 +331,7 @@ def iter_training_samples(
     stream = DialogueStream(encode, window, **kwargs)
     for speaker, text in script:
         if speaker == SELF_LABEL:
-            prompt = stream.prompt()
-            # 训练目标 = 模型实际要生成的东西：内容 + 终止符（`<cont>` 已废弃）
-            yield prompt, text + (EOS if stream.emit_eos else '')
+            yield stream.prompt(), text + (EOS if stream.emit_eos else '')
             stream.commit(text)
         else:
             stream.append(speaker, text)

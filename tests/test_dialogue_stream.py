@@ -1,12 +1,12 @@
 """对话流框架（`training/dialogue_stream.py`）的测试。
 
 ★ **已知答案对照**：窗口/弹出相关的测试用**假编码器** `lambda s: list(s)`
-  （1 字符 = 1 token），于是长度、弹几句全部可以手算 —— 判据不是"跑通就算过"，
-  而是能对上具体数字。并且成对给出「大窗口必须不弹 / 小窗口必须弹」，
-  避免"它无论如何都弹"也能通过的空测试。
+  （1 字符 = 1 token），于是长度、弹几句、loss 区间下标全部可以手算 ——
+  判据不是"跑通就算过"，而是能对上具体数字。并且成对给出「大窗口必须不弹 /
+  小窗口必须弹」，避免"它无论如何都弹"也能通过的空测试。
 
-★ 另有一组用**真 tokenizer** 的测试，钉住「`<resp>` 是**单 token**（id=140）」。
-  如果哪天有人重建 tokenizer 而把 cue 丢了，这组会立刻红。
+★ 另有一组用**真 tokenizer** 的测试，钉住「`<resp>` 是**单 token**（id=140）」，
+  以及「词表生成脚本与现盘产物不许漂移」。
 """
 import os
 import sys
@@ -34,12 +34,6 @@ def make(window: int = 256, **kw) -> DialogueStream:
     return DialogueStream(W, window, **kw)
 
 
-def strip_cue(prompt: str) -> str:
-    """把 prompt 末尾那行 cue 去掉，得到"持久记录"形态。"""
-    assert prompt.endswith('\n' + TURN_CUE)
-    return prompt[: -len('\n' + TURN_CUE)]
-
-
 # ---------------------------------------------------------------- 分句器复用
 
 
@@ -49,37 +43,54 @@ def test_reuses_repo_sentence_splitter():
     assert split_line('你好，我是李华。') == ['你好，我是李华。']  # 逗号不是句末
 
 
-# ---------------------------------------------------------------- 双视图渲染
+# ---------------------------------------------------------------- 单流渲染
 
 
 def test_render_matches_the_designed_flow():
-    """用户 2026-09-14 给的那个具体流程，逐字对上。"""
+    """用户 2026-09-14 设计的那条流，逐字对上（「乙」：单流、`<resp>` 内联）。"""
     s = make(window=256)
     s.append('A', '你好，我是李华。')
-    # 模型看到的 prompt：持久记录 + 末尾一行 cue
-    assert s.prompt() == 'A：你好，我是李华。\n<resp>'
-    # 持久记录里还没有模型的话
+    # 日志：还没有模型的话；模型输入＝日志 + 末尾一行 <resp>
     assert s.render() == 'A：你好，我是李华。'
-    # 模型生成「你好」之后，以 `自己：` 记回持久记录，并按约定贴 <eos>
+    assert s.prompt() == 'A：你好，我是李华。\n<resp>'
+    # 模型生成「你好」之后，记回日志（`<resp>` 前缀 + 末尾 `<eos>`）
     s.commit('你好')
-    assert s.render() == 'A：你好，我是李华。\n自己：你好<eos>'
+    assert s.render() == 'A：你好，我是李华。\n<resp>你好<eos>'
+    assert s.prompt() == 'A：你好，我是李华。\n<resp>你好<eos>\n<resp>'
+
+
+def test_prompt_of_empty_stream_is_just_the_cue():
+    """空流的模型输入就是孤零零一个 `<resp>`（不该带前导换行）。"""
+    assert make().prompt() == '<resp>'
+
+
+def test_resp_absorbs_the_self_label():
+    """★ `自己：` 的角色被 `<resp>` 吸收 —— 1 token 取代 3 token，且没有冗余标记。
+
+    `SELF_LABEL`（`'自己'`）只是**内部哨兵**，永远不该出现在渲染结果里。
+    """
+    s = make()
+    s.append('对象A', '在吗？')
+    s.commit('在的。')
+    out = s.render()
+    assert '<resp>' in out
+    assert '自己：' not in out and SELF_LABEL not in out
 
 
 def test_emit_eos_can_be_disabled():
-    """用户原话里那一步的**字面**形态（不带 `<eos>`）—— 关掉 `emit_eos` 即可复现。"""
-    s = make(window=256, emit_eos=False)
+    s = make(emit_eos=False)
     s.append('A', '你好，我是李华。')
     s.commit('你好')
-    assert s.render() == 'A：你好，我是李华。\n自己：你好'
+    assert s.render() == 'A：你好，我是李华。\n<resp>你好'
 
 
 def test_cont_is_never_emitted():
     """★ 用户 2026-09-14 决定：**合并 `<cont>`、保留 `<eos>`**。
 
-    新格式里 `<cont>` 不再出现（它的语义已被轮次机制取代），但**token 本身仍在词表里**
-    —— 既有 bin 里有 50 万个它，删了旧 bin 就解不出来。
+    新格式里 `<cont>` 不再出现（语义已被轮次机制取代），但 **token 本身仍在词表里**
+    —— 既有 bin 里有 100 万个它，删了旧 bin 就解不出来。
     """
-    s = make(window=256)
+    s = make()
     s.append('对象A', '在吗？')
     s.commit('在的！你说。')
     s.append('对象A', '好的。')
@@ -87,27 +98,6 @@ def test_cont_is_never_emitted():
     text = s.render()
     assert '<eos>' in text
     assert '<cont>' not in text
-
-
-def test_prompt_never_ends_with_self_label():
-    """★ 本框架存在的理由：prompt 以 cue 结尾，**绝不**带悬空的 `自己：`。
-
-    以标签结尾＝把模型自己的轮次变成一个匿名「待填槽位」（`B：` 的老毛病），
-    模型就永远学不会「我是谁」。
-    """
-    s = make(window=40)
-    for i in range(12):
-        s.append('A', f'第{i}句闲聊。')
-        assert s.prompt().splitlines()[-1] == TURN_CUE
-        assert not s.prompt().endswith(f'{SELF_LABEL}：')
-        s.commit(f'回第{i}句。')
-        assert s.prompt().splitlines()[-1] == TURN_CUE
-        assert not s.prompt().endswith(f'{SELF_LABEL}：')
-
-    # 负向对照：模拟"以标签结尾"的旧写法，确认判据能抓住它（判据非恒真）
-    bad = 'A：你好。\n自己：'
-    assert bad.splitlines()[-1] != TURN_CUE
-    assert bad.endswith(f'{SELF_LABEL}：')
 
 
 # ---------------------------------------------------------------- 窗口
@@ -139,19 +129,6 @@ def test_context_never_exceeds_window():
         assert s.context_len() <= s.window or s.overflow
 
 
-def test_pops_only_whole_sentences():
-    """弹出的必须是**整句** —— 不允许半句残留在流里。"""
-    s = make(window=25)
-    all_sents = [f'完整句子{i}。' for i in range(30)]
-    for t in all_sents:
-        s.append('A', t)
-    kept = [sent for _, sent in s.history()]
-    assert kept, '不该被清空（至少保留 1 句）'
-    for sent in kept:
-        assert sent in all_sents, f'残留了非整句: {sent!r}'
-    assert s.dropped + len(kept) == len(all_sents), '弹出的必须是整句、不许丢字符'
-
-
 def test_overflow_flag_matches_reality():
     """★ 回归：`overflow` 必须**随时**等于 `context_len() > window`。
 
@@ -167,6 +144,19 @@ def test_overflow_flag_matches_reality():
         assert s.overflow == (s.context_len() > s.window), '★ commit 之后标记必须仍然真实'
 
 
+def test_pops_only_whole_sentences():
+    """弹出的必须是**整句** —— 不允许半句残留在流里。"""
+    s = make(window=25)
+    all_sents = [f'完整句子{i}。' for i in range(30)]
+    for t in all_sents:
+        s.append('A', t)
+    kept = [sent for _, sent in s.history()]
+    assert kept, '不该被清空（至少保留 1 句）'
+    for sent in kept:
+        assert sent in all_sents, f'残留了非整句: {sent!r}'
+    assert s.dropped + len(kept) == len(all_sents), '弹出的必须是整句、不许丢字符'
+
+
 def test_single_oversized_sentence_does_not_loop():
     """单句就超窗 ⇒ 软上限放行 + `overflow` 标记，**绝不死循环**。"""
     s = make(window=5)
@@ -176,14 +166,7 @@ def test_single_oversized_sentence_does_not_loop():
     assert s.history() == [('A', long_sent)]
 
 
-# ---------------------------------------------------------------- 自己：与绑定
-
-
-def test_commit_uses_self_label():
-    s = make()
-    s.append('对象A', '我叫李华。')
-    s.commit('你好呀。')
-    assert s.history() == [('对象A', '我叫李华。'), (SELF_LABEL, f'你好呀。{EOS}')]
+# ---------------------------------------------------------------- 名字绑定
 
 
 def test_rename_binds_a_name():
@@ -217,21 +200,20 @@ def test_iter_training_samples_shapes():
 
     p0, r0 = out[0]
     assert p0 == '对象A：你好，我是李华。\n<resp>'
-    assert r0 == f'你好呀。{EOS}', '训练目标 = 内容 + <eos>（不含标签）'
+    assert r0 == f'你好呀。{EOS}', '训练目标 = 内容 + <eos>（不含 <resp>，那是 harness 喂的）'
 
     p1, r1 = out[1]
-    assert f'自己：你好呀。{EOS}' in p1, '上一轮必须已以 `自己：` 记入'
-    assert p1.endswith(TURN_CUE)
+    assert f'<resp>你好呀。{EOS}' in p1, '上一轮必须已内联进日志'
+    assert p1.endswith('\n' + TURN_CUE)
     assert r1 == f'我叫小寻。{EOS}'
 
 
-def test_prompt_is_rebuilt_with_self_label_substituting_the_cue():
-    """★ cue 是**临时**的：下一轮 prompt 里，末尾 cue 被 `自己：` **取代**。
+def test_stream_is_strictly_contiguous():
+    """★★ 选「乙」的全部意义：`prompt_k + reply_k` **逐字符等于**下一段日志的前缀。
 
-    这正是用户说的"自动补齐 `自己：` 这个前缀"。
-    ⇒ 训练数据是 **(prompt, target) 对**，不是一条连续 token 流
-      （prompt_{k+1} 不是 prompt_k + target_k 的简单拼接，中间发生过替换）。
-      这条不变量是拼接式写数据**必错**的地方，所以钉下来。
+    这是**零替换**的严格连续性。选「甲」时 cue 会被 `自己：` 替换掉，
+    所以数据只能是 (prompt, target) 对、喂不进「一条长流 + 按终止符掩码」的现有管线。
+    「乙」把它变成连续流。
     """
     script = [
         ('对象A', '你好，我是李华。'),
@@ -239,15 +221,11 @@ def test_prompt_is_rebuilt_with_self_label_substituting_the_cue():
         ('对象A', '你多大了？'),
         (SELF_LABEL, '还在长个儿呢。'),
     ]
-    (p0, r0), (p1, _) = list(iter_training_samples(script, W, window=200))
+    (p0, r0), (p1, r1) = list(iter_training_samples(script, W, window=200))
 
-    # 正确的不变量：持久记录(p0) + `自己：` + r0 是 p1 的前缀（r0 已自带 <eos>）
-    rebuilt = strip_cue(p0) + f'\n{SELF_LABEL}：' + r0
-    assert p1.startswith(rebuilt), f'\n  rebuilt={rebuilt!r}\n  p1     ={p1!r}'
-    # 负向对照：朴素拼接（不做替换）**必须不成立** —— 证明这条判据在真干活
-    assert not p1.startswith(strip_cue(p0) + '\n' + r0)
-    # cue 出现过，但持久记录里没有 cue
-    assert TURN_CUE in p0 and TURN_CUE not in rebuilt
+    assert p1.startswith(p0 + r0), 'prompt_k + reply_k 必须是 prompt_{k+1} 的前缀'
+    # 负向对照：若中间插了任何东西（比如旧的"替换"写法），前缀关系就断了
+    assert not p1.startswith(p0 + r0 + '\n' + r0), '判据要能区分出多余内容'
 
 
 def test_group_turns_option():
@@ -263,14 +241,46 @@ def test_group_turns_option():
     assert per_sent.render() == 'A：你好。\nA：我是李华。'
 
 
+# ---------------------------------------------------------------- loss 区间
+
+
+def test_loss_token_spans_cover_only_the_models_own_words():
+    """★ loss 区间 = `<resp>` 之后到 `<eos>`（含）；别人的话与 `<resp>` 都不算。
+
+    用假编码器（1 字 = 1 token）可以手算下标：
+        `A：你好。\\n<resp>你好<eos>`
+         0123456 789...                → cue 在 [6,12)，eos 结束于 19
+    """
+    s = make()
+    s.append('A', '你好。')
+    s.commit('你好')
+    log = s.render()
+    assert log == 'A：你好。\n<resp>你好<eos>'
+
+    spans = s.loss_token_spans()
+    assert spans == [(12, 19)], spans
+    ids = list(s.encode(log))
+    covered = ''.join(''.join(ids[a:b]) for a, b in spans)
+    assert covered == f'你好{EOS}'
+    # 别人的话与 <resp> 都落在 loss 之外
+    assert 'A：' not in covered
+    assert TURN_CUE not in covered
+
+
+def test_loss_token_spans_empty_when_nothing_committed():
+    s = make()
+    s.append('A', '你好。')
+    assert s.loss_token_spans() == []
+
+
 # ---------------------------------------------------------------- 钉住 tokenizer
 
 
 def test_turn_cue_is_a_single_token():
-    """★ 钉住 tokenizer 事实：`<resp>` 是**单 token**（id=140），不是 7 个字符。
+    """★ 钉住 tokenizer 事实：`<resp>` 是**单 token**（id=140），不是 6 个字符。
 
-    tokenizer 重建后若丢了 cue，这里会立刻红 —— 否则会静默退化成 7 token，
-    悄悄吃掉窗口（256 窗口里每轮白扔 6 token）。
+    tokenizer 重建后若丢了它，这里会立刻红 —— 否则会静默退化成多 token，
+    悄悄吃掉窗口，而且 loss 区间的搜索也会错。
     """
     from tokenizers import Tokenizer
 
@@ -305,7 +315,7 @@ def test_tokenizer_source_matches_the_built_artifact():
                 and any(getattr(t, 'id', None) == 'mech_names' for t in node.targets)):
             names = ast.literal_eval(node.value)
     assert names, '没能从 train_tokenizer.py 里解析出 mech_names'
-    assert names[12] == '<resp>', f'mech_names[12] 应为 <resp>（→ id 140），实际 {names[12]!r}'
+    assert names[12] == TURN_CUE, f'mech_names[12] 应为 {TURN_CUE!r}（→ id 140），实际 {names[12]!r}'
 
     vocab = json.load(io.open(
         os.path.join(_ROOT, 'data', 'chinese', 'char_tokenizer.json'), encoding='utf-8')
@@ -319,7 +329,9 @@ def test_tokenizer_source_matches_the_built_artifact():
 @pytest.mark.parametrize('text', [
     '你好，我是李华。',
     '今天天气不错。',
-    'A：你好。\n自己：你好。',
+    # ⚠ 这里**不能**放含 <resp>/<eos> 的文本 —— 它们是 special，会被编成 **1** 个 token，
+    #   那条测的是"普通文本仍逐字符"，混进 special 就自相矛盾了。
+    'A：你好。\nB：你好。',
 ])
 def test_ordinary_text_encoding_unchanged_by_cue(text):
     """加了 cue 之后，普通文本仍编成**逐字符**（汉字区 id 没被挪动）。"""
