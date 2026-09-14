@@ -5,7 +5,7 @@
   而是能对上具体数字。并且成对给出「大窗口必须不弹 / 小窗口必须弹」，
   避免"它无论如何都弹"也能通过的空测试。
 
-★ 另有一组用**真 tokenizer** 的测试，钉住「`<你该说话了>` 是**单 token**（id=140）」。
+★ 另有一组用**真 tokenizer** 的测试，钉住「`<resp>` 是**单 token**（id=140）」。
   如果哪天有人重建 tokenizer 而把 cue 丢了，这组会立刻红。
 """
 import os
@@ -57,7 +57,7 @@ def test_render_matches_the_designed_flow():
     s = make(window=256)
     s.append('A', '你好，我是李华。')
     # 模型看到的 prompt：持久记录 + 末尾一行 cue
-    assert s.prompt() == 'A：你好，我是李华。\n<你该说话了>'
+    assert s.prompt() == 'A：你好，我是李华。\n<resp>'
     # 持久记录里还没有模型的话
     assert s.render() == 'A：你好，我是李华。'
     # 模型生成「你好」之后，以 `自己：` 记回持久记录，并按约定贴 <eos>
@@ -201,7 +201,7 @@ def test_iter_training_samples_shapes():
     assert len(out) == 2
 
     p0, r0 = out[0]
-    assert p0 == '对象A：你好，我是李华。\n<你该说话了>'
+    assert p0 == '对象A：你好，我是李华。\n<resp>'
     assert r0 == f'你好呀。{EOS}', '训练目标 = 内容 + <eos>（不含标签）'
 
     p1, r1 = out[1]
@@ -252,7 +252,7 @@ def test_group_turns_option():
 
 
 def test_turn_cue_is_a_single_token():
-    """★ 钉住 tokenizer 事实：`<你该说话了>` 是**单 token**（id=140），不是 7 个字符。
+    """★ 钉住 tokenizer 事实：`<resp>` 是**单 token**（id=140），不是 7 个字符。
 
     tokenizer 重建后若丢了 cue，这里会立刻红 —— 否则会静默退化成 7 token，
     悄悄吃掉窗口（256 窗口里每轮白扔 6 token）。
