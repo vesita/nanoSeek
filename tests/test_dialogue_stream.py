@@ -152,6 +152,21 @@ def test_pops_only_whole_sentences():
     assert s.dropped + len(kept) == len(all_sents), '弹出的必须是整句、不许丢字符'
 
 
+def test_overflow_flag_matches_reality():
+    """★ 回归：`overflow` 必须**随时**等于 `context_len() > window`。
+
+    曾经的 bug：`commit()` 贴 `<eos>`（+5 token）后不再收窗 ⇒ 输入超窗而 `overflow`
+    仍是 `False`，即「说没超，实际超了」的自相矛盾状态。本判据直接钉住这个不变量，
+    比"长度断言"更早发现问题。
+    """
+    s = make(window=30)
+    for i in range(25):
+        s.append('A', f'第{i}句。')
+        assert s.overflow == (s.context_len() > s.window), 'append 之后标记必须真实'
+        s.commit(f'回第{i}句。')
+        assert s.overflow == (s.context_len() > s.window), '★ commit 之后标记必须仍然真实'
+
+
 def test_single_oversized_sentence_does_not_loop():
     """单句就超窗 ⇒ 软上限放行 + `overflow` 标记，**绝不死循环**。"""
     s = make(window=5)

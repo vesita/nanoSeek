@@ -186,6 +186,11 @@ class DialogueStream:
         if self.emit_eos and len(self._entries) > before:
             spk, sent = self._entries[-1]
             self._entries[-1] = (spk, sent + EOS)
+            # ★ 必须**重新收窗**：`<eos>` 是在 `append()` 的 `enforce_window()` **之后**
+            #   才贴上去的，会让最后一句话变长 5 个 token。漏了这一步就会出现
+            #   「context_len() > window 但 overflow 仍是 False」这种自相矛盾的状态。
+            #   （这个 bug 靠改名把 cue 从 7 字变 6 字、挪动了测试里的长度算术才暴露出来。）
+            self.enforce_window()
 
     def rename(self, old: str, new: str) -> int:
         """把某说话人的历史标签整体改名（「对象A → 名字」的绑定）。
