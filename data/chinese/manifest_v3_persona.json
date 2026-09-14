@@ -1,0 +1,95 @@
+{
+  "dataset": "chinese",
+  "created_at": "2026-09-14T23:25:28+08:00",
+  "prepare_args": {
+    "with_books": false,
+    "task_ratio": 1.0,
+    "insert_eos": true,
+    "pretrain": false,
+    "char_level": true,
+    "byte_level": false,
+    "val_all": true,
+    "val_ratio": 0.01,
+    "source_ratio": [],
+    "seed": 20260910,
+    "out_prefix": "v3_persona",
+    "emit_offsets": true,
+    "source_dir": "/home/vesita/coding/my/nanoSeek/data/chinese/stages/v3_persona",
+    "argv": [
+      "/home/vesita/coding/my/nanoSeek/data/chinese/prepare.py",
+      "--char-level",
+      "--val-all",
+      "--val-ratio",
+      "0.01",
+      "--seed",
+      "20260910",
+      "--source-dir",
+      "/home/vesita/coding/my/nanoSeek/data/chinese/stages/v3_persona",
+      "--out-prefix",
+      "v3_persona",
+      "--emit-offsets"
+    ]
+  },
+  "tokenizer": {
+    "vocab_size": 8192,
+    "char_level": true,
+    "tokenizer_path": "char_tokenizer.json"
+  },
+  "counts": {
+    "train_samples": 792,
+    "val_samples": 8,
+    "train_chars": 106784,
+    "val_chars": 1066,
+    "train_tokens": 85967,
+    "val_tokens": 850
+  },
+  "source_files": [
+    {
+      "file": "persona_identity.txt",
+      "size_bytes": 254059,
+      "sha256": "acfbfb9a9144ed266cfe60d899061c4eea19dcd594ad3b8ebcc726dd9596e42c",
+      "mtime": "2026-09-14T22:46:50"
+    }
+  ],
+  "source_breakdown": [
+    {
+      "file": "persona_identity.txt",
+      "size_bytes": 254059,
+      "blocks": 800,
+      "train_blocks": 792,
+      "val_blocks": 8,
+      "train_chars_raw": 105202,
+      "val_chars_raw": 1052,
+      "train_share": 1.0,
+      "val_share": 1.0
+    }
+  ],
+  "artifacts": {
+    "train_char_v3_persona.bin": {
+      "size_bytes": 171934,
+      "sha256": "9a0884824a2fa0f42d3e64d88173d709be7fb7a1d4f7d7c97c501876c7bb9c1d"
+    },
+    "val_char_v3_persona.bin": {
+      "size_bytes": 1700,
+      "sha256": "293494d364f6032440dadb98092cf25ec22d5c5b13f41ed7529e4c95665a2e71"
+    },
+    "tokenizer.json": {
+      "size_bytes": 593448,
+      "sha256": "04ba03e90b6b0d2f7f23d5c1d5bb2e18bd58e2fb4c6b6538cc9fb87f7faf86b8"
+    },
+    "meta_char_v3_persona.pkl": {
+      "size_bytes": 85,
+      "sha256": "a5e16acc691e0af348d520b8d006feb644820705d84ac6dba20f0daede380dd4"
+    },
+    "train_char_v3_persona.off": {
+      "size_bytes": 6344,
+      "sha256": "45588f8522278c11fcfd66b33a9b1aa2dc2386f47e494fecb5a12ba519c35692",
+      "elements": 793
+    },
+    "val_char_v3_persona.off": {
+      "size_bytes": 72,
+      "sha256": "58bb4cdda932d2407c41bfe5d2de8dac457a3810c7dec440b1e7fcb0088a85d0",
+      "elements": 9
+    }
+  }
+}

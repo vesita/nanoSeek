@@ -289,9 +289,15 @@ V3_STAGE_CONFIGS = sorted(glob.glob(str(ROOT / 'configs' / 'base_v3_*.yaml')))
 #     ★ **配置保留**（配方不删，将来补知识段仍用它），所以步数继续登记在这里；
 #       但它不再是 B 段的前置条件。
 #   - B 段 `base_v3_dlg.yaml`（14k = 1 epoch 对话专修）**直接接 `out/base_v2/last.pt`**。
+#   - 人格层 `base_v3_persona.yaml`（**单流 `<resp>` 格式**，接 `out/base_v3_dlg/last.pt`）
+#     2026-09-14 新增。★ 它有三处**有意的例外**，都写在下面对应断言旁边：
+#     ① 必须开 `use_loss_masking`（+ `mask_mode: resp_span`）；
+#     ② `data_prefix == 'v3_persona'`；
+#     ③ 现在的 300 步是**冒烟**（语料只有 86k token），不是正式配方。
 V3_STAGE_STEPS = {
     'base_v3_know.yaml': 3000,
     'base_v3_dlg.yaml': 14000,
+    'base_v3_persona.yaml': 300,
 }
 
 
@@ -353,8 +359,23 @@ def test_v3_stage_config_safety(cfg_path):
         f"{name}: pack_align 必须 False —— True 时 v3_know 有 72.91% 的 train token "
         f"永远进不了任何窗口（PROJECT_STATE §0.5.12）")
 
-    # (4) loss masking 三阶段必须全关（v3_lang 一个终止符都没有）。
-    assert cfg['use_loss_masking'] is False, f"{name}: use_loss_masking 必须 False"
+    # (4) loss masking：默认**必须关**（v3_lang 一个终止符都没有；v3_dlg 全 token 等权）。
+    #     ★★ 例外（2026-09-14，人格层）：单流 `<resp>` 语料的**全部**监督信号都在
+    #        `<resp>…<eos>` 区间里，关掉 masking = 零梯度 ⇒ 必须开。但例外**绑在
+    #        `mask_mode` 上、不绑在文件名上**，并且要求语料前缀就是人格层 ——
+    #        别的阶段写 `resp_span` 会在这里被拦下（那说明配错了语料：resp_span 只对
+    #        单流格式成立，对 `A：/B：` 语料会给出全 False 的 mask ⇒ loss NaN）。
+    mask_mode = cfg.get('mask_mode', 'eos_line')
+    assert mask_mode in ('eos_line', 'resp_span'), (
+        f"{name}: mask_mode={mask_mode!r} 不是已知模式（train.py 只认 eos_line/resp_span）")
+    if mask_mode == 'resp_span':
+        assert cfg['data_prefix'] == 'v3_persona', (
+            f"{name}: mask_mode=resp_span 只对单流 <resp> 语料成立，"
+            f"但 data_prefix={cfg['data_prefix']!r} —— 配错语料会让 mask 全 False ⇒ loss NaN")
+        assert cfg['use_loss_masking'] is True, (
+            f"{name}: resp_span 必须配 use_loss_masking=True（否则零梯度）")
+    else:
+        assert cfg['use_loss_masking'] is False, f"{name}: use_loss_masking 必须 False"
 
     # (5) 退火覆盖整段 + 语料前缀 + 步数与方案表一致。
     assert cfg['lr_decay_iters'] == cfg['max_iters'], (

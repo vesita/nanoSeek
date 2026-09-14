@@ -9,7 +9,13 @@
 
 ## 🚀 速查（最常用的东西就在这一节，别往下翻）
 
-**当前状态**：✅ **B 段对话专修已跑完**（2026-09-14 13:28）—— 单元 `nanoseek-v3-dlg`，
+**当前状态**：🧩 **主线已切到「人格层」（`v3_persona`，2026-09-14）—— Step A 冒烟在跑**。
+单元 `nanoseek-persona-smoke`（`on_failure=--collect`，**跑完自己消失**，别以为死了）；
+配置 `configs/base_v3_persona.yaml`，`init_from: out/base_v3_dlg/last.pt`（step 14000），
+`mask_mode: resp_span`。日志 `out/base_v3_persona_train.log`，产物 `out/base_v3_persona/`。
+★ 它只有 **86k token 语料 / 300 步 ≈ 28 epoch**，是**链路验证**不是效果 —— 细节与
+"本层不要把人设写进仓库"的约束见 **§0.5.14**（先读它的开头那条自我约束）。
+✅ **B 段对话专修已跑完**（2026-09-14 13:28）—— 单元 `nanoseek-v3-dlg`，
 `Result=success`、**14000/14000** 步、12:59:55、`NRestarts=0`；配置 `configs/base_v3_dlg.yaml`，
 `init_from: out/base_v2/last.pt`（= step **61000**）。产物 `out/base_v3_dlg/`
 （`last.pt` = 14000；归档 5000/10000/13000/14000）。⚠ 该单元**现在 inactive 是正常的**。
@@ -30,16 +36,20 @@ B 段**起跑前基线**（`per_source_ce_probe` @61000）：real **3.0095** / r
 ```bash
 cd /home/vesita/coding/my/nanoSeek
 
-# ① 启动 / 续训 B 段（★ 必须用 systemd 单元，不能用 setsid nohup —— 见铁律 0）
-systemd-run --user --unit=nanoseek-v3-dlg --collect \
+# ① 启动 / 续训**当前这一站**（★ 必须用 systemd 单元，不能用 setsid nohup —— 见铁律 0）
+#    当前站 = 人格层 v3_persona（§0.5.14）；换站时**必须**同时改这里、①b、
+#    和 scripts/watch.sh:20-21 的默认 OUT_DIR/LOG（不同步 ⇒ 新目录 ckpt 不被 prune）
+systemd-run --user --unit=nanoseek-persona-smoke --collect \
   --property=WorkingDirectory=/home/vesita/coding/my/nanoSeek \
   --setenv=HSA_OVERRIDE_GFX_VERSION=10.3.0 --setenv=HSA_ENABLE_SDMA=0 \
-  /bin/bash -c '.venv/bin/python -u training/train.py configs/base_v3_dlg.yaml > out/base_v3_dlg_train.log 2>&1'
+  /bin/bash -c '.venv/bin/python -u training/train.py configs/base_v3_persona.yaml > out/base_v3_persona_train.log 2>&1'
+#    后台等它跑完（有明确终点 ⇒ 正常等到结束，不用 sleep 链）：
+#    systemd-run ... --wait ...   ← 或 systemctl --user is-active nanoseek-persona-smoke
 
 # ①b 看训练单元的存活与日志
-systemctl --user status nanoseek-v3-dlg.service --no-pager | head -14
+systemctl --user status nanoseek-persona-smoke.service --no-pager | head -14
 
-# ② 巡检：只认这一条，别手敲长命令（铁律 11）★ 默认已指向 out/base_v3_dlg
+# ② 巡检：只认这一条，别手敲长命令（铁律 11）★ 默认已指向 out/base_v3_persona
 bash scripts/watch.sh
 
 # ②b 补盲区：systemd 定时器 nanoseek-watch.timer 每 30 分钟自动跑一次 watch.sh，
@@ -983,6 +993,118 @@ lang 1.95% / know 0.84% / dlg 0.92%。
 **机翻管线的三个坑（照抄，别再踩）**：`transformers` **必须钉 4.46.3**（5.x 让 Marian 永不吐 EOS，
 `Hello` → 200 个「哈」）；必须 `no_repeat_ngram_size=4`（否则短句跑到上限；加上后既正确又快 14 倍）；
 **CPU 4 线程最优，12 线程反而慢 4 倍**。该管线**只能喂纯英文**（中文进去会吐出 `~ , ~ ~ 的, ~`）。
+
+### 0.5.14 🧩 人格层（`v3_persona`）：单流 `<resp>` 格式 + `mask_mode=resp_span`（2026-09-14）
+
+★★ **本节的自我约束（先读这条再往下）**：人格的**具体设定**（性格、语气、要避免什么、
+要传递什么）**故意不写进仓库** —— 用户明确要求「这些句话除了在上下文中，其他地方不要留下
+任何记录」。语料本体与规格都在仓库外（`~/datasets/persona/`，规格 `_spec.md`）；
+仓库里只放**工程侧**的东西：格式、掩码口径、配置、验收工具。
+⇒ **不要**把对话正文、人设描述、示例回复粘进本文档 / 提交信息 / 测试 / 注释。
+本节提到人格时只用中性说法（"人格层"、"人设绑定"）。
+
+**为什么会有这一段**：用户 2026-09-14 把主线从"通用对话专修"改成"**陪聊人格**"，
+理由是 NDB 本来就不基于上下文，人格比知识更贴合那条路线（原话大意：陪聊更符合我们用
+NDB 这种不基于上下文的预设）。B 段（`v3_dlg`）练出的是**对话的形状**不是内容
+（`analysis/B_ood_prompts.txt` 实测 OOD/身份类全线失败）⇒ 人格层要补的正是
+"**我是谁 / 我怎么说话**"这一层监督信号。
+
+#### 一、用户拍板的决定（照抄，别再自己发明）
+
+| 决定 | 内容 | 备注 |
+|---|---|---|
+| 格式 | **单流**（方案"乙"）：整个对话是一条流，模型轮的标记是 **`<resp>`** | 不是多流、不是 `用户：/模型：` |
+| 模型自己的标记 | **`<resp>`**（单 token，**id 140**） | 取代早期的 `自己：`/`<你该说话了>`；它由 harness 喂，**模型不该生成它** |
+| 换话题标记 | **`<topic>`**（单 token，**id 141**），插在**开启新话题那一段的开头** | 放在**模型自己**那段时它落在 loss 区间内 ⇒ 模型能学会**主动**换话题（commit `a95cd0d`） |
+| 对方编号 | 未绑定身份时用 **`对象A` / `对象B` / `对象C`** | 用户提议、已用在生成的语料里 |
+| 身份绑定 | `对象A：我是xx。` ⇒ 后续改用 **`xx：`** | 允许绑定后改名（`DialogueStream.rename`）|
+| `<cont>` | **已退役**（token 保留，id 130，绝不删——删了会动其它 id） | 用户："直接合并 cont 吧，保留 eos" |
+| 语料边界（a+b） | 人设描述**不进仓库**；语料**放仓库外的 `~/datasets/`** | 仓库里只留软链（`data/chinese/new_sources/` 本身已 gitignore） |
+
+#### 二、loss 口径：**必须** `mask_mode: resp_span`（这是本层唯一的新机制）
+
+单流格式里每一行都自带终止符，所以：
+
+- 旧规则（`mask_mode='eos_line'`：token 所在**行**内含 `<eos>/<cont>` ⇒ **整行**算 loss）
+  不会误伤对方行（它们没有 `<eos>`），但会把 **`<resp>` 自己**算进 loss ——
+  每轮只多 1 个 token，方向却是错的（在教模型顺手输出 `<resp>`）。
+- 关掉 masking 更糟：全部 token 等权。
+- ⇒ 新规则 `resp_span`：**`<resp>` 之后 → 对应 `<eos>`（含）** 算 loss，**不含 `<resp>`**；
+  `<topic>` 落在区间内照常算 loss。实现 `training/masking.py::build_resp_span_mask`
+  （纯 cummax/cummin），权威定义是 `training/dialogue_stream.py::loss_token_spans`。
+
+★ **写这一版时抓到一个真 bug（值得记，因为它差点被"参考实现"掩盖）**：第一版向量化实现用
+"**含自身**的 `cummax` 得 `prev_resp`" + 断言 `prev_resp < t` 来表达"cue 自身不算 loss"。
+它在 **相邻两个 `<resp>`**（`<resp><resp>…<eos>`）上给 `[F,F,T]`，而**权威顺序扫描**给
+`[F,T,T]`（第一个 `<resp>` 的扫描把第二个当**正文**吞进区间）。实测 `[140,140,128]` 分歧。
+⇒ 真正的判据是「**严格早于** t 存在 `<resp>`」，改用右移一格的严格版。
+真实流里 `append/commit` 不会产出相邻 cue，所以这不是行为 bug，但
+"向量化实现 ≡ 权威 span 定义"必须**对所有输入**成立。
+**教训**：我最初的测试参考实现也写成了一次扫描的状态机，它**同样**在未闭合 `<resp>` 上出错
+⇒ 是**参考错了，不是实现对了**；消融前先怀疑参考，并且要用**两条独立写法**的参考互钉
+（`tests/test_masking.py::test_resp_span_two_references_agree_exhaustively` 穷举 L≤7 的
+全部短行，再把实现穷举到 L≤6 的 15625 行 —— 400 行随机对照**没抽到**相邻 cue 那个组合）。
+
+#### 三、产物与验收（`[实测]`，2026-09-14）
+
+构建（语料是 800 段单流对话 / 107,850 字符）：
+
+```bash
+.venv/bin/python data/chinese/build_stages.py --src data/chinese/clean_v3 \
+    --extra data/chinese/new_sources --only v3_persona --apply --build
+```
+
+| 项 | 实测值 |
+|---|---|
+| `train_char_v3_persona.bin` | **85,967** token（792 段；`.off` 793 个边界）|
+| `val_char_v3_persona.bin` | **850** token（8 段，`--val-all` 口径与 train 同源）|
+| 终止符位置验收 | `rel_p50=0.9815`、`rel<0.5` 占比 **0.00%** ✅ |
+| `<resp>` / `<eos>` 计数 | **2,313 / 2,313**（配平）、孤儿 **0 / 0** |
+| `<topic>` 计数 | **0**（本层语料还没用它；留给 persona 的 dialogue 层）|
+| ★ **有效 token 占比** | **55,767 / 85,967 = 64.87%**（`resp_span` 口径；AGENTS §5.10 要求）|
+| 两条 loss 口径 | 向量化 **逐位等于** 权威顺序扫描 ✅ |
+| 编解码往返 | 3/3 块逐字相同 ✅（`skip_special_tokens=False`！）|
+
+验收工具：**`scripts/resp_bin_probe.py`**（`--selftest` 带已知答案对照、`--json` 落盘）。
+它补的正是 `build_stages.py` 的 `check_terminators` **看不见**的那一半 ——
+后者只查"块内最后一个终止符落在块尾"，**完全不看 `<resp>`**。
+
+#### 四、配置与测试例外
+
+`configs/base_v3_persona.yaml`（`extends: base_v2.yaml`）：
+`out_dir: out/base_v3_persona`、`init_from: out/base_v3_dlg/last.pt`（B 段终态 step 14000）、
+`data_prefix: v3_persona`、`use_doc_packing: true` + `pack_align: false`、
+**`use_loss_masking: true` + `mask_mode: resp_span`**、`eval_interval: 50`（段短，否则
+`best.pt` 永不落盘）。
+
+★ 它与其余 v3 阶段的一条硬不变量**相反**：别处要求 `use_loss_masking is False`，
+本层必须为 `True`。`tests/test_project_layout.py::test_v3_stage_config_safety` 的
+第 (4) 条因此改成**按 `mask_mode` 分支**：
+`mask_mode == 'resp_span'` ⇒ 必须开 masking，且 `data_prefix` 必须是 `v3_persona`
+（别的阶段写 `resp_span` 会被拦下——那说明配错了语料，后果是 mask 全 False ⇒ loss NaN）。
+例外**绑在格式上、不绑在文件名上**，所以将来新增单流语料阶段也能复用这条判据。
+
+#### 五、Step A（冒烟）与 Step B（NDB 在线写）
+
+- **Step A（本节的现状）**：语料只有 86k token（8192 token/步 ⇒ **10.5 步 1 epoch**），
+  300 步 ≈ **28 epoch**，必然只能**背下来**。它要证明的是**链路**
+  （单流语料 → `resp_span` loss → 权重更新 → 采样 → `parse_log` 回读 → 污染率），
+  **不是效果**。⇒ **别拿它的 loss/样本当人格质量结论。**
+- **Step B（未做）**：`train.py` 当前**在线写 NDB 的调用是 0 个**（`out/mem_store/` 为空），
+  现成的 `MemoryCrossAttention` 路径是**预构建库只读**（= 用户否决过的"灌注"路线）。
+  唯一被证明过的**在线写**模式是 `local/train_residual_db_hidden.py:220`
+  （`r_db.write_from_logits(...)` + `model/residual_neural_db.py:240`）。
+  ⇒ 要做的是把这条接进 `train.py`，然后跑 **有写 / 无写** 的 A-B 对照。
+- 语料还剩三层没写：**对比探针**（`persona_contrast_probe.txt`，**是评估探针不是训练数据**，
+  别混进 bin）、**独白层**、**对话层**。三层写完再定正式步数
+  （改步数必须同时改 `V3_STAGE_STEPS` + 本节 + `configs/base_v3_persona.yaml`）。
+
+⚠ **诚实记录的语料上限**：生成器用的是手写池，小寻的句子**唯一率只有 28%**
+（2,313 句里 650 左右是新的）⇒ 这层是**身份层**，**不能当文风来源**；
+身份类 token 总量（86k）远小于早期估的 0.5M ⇒ 正式训练时靠**过采样 ×5~6**，
+而不是复制文本。
+⚠ **配对负例的定位已被纠正**：同一句话的"好/坏"两个版本进不了训练（普通 next-token
+训练会把两个都学），它只能当**评估探针**；真正压制坏写法靠**正样本密度 + 措辞级禁用词**。
 
 ### 0.6 🚀 吞吐扫描：**已到顶，别再花时间**（2026-09-11 深夜实测）
 

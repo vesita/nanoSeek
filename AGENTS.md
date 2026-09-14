@@ -12,7 +12,20 @@
 然后做一个 **no_grad 外部神经数据库（NDB）**，在不增加模型大小的前提下扩大有效容量
 （用户明确要求：NDB **可读可写**，且**由模型自己决定**怎么读写）。
 
-**当前主线（2026-09-13 起，用户拍板）**：
+**当前主线（2026-09-14 起，用户拍板：陪聊人格；工程侧见 `PROJECT_STATE §0.5.14`）**：
+ 0. **★ 人格层 `v3_persona` 是当前站** —— 配置 `configs/base_v3_persona.yaml`，
+    单元 `nanoseek-persona-smoke`（**跑完自己消失**，`inactive` 不代表训练"死了"），
+    接 `out/base_v3_dlg/last.pt`，**单流 `<resp>` 格式 + `mask_mode: resp_span`**。
+    ★★ 语料是 **86k token 的冒烟量 / 300 步 ≈ 28 epoch** ⇒ 它只证明**链路**，
+    **别**拿它的 loss 或样本当人格质量结论。
+    ★★ **人格的具体设定（性格/语气/措辞）不许写进仓库**（用户：「这些句话除了在上下文中，
+    其他地方不要留下任何记录」）—— 语料与规格都在 `~/datasets/persona/`（仓库外），
+    仓库里只放格式/掩码/配置/验收工具。**不要**把对话正文或人设描述粘进文档、提交信息、测试。
+    ★ 验收工具 `scripts/resp_bin_probe.py`（查 `<resp>`/`<eos>` 配平、**有效 token 占比**、
+    两条 loss 口径逐位一致、编解码往返）；实测 2,313/2,313 配平、**64.87% 有效**。
+    ⏭ **Step B（未做）**：把**在线写** NDB 接进 `train.py`（现在**调用数是 0**，
+    `out/mem_store/` 空；现成的 `MemoryCrossAttention` 是**预构建库只读** = 用户否决的灌注路线），
+    再做「有写 / 无写」A-B 对照。
 1. **B 段对话专修已跑完（2026-09-14 13:28）** —— 单元 `nanoseek-v3-dlg`（`Result=success`，
    14000/14000 步，12:59:55，`NRestarts=0`），配置 `configs/base_v3_dlg.yaml`，
    warm start 自 `out/base_v2/last.pt`（step **61000**）。产物在 `out/base_v3_dlg/`
@@ -83,17 +96,19 @@ HSA_OVERRIDE_GFX_VERSION=10.3.0 HSA_ENABLE_SDMA=0    # gfx1030 必需
   `pyproject.toml` 另行解析/同步一套环境，可能跑在**不同的 torch/依赖**上，
   于是"测试全绿"证明的**不是本项目的环境**。命令统一写成：
   `.venv/bin/python -m pytest -q -m 'not slow'` / `.venv/bin/python -m ruff check .`
-- **训练跑在 systemd 用户单元里**（铁律 0），最新一站是 **B 段对话专修（已跑完）**，看它一眼用：
+- **训练跑在 systemd 用户单元里**（铁律 0），最新一站是 **人格层 `v3_persona`（Step A 冒烟）**，看它一眼用：
   ```bash
-  systemctl --user is-active  nanoseek-v3-dlg.service
-  systemctl --user status      nanoseek-v3-dlg.service --no-pager | head -14
+  systemctl --user is-active  nanoseek-persona-smoke.service
+  systemctl --user status      nanoseek-persona-smoke.service --no-pager | head -14
   ```
-  单元名：`nanoseek-v3-dlg`（**当前**：B 段对话专修，跑 `configs/base_v3_dlg.yaml`；
-  2026-09-14 13:28 **正常结束**，`Result=success`、14000/14000 步）。
-  ⇒ **它现在 `inactive` 是对的，不是"训练死了"**；要接着训是**新的一站**，
-  必须新起单元名（并同步改 `scripts/watch.sh:16-17` 与 `nanoseek-watch.timer` 的默认值）。
-  ⚠ **旧单元 `nanoseek-base-v2` 已停**（2026-09-13 12:48 stop，终态 step **61776**，
-  它的 `last.pt` = step 61000）；`nanoseek-pause-65000`（65000 步看守）**从未触发、已作废**，
+  单元名：`nanoseek-persona-smoke`（**当前**：人格层，跑 `configs/base_v3_persona.yaml`。
+  ★ 它用 `--collect` 起的 ⇒ **跑完单元自己消失**，`is-active` 返回 `inactive` 且
+  `systemctl status` 报 "could not be found" **都是正常的**，要看日志判断是成功还是失败）。
+  ⇒ 要接着训是**新的一站**，必须新起单元名（并同步改 `scripts/watch.sh:20-21`）。
+  ✅ **上一站 `nanoseek-v3-dlg`（B 段对话专修）2026-09-14 13:28 正常结束**
+  （`Result=success`、14000/14000 步）；⚠ **旧单元 `nanoseek-base-v2` 已停**
+  （2026-09-13 12:48 stop，终态 step **61776**，它的 `last.pt` = step 61000）；
+  `nanoseek-pause-65000`（65000 步看守）**从未触发、已作废**，
   **别**再照抄它们的命令去判断"训练是不是死了"。
   ⚠ `systemctl --user` 的单元**不随会话重启而死**，但**随手用 `setsid nohup` 起的会死**。
 
@@ -107,11 +122,13 @@ HSA_OVERRIDE_GFX_VERSION=10.3.0 HSA_ENABLE_SDMA=0    # gfx1030 必需
 **四条最常用的**（其余去速查节抄）：
 ```bash
 bash scripts/watch.sh                                  # 巡检（唯一认可的入口，铁律 6）
-systemctl --user status nanoseek-v3-dlg.service        # 训练还活着吗
-tail -c 1500 out/base_v3_dlg_train.log                 # 最新进度
+systemctl --user is-active nanoseek-persona-smoke.service   # 训练还活着吗
+tail -c 1500 out/base_v3_persona_train.log             # 最新进度
 tail -40 out/watch_heartbeat.log                       # ★ 我不在时，定时器替我记的巡检心跳
 ```
-⚠ 训练日志在 **`out/base_v3_dlg_train.log`**（`out_dir` **之外**，铁律 3）。
+⚠ 训练日志在 **`out/base_v3_persona_train.log`**（`out_dir` **之外**，铁律 3）。
+⚠ 上面的单元名/日志名**跟着当前站走**：当前站是人格层 `v3_persona`（§1 第 0 条）。
+换站时这四条里的后三条、以及下面那条 `watch.sh` 的默认值**都**要一起改。
 
 ★★ **巡检已由 systemd 定时器兜底：`nanoseek-watch.timer`（每 30 分钟跑一次 `watch.sh`，
 输出追加进 `out/watch_heartbeat.log`）**。2026-09-14 实测的教训：
@@ -124,9 +141,9 @@ AI 会话的 `sleep N` 链**是单点故障** —— 半夜 bash 定时器到点
 `sleep` 链只用来让我自己醒来后看一眼**；醒来先读 `out/watch_heartbeat.log` 补盲区，
 再跑一次 `watch.sh` 做即时确认。定时器本身用
 `systemctl --user list-timers nanoseek-watch.timer` 验证。
-⚠★ **换 run 必须同步改 `scripts/watch.sh:16-17` 的默认 `OUT_DIR`/`LOG`** ——
+⚠★ **换 run 必须同步改 `scripts/watch.sh:20-21` 的默认 `OUT_DIR`/`LOG`** ——
 它俩是写死的默认值。不同步的后果不是"少看日志"：**新目录的 ckpt 不会被 prune，磁盘会被写满**，
-而且日志/异常关键字扫的是旧 run（2026-09-13 起 `watch.sh` 默认已指向 `out/base_v3_dlg`）。
+而且日志/异常关键字扫的是旧 run（2026-09-14 起默认已指向 `out/base_v3_persona`）。
 
 ---
 
@@ -377,10 +394,12 @@ step > 22000   全 token 均匀采样、全部算 loss                 val ≈ 4
 `test_project_layout.py` 就是**故意**这么设计的 —— 它逼着"文档和配置一起改"。
 **不要**为了让测试变绿只改测试不改文档。
 
-**★ 三阶段配方是另一套（2026-09-13 新增）**：`configs/base_v3_know.yaml` / `base_v3_dlg.yaml`
+**★ 分段配方是另一套（2026-09-13 新增，2026-09-14 加入人格层）**：`configs/base_v3_*.yaml`
 用 `extends: base_v2.yaml` 继承架构与优化器，只覆盖"这一段训练的配方"。
 它们的步数在 `tests/test_project_layout.py::V3_STAGE_STEPS` 里又写了一遍，
-改步数必须同时改**两个文件**（`PROJECT_STATE §0.5.10` 的方案表 + 那个 dict）。
+改步数必须同时改**两个文件**（`PROJECT_STATE` 的方案表 §0.5.10 / §0.5.14 + 那个 dict）。
+★★ 人格层是**唯一**开着 `use_loss_masking` 的阶段（`mask_mode: resp_span`）——
+`test_v3_stage_config_safety` 第 (4) 条**按 `mask_mode` 分支**，不是按文件名白名单。
 
 ---
 
@@ -392,7 +411,8 @@ step > 22000   全 token 均匀采样、全部算 loss                 val ≈ 4
 | 多轮对话评估 | `inference/scripts/eval_multiturn.py`（**也必带 `--style`**：收尾率/自开轮次率/收不住率；2026-09-13 前它写死 v1 标签，评 v2 会喂 OOD，见 `TECH_DEBT` §1.13）|
 | 采样 / 对话 | `inference/sample.py`、`inference/scripts/chat.py`（或 `cli.py sample` / `cli.py chat`）|
 | 巡检 | `scripts/watch.sh` |
-| **v3 分段训练配方（B 段对话 = 当前主线；A 段知识已跳过）** | ★ **B 段**：`configs/base_v3_dlg.yaml`（`extends: base_v2.yaml`），当前直接 `init_from: out/base_v2/last.pt`（step 61000）—— **A 段 `configs/base_v3_know.yaml` 已被用户 2026-09-13 拍板跳过**，配方保留备用。启动就是 `train.py configs/base_v3_*.yaml`，**不要再堆一长串命令行参数**（方案文档里那串参数已经全部写进配置）。★★ 铁律 **12**：warm start 的 `init_from=<路径>.pt` **不是** `resume`，照样触发 `_backup_old_run` ⇒ **每段必须有自己的 `out_dir`**。两条断言钉着：`test_project_layout.py::test_v3_stage_config_safety` / `::test_all_config_out_dirs_are_pairwise_distinct` |
+| **v3 分段训练配方（当前主线 = 人格层 `v3_persona`）** | ★ **人格层（当前）**：`configs/base_v3_persona.yaml`（`extends: base_v2.yaml`），`init_from: out/base_v3_dlg/last.pt`，`data_prefix: v3_persona`，**`use_loss_masking: true` + `mask_mode: resp_span`**（单流格式必需，见下一条）。★ **B 段**：`configs/base_v3_dlg.yaml`，`init_from: out/base_v2/last.pt`（step 61000）—— **A 段 `configs/base_v3_know.yaml` 已被用户 2026-09-13 拍板跳过**，配方保留备用。启动就是 `train.py configs/base_v3_*.yaml`，**不要再堆一长串命令行参数**（方案文档里那串参数已经全部写进配置）。★★ 铁律 **12**：warm start 的 `init_from=<路径>.pt` **不是** `resume`，照样触发 `_backup_old_run` ⇒ **每段必须有自己的 `out_dir`**。三条断言钉着：`test_project_layout.py::test_v3_stage_config_safety`（第 (4) 条按 `mask_mode` 分支）/ `::test_all_config_out_dirs_are_pairwise_distinct` / `V3_STAGE_STEPS` |
+| **单流 `<resp>` 语料的 loss 掩码 / 产物验收** | ★ 掩码：`training/masking.py::build_resp_span_mask`（`<resp>` 之后 → 对应 `<eos>` 含，**不含 `<resp>`**）；权威定义是 `training/dialogue_stream.py::loss_token_spans`，**两者必须对所有输入逐位一致**（相邻 `<resp>` 这种退化输入曾让它们分叉 —— 那次是**实现**错，见 `PROJECT_STATE §0.5.14`）。`train.py` 用 `--mask_mode=resp_span` 选它（未知值**断言退出**，不静默退回）。★ bin 验收：`scripts/resp_bin_probe.py` —— `build_stages.py` 的 `check_terminators` **看不见 `<resp>`**，本脚本补上：`<resp>`/`<eos>` 配平、孤儿计数、**有效 token 占比**、两条口径逐位一致、编解码往返（★ `decode` 必须 `skip_special_tokens=False`）。`--selftest` 带已知答案对照 |
 | 配对重评 / val 噪声 | `scripts/ckpt_paired_eval.py` |
 | **逐来源的语言能力（"会不会认字"）** | `scripts/per_source_ce_probe.py` —— 按 manifest 的 `val_blocks` 把 val 切回**来源**，报 `real / shuffled / unigram` 三级对照。`real − shuffled` = 真的在读上下文的净度量（`shuffled` 保住相邻对、毁掉长上下文）。★ **口径与 `use_loss_masking` 无关**，所以 **step 22000 那条断裂线在它的表里不存在**，可以跨全程比较。★ **可以换 val**：`--data/--offsets/--manifest/--train-bin` 指到 `v3_*` 就能评 stage 自己的 val（§5.12 要求两把尺子都报）。★★ 曾经写在"源对齐对照"里的三个源名是 **v2 manifest 专属**，换 manifest 会 `KeyError`（2026-09-14 修，见 `align_control_names()` + 4 条测试）。★ `--dump-windows <json>` 把**实际用到的窗口起点**落盘，供污染率审计复用。★ 加 `--control-random` 会再评一个**随机初始化**的模型当已知答案对照（实测 real−shuffled = **+0.001**，B 终态是 **−1.65**，随机权重落在 log(8192)=9.01 ≈ 瞎猜）——**下结论前先看这一行**。⚠ 此前那句"v3 val 已被 v2 见过 99%"**在逐字 32-gram 口径下实测为 0/153**，别再引用它当理由 |
 | **val 是不是训练集的近重复（污染率）** | `scripts/val_train_contamination_probe.py` —— 拿 `per_source_ce_probe --dump-windows` 落盘的那批窗口，做 32-gram 定长哈希**流式**扫训练 bin。★★ **必须流式、别建全量索引**：9.4 亿 token 的 bin 建索引要 ≈7.5GB，实测被 OOM 杀过两次。★ 自带三组对照（train 原样片段必须命中 / 同段打乱必须不命中 / v2 自己的 train 查 v2 自己的 val 应≈0）。★ 2026-09-14 实测：B 段 v2 val **0/369**、v3_dlg val **0/153** |
@@ -433,7 +453,7 @@ CE 只吃 token，不受标签格式影响，是更硬的证据。
 ## 10. 目录导航
 
 ```
-configs/            训练配置（base_v2.yaml = 已跑完的基座；base_v3_{know,dlg}.yaml = 三阶段主线；★ 必须放在 out_dir 之外）
+configs/            训练配置（base_v2.yaml = 基座；base_v3_persona.yaml = **当前站**；base_v3_{know,dlg}.yaml = 前两站；★ 必须放在 out_dir 之外）
 training/train.py   ★ 1473 行的模块级脚本 —— import 它就等于开始训练，不能单测
 training/           已抽出的纯函数模块（schedules / masking / checkpoints / run_logs / diag）
 model/              模型与组件（gpt.py / ngram_ndb.py 是 NDB 原型）
@@ -445,7 +465,7 @@ data/chinese/       语料与 tokenizer（★ **原始语料已移出仓库**，
 /home/vesita/datasets/NLP/   ★ 原始语料（2026-09-13 用户要求搬出仓库；29 文件 / 2.4GB）
 data/chinese/raw_all/        软链聚合目录（清洗的**输入**）
 data/chinese/clean_v3/       治理后的语料（清洗**产物**，进 bin 的输入）+ CLEANING_REPORT.md
-data/chinese/stages/v3_*/    三阶段软链目录（v3_lang / v3_know / v3_dlg）
+data/chinese/stages/v3_*/    阶段软链目录（v3_lang / v3_know / v3_dlg / v3_persona）
 data/chinese/new_sources/    新导入数据的转换产物（qa_knowledge / sharegpt / belle / wildchat）
 PROJECT_STATE.md    ★ 状态 + 速查 + 铁律
 TECH_DEBT.md        技术债

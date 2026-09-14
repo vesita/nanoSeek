@@ -1,0 +1,77 @@
+# ============================================================================
+# v3 分段训练 · 人格层（v3_persona）—— **单流 `<resp>` 格式**，与其它 v3 段口径不同
+# ============================================================================
+# 继承 base_v2.yaml，并覆盖本段配方。用法：
+#     .venv/bin/python training/train.py configs/base_v3_persona.yaml
+#
+# ★ 本段与 v3_lang / v3_know / v3_dlg 的**根本区别**（三条，别照抄别的段）：
+#   1. 语料是**单流格式**：`对象A：…` / `<resp>…<eos>` 逐行交替（`training/dialogue_stream.py`
+#      的渲染产物），**不是**「用户：/模型：」。`prepare.py::annotate_replies` 认不出这种
+#      前缀，会把每一行**原样保留** —— 正是我们要的（语料自带 `<resp>`/`<eos>`，
+#      不该被二次标注成 `A：/B：` + 追加 `<eos>`）。
+#   2. ⇒ **必须开 loss masking**（`use_loss_masking: true`），且模式必须是
+#      `mask_mode: resp_span`（`<resp>` 之后 → 对应 `<eos>` 含，**不含 `<resp>` 本身**）。
+#      ★ 这与 B 段「三阶段都必须关 masking」相反，理由不是"改主意了"，而是**格式变了**：
+#      旧规则（行内含 `<eos>` ⇒ 整行算 loss）在这里不会误伤用户行（用户行没有 `<eos>`），
+#      但会把 `<resp>` 自己算进 loss —— 每轮只多 1 个 token，方向却是错的
+#      （在教模型顺手输出 `<resp>`，而它是 harness 喂的）。
+#      关掉 masking 更糟：全部 token 等权，`<resp>`/`<eos>` 与正文一视同仁。
+#   3. 因此 `tests/test_project_layout.py::test_v3_stage_config_safety` 的
+#      "use_loss_masking 必须 False" 一条对本段**有文档化例外**：判据绑在
+#      `mask_mode == 'resp_span'` 上，并要求 `data_prefix == 'v3_persona'`
+#      —— 别的阶段写 resp_span 会被断言拦下（那说明配错了语料）。
+#
+# 依据：PROJECT_STATE.md §0.5.14；语料规格在仓库外（~/datasets/persona/_spec.md）。
+extends: base_v2.yaml
+
+# --- 1) 产物隔离 ------------------------------------------------------------
+# warm start 会触发 `_backup_old_run(out_dir)`（铁律 12），所以本段必须有独立 out_dir。
+# **绝不要**写 out/base_v3_dlg 或 out/base_v2。
+out_dir: out/base_v3_persona
+
+# --- 2) 权重来源：B 段对话专修终态 -----------------------------------------
+# `out/base_v3_dlg/last.pt` = **step 14000**（B 段跑满 14000/14000，Result=success）。
+# ★ 为什么接 B 段而不是基座：人格层要的是"在已有的对话形状上加一层人设绑定与措辞习惯"，
+#   接一个已经会对话的模型才能看出人格层**单独**贡献了什么；接 scratch 就只能证明
+#   "脚本能跑"。本段的第一版是**冒烟**（见下 §5），用哪个基座不影响它要证明的事，
+#   但用真权重才让"采样 → parse_log"这一步有可读的产物。
+init_from: out/base_v3_dlg/last.pt
+
+# --- 3) 语料 + 打包 ---------------------------------------------------------
+# 由 `data/chinese/build_stages.py --only v3_persona --apply --build` 产出
+# （源文件 persona_identity.txt 软链自 new_sources/，本体在仓库外）。
+# ★ 重建后必须核对 token 数变了没有：实测 train 85,967 / val 850。
+# 验收工具：`scripts/resp_bin_probe.py`（查 resp/eos 配对、有效 token 占比、
+# 两条 loss 口径逐位一致、编解码往返）。实测：2,313 resp == 2,313 eos，0 孤儿，
+# 有效 token **64.87%**，编解码 3/3 逐字相同。
+data_prefix: v3_persona
+
+use_doc_packing: true
+pack_align: false        # ★★ 见 base_v3_know.yaml 的长注释 / PROJECT_STATE §0.5.12
+
+# --- 4) loss masking：本段**必须开**，且必须是 resp_span ---------------------
+use_loss_masking: true
+mask_mode: resp_span
+
+# --- 5) 学习率配方（开一段新的 WSD 循环，不是续训）--------------------------
+schedule: wsd
+stage: full
+learning_rate: 0.0002
+min_lr: 0.00002
+warmup_iters: 30         # 300 步的 10%（B 段 200/14000 也是这个比例）
+stable_frac: 0.8
+
+# --- 6) 步数 ----------------------------------------------------------------
+# ★★ 现在这 300 步是**冒烟**，不是正式配方：语料只有 86k token（792 条 / 28% 句唯一率），
+#    8192 token/步 ⇒ 10.5 步 1 epoch ⇒ 300 步 ≈ **28 epoch**，必然只能背下来。
+#    它要证明的是**链路**（单流语料 → resp_span loss → 权重更新 → 采样 → parse_log 回读），
+#    不是效果。persona 的 monologue / dialogue 层还没写，写完再定正式步数。
+# ★ 改步数必须同时改两处（有测试钉着，铁律见 AGENTS §8）：
+#    `tests/test_project_layout.py::V3_STAGE_STEPS` + `PROJECT_STATE §0.5.14` 的方案表。
+max_iters: 300
+lr_decay_iters: 300
+
+# --- 7) 评估节律（本段段短，必须加密，否则 best.pt 永不落盘）----------------
+# base_v2 的 eval_interval=1000 > max_iters=300 ⇒ 只会在结束前算一次，
+# `always_save_checkpoint: false` 下 best.pt 永远不会写。降到 50 ⇒ 6 个评估点。
+eval_interval: 50

@@ -13,12 +13,14 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-# ★ 默认值必须跟**当前正在跑的 run** 走。2026-09-13 起主线是 v3 分段训练
-#   （B 段 `out/base_v3_dlg`）。默认值写死旧 run 的后果不是"少看几行日志"：
+# ★ 默认值必须跟**当前正在跑的 run** 走。2026-09-14 起主线是**人格层**
+#   （`configs/base_v3_persona.yaml` → `out/base_v3_persona`，单流 `<resp>` 格式，
+#   `mask_mode: resp_span`）；上一站 B 段 `out/base_v3_dlg` 已跑完（14000/14000）。
+#   默认值写死旧 run 的后果不是"少看几行日志"：
 #   新目录的归档 ckpt 不会被 prune（见第 49 行），**磁盘会被写满**。
 #   换 run 时**必须**同步改这两行；要巡检别的 run 就显式传参。
-OUT_DIR="${1:-out/base_v3_dlg}"
-LOG="${2:-out/base_v3_dlg_train.log}"
+OUT_DIR="${1:-out/base_v3_persona}"
+LOG="${2:-out/base_v3_persona_train.log}"
 SPARSE_EVERY="${3:-5000}"
 NEWEST_KEEP="${4:-2}"
 CONFIG_PAT="training/train.py"

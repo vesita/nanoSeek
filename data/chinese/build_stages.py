@@ -56,6 +56,14 @@ PREPARE = os.path.join(DATA, 'prepare.py')
 #   lang  识字：通用书面语（网页/百科/文学）—— 学字、词、句法
 #   know  知识：问答 / 指令 / 任务 / 推理链 —— 学事实与推理
 #   dlg   对话：有来有回的多轮对话 —— 学轮次结构与对话逻辑
+#   persona 人格：**单流 `<resp>` 格式**的人设绑定层（2026-09-14 用户定的新阶段）——
+#          语料是 `对象A：…` / `<resp>…<eos>` 逐行交替的**单流**（不是「用户：/模型：」），
+#          `annotate_replies` 认不出它，会把每一行**原样保留**（正是我们要的：语料已自带
+#          `<resp>`/`<eos>`，不该被二次标注）。⇒ 训练时**必须**配
+#          `mask_mode: resp_span`（见 `configs/base_v3_persona.yaml`），否则
+#          `build_assistant_mask` 的"整行含终止符"规则会把 `<resp>` 自己也算进 loss。
+#  源文件 `persona_identity.txt` 本体**不在仓库里**（放在 ~/datasets/ 下，软链进
+#  new_sources/；见 PROJECT_STATE §0.5.14）。文件名刻意保持中性。
 STAGES = {
     'v3_lang': [
         'c4_zh.txt', 'wikipedia_cn.txt',
@@ -76,6 +84,9 @@ STAGES = {
         'belle_multiturn.txt',                    # 新导入：Belle 0.8M 抽样
         'wildchat_zh.txt',                        # 新导入：WildChat 中文（已过滤 toxic）
         'escov_zh.txt',                           # 新导入：翻译后的多轮对话
+    ],
+    'v3_persona': [
+        'persona_identity.txt',                   # 单流 <resp> 人设绑定层（~87k token）
     ],
 }
 
@@ -275,7 +286,9 @@ def main():
         if r.returncode != 0:
             raise SystemExit(f'❌ {stage} 构建失败（退出码 {r.returncode}）')
     run_terminator_checks(stages, a.bad_frac_max)
-    print('\n✅ bin 构建完成。训练时用 --data-prefix v3_lang / v3_know / v3_dlg 切换')
+    print('\n✅ bin 构建完成。训练时用 --data-prefix v3_lang / v3_know / v3_dlg / '
+          'v3_persona 切换（★ v3_persona 必须配 mask_mode=resp_span，见 '
+          'configs/base_v3_persona.yaml）')
 
 
 if __name__ == '__main__':

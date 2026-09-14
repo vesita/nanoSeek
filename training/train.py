@@ -340,6 +340,18 @@ elif byte_level:
     # loss masking 标记改字节序列（<eos>=256；字级 <cont> 在字节模式暂不启用，只用 eos 定位）
     mask_reply_ids = [0x0100]                       # 256 = <eos>
     mask_sep_ids = [0x0a, 0x0a]                     # \n\n
+# mask_mode 合法性：**写错值绝不能静默退回 eos_line** —— 观测到的后果是两回事：
+# 'resp_span' 写错成 'resp-spain' 会安静地用整行规则，loss 照样下降（只是多算了 <resp>），
+# 而 'eos_line' 写错成 'resp_span' 在非单流语料上会给出**全 False** 的 mask ⇒ loss NaN。
+# 断言放在这里（config_keys 之后、消费点之前），配置一加载就炸。
+assert mask_mode in ('eos_line', 'resp_span'), (
+    f"mask_mode={mask_mode!r} 未知；只认 'eos_line'（行内含 <eos>/<cont> ⇒ 整行算 loss）"
+    f" 或 'resp_span'（<resp> 之后 → 对应 <eos> 含，**不含 <resp>**，单流格式用）")
+if mask_mode == 'resp_span':
+    # 单流格式下 mask_reply_ids 只服务"窗口非空"打包判据；真正判定用 mask_resp_ids。
+    assert mask_resp_ids, ("mask_mode='resp_span' 但 mask_resp_ids 为空 —— "
+                           "字级模式会在上面按词表填 <resp>；这里为空说明走了 "
+                           "BPE/字节分支，而 resp_span 目前只支持字级")
 # 打包非空窗口：终止符 id 列表（空 = 不启用，见 get_batch / _sample_nonempty_ix）
 _pack_terms = []
 if pack_nonempty and use_loss_masking and ('stage' not in globals() or stage != 'pretrain'):
