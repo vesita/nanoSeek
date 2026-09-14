@@ -146,3 +146,23 @@ class GPTConfig:
     z_loss_weight: float = 0.0
     # --- 100M 大模型与长上下文基建：梯度检查点 (Activation Checkpointing) ---
     gradient_checkpointing: bool = False  # True: 对 Transformer Block 开启重算，压降 65%~75% 显存
+
+    @classmethod
+    def from_model_args(cls, args):
+        """从 checkpoint 的 `model_args` 建配置，**忽略本类不认识的键**。
+
+        ★ 为什么必须有这个入口，而不是到处 `GPTConfig(**ckpt['model_args'])`：
+        checkpoint 里存的是**当时那套** `GPTConfig` 的字段。我们一旦删掉某个开关
+        （例如 2026-09-15 删掉旧 PK-NDB 的 `use_neural_db` 一族），老 checkpoint 的
+        `model_args` 里仍然带着它 ⇒ 直接 `**` 展开会 `TypeError`，
+        于是**所有历史 checkpoint 都加载不了**。实测踩过一次：删字段后
+        `local/build_chunk_store.py` 当场崩在 `GPTConfig(**args)`。
+
+        用法：凡是从 checkpoint / 存档里拿 `model_args` 的地方，一律走这里。
+        只认识当前字段、其余安静丢弃 —— 删字段这件事从此不再有破坏性。
+        """
+        import dataclasses
+        if not isinstance(args, dict):
+            raise TypeError(f"model_args 必须是 dict，收到 {type(args).__name__}")
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in args.items() if k in known})

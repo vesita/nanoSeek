@@ -56,7 +56,7 @@ def build_model(ckpt_path, device):
     ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     ma = dict(ck['model_args'])
     ma.pop('eos_token_id', None)
-    model = GPT(GPTConfig(**ma))
+    model = GPT(GPTConfig.from_model_args(ma))
     sd = {(k[10:] if k.startswith('_orig_mod.') else k): v for k, v in ck['model'].items()}
     model.load_state_dict(sd, strict=False)
     return model.to(device).eval(), ma

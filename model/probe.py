@@ -65,7 +65,7 @@ def load_model(out_dir, device):
     if not os.path.exists(ckpt_path):
         sys.exit(f"错误：找不到 {ckpt_path}（先用 cli.py train 训练，或用 --out_dir 指定实验目录）")
     ckpt = torch.load(ckpt_path, map_location=device)
-    model = GPT(GPTConfig(**ckpt["model_args"]))
+    model = GPT(GPTConfig.from_model_args(ckpt["model_args"]))
     state = ckpt["model"]
     unwanted = "_orig_mod."
     for k in list(state):

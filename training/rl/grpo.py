@@ -48,7 +48,7 @@ def load_model(ckpt_path):
     args = dict(ck["model_args"])
     if "use_csa_fused_qkv" not in args:   # 旧 checkpoint → 独立 QKV 布局
         args["use_csa_fused_qkv"] = False
-    model = GPT(GPTConfig(**args))
+    model = GPT(GPTConfig.from_model_args(args))
     state = {k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v
              for k, v in ck["model"].items()}
     model.load_state_dict(state)
@@ -116,7 +116,7 @@ def main():
     a = ap.parse_args()
 
     model, ck = load_model(a.ckpt)
-    ref = GPT(GPTConfig(**{**ck["model_args"], "use_csa_fused_qkv": False})) if "use_csa_fused_qkv" not in ck["model_args"] else None
+    ref = GPT(GPTConfig.from_model_args({**ck["model_args"], "use_csa_fused_qkv": False})) if "use_csa_fused_qkv" not in ck["model_args"] else None
     # 基座冻结副本（KL 参考）：直接克隆权重
     import copy
     ref = copy.deepcopy(model)

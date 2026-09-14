@@ -43,7 +43,7 @@ assert init_from == 'resume', "本脚本只支持从 out_dir 加载 best.pt"
 # 从保存在特定目录中的模型初始化
 ckpt_path = os.path.join(out_dir, 'best.pt')
 checkpoint = torch.load(ckpt_path, map_location=device)
-gptconf = GPTConfig(**checkpoint['model_args'])
+gptconf = GPTConfig.from_model_args(checkpoint['model_args'])
 model = GPT(gptconf)
 state_dict = checkpoint['model']
 unwanted_prefix = '_orig_mod.'

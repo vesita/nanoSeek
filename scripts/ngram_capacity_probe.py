@@ -277,7 +277,7 @@ def run_delta(a, L_d, M_d):
     from model.gpt import GPT, GPTConfig
     ck = torch.load(a.ckpt, map_location="cpu", weights_only=False)
     ma = dict(ck["model_args"]); ma.pop("eos_token_id", None)
-    model = GPT(GPTConfig(**ma))
+    model = GPT(GPTConfig.from_model_args(ma))
     sd = {(k[10:] if k.startswith("_orig_mod.") else k): v for k, v in ck["model"].items()}
     model.load_state_dict(sd, strict=False)
     dev = torch.device(a.device)

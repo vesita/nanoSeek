@@ -48,7 +48,7 @@ def checkpoint_healthy(ckpt_path, samples_per_prompt=3, max_tokens=50,
         args = dict(ck["model_args"])
         if "use_csa_fused_qkv" not in args:
             args["use_csa_fused_qkv"] = False
-        m = GPT(GPTConfig(**args))
+        m = GPT(GPTConfig.from_model_args(args))
         state = {k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v
                  for k, v in ck["model"].items()}
         m.load_state_dict(state)

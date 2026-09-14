@@ -27,7 +27,7 @@ def load(dirpath):
     args = dict(ck["model_args"])
     if "use_csa_fused_qkv" not in args:   # 旧 checkpoint → 独立 QKV 布局
         args["use_csa_fused_qkv"] = False
-    m = GPT(GPTConfig(**args))
+    m = GPT(GPTConfig.from_model_args(args))
     state = {k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v
              for k, v in ck["model"].items()}
     m.load_state_dict(state)

@@ -19,7 +19,7 @@ from model.gpt import GPT           # noqa: E402
 
 
 def count_from_args(name, model_args):
-    model = GPT(GPTConfig(**{k: v for k, v in model_args.items()}))
+    model = GPT(GPTConfig.from_model_args(model_args))
     n = model.get_num_params(non_embedding=True)
     print(f"{name:<30} {n:>9,}   ({n/1e6:.3f}M)")
     return n

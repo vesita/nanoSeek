@@ -72,7 +72,7 @@ def load_model(ckpt_path, device):
         if dropped:
             print(f"  [note] 丢弃 GPTConfig 不认的键: {dropped}")
         args = {k: v for k, v in args.items() if k in fields}
-    model = GPT(GPTConfig(**args))
+    model = GPT(GPTConfig.from_model_args(args))
     sd = ck['model']
     if any(k.startswith('_orig_mod.') for k in sd):
         sd = {k.replace('_orig_mod.', '', 1): v for k, v in sd.items()}

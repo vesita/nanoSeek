@@ -41,7 +41,7 @@ def build_model_from_checkpoint(out_dir, device=None, rope_len=None):
     """
     ckpt = torch.load(Path(out_dir) / "best.pt", map_location="cpu", weights_only=False)
     args = dict(ckpt["model_args"])
-    conf = GPTConfig(**args)
+    conf = GPTConfig.from_model_args(args)
     # 推理无反向传播：梯度检查点纯浪费（profile：每步 414 次 checkpoint 调用）
     if getattr(conf, "kv_memory_checkpoint", False):
         conf.kv_memory_checkpoint = False

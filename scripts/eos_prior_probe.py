@@ -133,7 +133,7 @@ def main():
 
     from model import GPT, GPTConfig
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    model = GPT(GPTConfig(**ckpt['model_args']))
+    model = GPT(GPTConfig.from_model_args(ckpt['model_args']))
     sd = {k[len('_orig_mod.'):] if k.startswith('_orig_mod.') else k: v for k, v in ckpt['model'].items()}
     model.load_state_dict(sd)
     model.eval().to(device)
