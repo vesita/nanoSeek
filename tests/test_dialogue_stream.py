@@ -286,6 +286,36 @@ def test_turn_cue_is_a_single_token():
     assert tok.get_vocab_size() == 8192, '词表大小不能变（变了所有 bin 都失效）'
 
 
+def test_tokenizer_source_matches_the_built_artifact():
+    """★ 词表**生成脚本**与**现盘产物**必须一致 —— 否则重建一次就静默漂移。
+
+    `data/chinese/char_tokenizer.json` 被 `.gitignore` 忽略（`data/*/char_tokenizer.json`），
+    所以**能进版本的真相是生成脚本里的 `mech_names`**。这条把两者钉在一起：
+    「顺序即 id」⇒ `mech_names[i]` 必须恰好落在 id `128 + i`。
+    """
+    import ast
+    import io
+    import json
+
+    src = io.open(os.path.join(_ROOT, 'data', 'chinese', 'train_tokenizer.py'),
+                  encoding='utf-8').read()
+    names = None
+    for node in ast.walk(ast.parse(src)):
+        if (isinstance(node, ast.Assign)
+                and any(getattr(t, 'id', None) == 'mech_names' for t in node.targets)):
+            names = ast.literal_eval(node.value)
+    assert names, '没能从 train_tokenizer.py 里解析出 mech_names'
+    assert names[12] == '<resp>', f'mech_names[12] 应为 <resp>（→ id 140），实际 {names[12]!r}'
+
+    vocab = json.load(io.open(
+        os.path.join(_ROOT, 'data', 'chinese', 'char_tokenizer.json'), encoding='utf-8')
+    )['model']['vocab']
+    for i, n in enumerate(names):
+        assert vocab.get(n) == 128 + i, (
+            f'mech_names[{i}]={n!r} 应在 id {128 + i}，实际 {vocab.get(n)} —— '
+            f'生成脚本与现盘词表已漂移，重建一次就会改掉 id 语义')
+
+
 @pytest.mark.parametrize('text', [
     '你好，我是李华。',
     '今天天气不错。',
