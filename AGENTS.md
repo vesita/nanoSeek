@@ -23,6 +23,13 @@
     仓库里只放格式/掩码/配置/验收工具。**不要**把对话正文或人设描述粘进文档、提交信息、测试。
     ★ 验收工具 `scripts/resp_bin_probe.py`（查 `<resp>`/`<eos>` 配平、**有效 token 占比**、
     两条 loss 口径逐位一致、编解码往返）；实测 2,313/2,313 配平、**64.87% 有效**。
+    ✅ **Step A 冒烟已跑完**（`Result=success`、300 步、19.8 min、异常 0；
+    val 3.50 → 0.128 —— 28 epoch ⇒ **背下来了**，只证明链路）。
+    端到端验收 `scripts/single_stream_e2e.py` 四条全过：**收尾 6/6**、
+    `parse_log(render())` 往返一致、`<resp>` 不进 loss、渲染行级无相邻同说话人。
+    ⚠ 报告含生成正文 ⇒ 放仓库外 `~/datasets/persona/reports/`，**别写进 `analysis/`**。
+    ★ 采样/评估入口对单流格式**还没有一等支持**（`sample_py` 删尾部 `<eos>` + `decode`
+    吞机制符；两个 eval 入口缺单流 `--style`）⇒ 见 `TECH_DEBT §2` P1。
     ⏭ **Step B（未做）**：把**在线写** NDB 接进 `train.py`（现在**调用数是 0**，
     `out/mem_store/` 空；现成的 `MemoryCrossAttention` 是**预构建库只读** = 用户否决的灌注路线），
     再做「有写 / 无写」A-B 对照。
@@ -106,7 +113,8 @@ HSA_OVERRIDE_GFX_VERSION=10.3.0 HSA_ENABLE_SDMA=0    # gfx1030 必需
   `systemctl status` 报 "could not be found" **都是正常的**，要看日志判断是成功还是失败）。
   ⇒ 要接着训是**新的一站**，必须新起单元名（并同步改 `scripts/watch.sh:20-21`）。
   ✅ **上一站 `nanoseek-v3-dlg`（B 段对话专修）2026-09-14 13:28 正常结束**
-  （`Result=success`、14000/14000 步）；⚠ **旧单元 `nanoseek-base-v2` 已停**
+  （`Result=success`、14000/14000 步；⚠ 它跑在修 off-by-one **之前**，优化器步实际 14001）；
+  ⚠ **旧单元 `nanoseek-base-v2` 已停**
   （2026-09-13 12:48 stop，终态 step **61776**，它的 `last.pt` = step 61000）；
   `nanoseek-pause-65000`（65000 步看守）**从未触发、已作废**，
   **别**再照抄它们的命令去判断"训练是不是死了"。
@@ -419,6 +427,7 @@ step > 22000   全 token 均匀采样、全部算 loss                 val ≈ 4
 | **某一段训练到底训成什么样（效果审查报告）** | `analysis/B_stage_review.md`（B 段：两把尺子 + 污染率 + 生成侧指标 + OOD 提示词 + 结论与债）；原始输出在 `analysis/per_source_ce_{after_B,B_ownval,B_controlcheck}.txt`、`analysis/eval_{dialogue,multiturn}_B.txt`、`analysis/B_ood_prompts.txt`、`analysis/val_train_contamination_{v2val,v3dlgval}.md`。★ 采样入口是现成的 `inference/scripts/sample_py.py`（`--out_dir/--prompt/--temperature/--seed`），**不要另写采样脚本** |
 | **★ 分句 / 流式输入 / 上下文管理 / 自然文本入口（全项目统一）** | ★★ `training/segmentation.py` —— **canonical，别再自己写分句或滑窗**。① `split_line()` / `split_text()`：分句；**机制符原子**（不切进 `<...>`）、且 `<eos>` 这类后缀**不单独成句**（否则滑窗会把 `<eos>` 单独弹掉 = 坏数据）。② `StreamSegmenter`：**流式**（用户输入 / 长文本 / 分块到达）；**跨块的 `<eos>` 也粘得住**（`hold_last=True`，逐字喂也对）；`pending` 是压着的尾巴，`flush()` 收尾。③ `ContextWindow`：**上下文管理** —— 超预算从头部**整句**弹出（用户 2026-09-14 定的规则）；`budget >= NO_LIMIT` 时**不做任何测量**（否则解析整份语料 O(n²)，实测 60s+ 超时 → 0.01s）。④ `prepare_natural_text()` / `process_file()` / `python -m training.segmentation --file X`：**自然文本 → 训练可用**（规整 → 一句一行 → 空行仍是块分隔）。★ `data/chinese/split_sentences.py` 只是它的**薄壳转发**（`prepare.py` 一行没改）；测试见 `tests/test_segmentation.py`（含与旧实现逐字对拍 + 负向对照） |
 | **对话流（单流 + `<resp>` + loss 区间）** | `training/dialogue_stream.py` —— `DialogueStream`（`append/commit/prompt/render/rename/loss_token_spans`）、`iter_training_samples`、**`parse_log`**（把日志读回来）、**`read_corpus`/`write_corpus`**（语料统一读写，别再手写 `split('\n\n')`）。★ **上下文管理已委托**给 `segmentation.ContextWindow`，**别在 `DialogueStream` 里再加一套滑窗**。★ 模型自己轮次的标记是 **`<resp>`**（单 token，id 140），不是 `自己：`。★ **换话题标记 `<topic>`**（单 token，id 141）插在**开启新话题那一段的开头**（`append/commit(..., new_topic=True)`，或剧本三元组 `(speaker, text, True)`）；放在**模型自己**那段时它**落在 loss 区间内**，所以模型能学会**主动换话题** |
+| **单流语料的端到端验收（采样 → `parse_log` 回读）** | `scripts/single_stream_e2e.py` —— 拿 `best.pt` 按部署形状（`对象X：…\n<resp>`）采样，再喂 `training.dialogue_stream.parse_log`：查 ①模型自己吐 `<eos>` 的比例 ②`render` 往返 ③`<resp>` 是否进了 loss 区间 ④渲染行级相邻同说话人。★ 它**临时绕过**了 `sample_py` 的两个机制符缺口（把采样器删掉的尾部 `<eos>` 补回去 + `skip_special_tokens=False`），缺口本身在 `TECH_DEBT §2` P1。★ `--out` 的报告含生成正文 ⇒ **只写仓库外**（`~/datasets/persona/reports/`）|
 | 有效 token 密度 | `scripts/mask_density_probe.py` |
 | **量"`<eos>` 先验"（数据 bug 在权重里的残留）** | `scripts/eos_prior_probe.py` —— 在 `<think>\n` 之后 / 真·收尾处 / 换轮边界 / 随机中段四组位置上，量 P(`<eos>`) 与它的 **rank**。★ 自带**已知答案对照**（真·收尾组 rank 应为 0，实测通过），`--show` 会 dump 位置前文供人工核对（§5.9）。★★ **rank 和概率会给出相反读法**（实测：`<think>` 后 rank 28 但 P 仅 1.3e-4）—— 判"会不会真的截断"必须看**概率**，rank 只能说明"学到了" |
 | NDB 容量上限 | `scripts/ngram_capacity_probe.py` |
@@ -478,7 +487,9 @@ dev-notes/          历史实验记录（编号笔记，写新结论时接着编
 
 - [ ] `.venv/bin/python -m pytest -q -m 'not slow'` 全绿
 - [ ] `.venv/bin/python -m ruff check .` 全绿
-- [ ] 改过 `train.py` → 跑过 2 步冒烟（带 `--init_from=scratch` **和 `configs/base_v2.yaml`**）
+- [ ] 改过 `train.py` → 跑过 2 步冒烟（带 `--init_from=scratch` **和 `configs/base_v2.yaml`**）；
+      **动过训练主循环的步数/终止/评估节律 → 另跑 `pytest tests/test_training_loop.py`**
+      （AST 钉住"终止判据在优化器步**之前**且用 `>=`" —— 否则会多跑一个**不进 ckpt** 的优化器步）
 - [ ] 后台任务没留下孤儿进程；长跑用 `systemd-run` 起的（铁律 0）
 - [ ] 新结论写进了 `PROJECT_STATE.md`（状态类）或 `TECH_DEBT.md`（债类），
       并标注 **[实测] / [推断]**，以及**证据强度**（单次？配对？多 seed？）

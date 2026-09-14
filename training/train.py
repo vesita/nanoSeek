@@ -1413,6 +1413,23 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
+    # ★★ 终止判据必须在**优化器步之前**（2026-09-14 修，用户实测发现"多训练一轮"）。
+    # 为什么原来会多跑一步：旧代码把 `if iter_num > max_iters: break` 放在**循环末尾**、
+    # 且在 `iter_num += 1` **之后**，于是流程是
+    #     [eval@k] → [优化器步 k] → k+=1 → (k > max_iters 才 break)
+    # ⇒ 跑满 max_iters 之后**还会再走一次前向/反向/optimizer.step()**，那一步：
+    #   ① 不产生任何评估、不写任何 ckpt（**白算**，每个 run 固定浪费 1 步）；
+    #   ② 但它**改了权重** —— 而 `last.pt` 是在循环顶部 `iter_num == max_iters` 时存的
+    #      ⇒ 盘上的权重与内存里的权重差一步（用户看到的"多训练一轮"）。
+    #   实测：`--max_iters=3` 打印"训练完成：**4** 步"、tqdm 走到 `4it`（>100%）。
+    # 修法：把判据提到评估之后、优化器步之前，判据用 **>=**（不是 >）。
+    # 语义（修后）：优化器步**恰好** max_iters 次（iter_num 0..max_iters-1），
+    #   最后一步评估/落盘仍发生在 `iter_num == max_iters`（循环顶部），
+    #   ⇒ ckpt 编号不变、`results.csv` 不变、`last.pt` 与内存权重**一致**。
+    #   结构性断言见 `tests/test_training_loop.py`（AST，不用 import 这个脚本）。
+    if iter_num >= max_iters:
+        break
+
     # GLM-5 索引器预热：warmup 结束的当步解冻主模型（只切换一次，避免每步开销）
     if _idx_warmup_active and iter_num >= indexer_warmup_steps:
         _set_indexer_freeze(raw_model, False)
@@ -1596,9 +1613,8 @@ while True:
     if pbar is not None:
         pbar.update(1)
 
-    # 终止条件
-    if iter_num > max_iters:
-        break
+    # ★ 终止判据**不在这里** —— 它已上移到优化器步之前（见那里的长注释）。
+    #   留这条注释是为了让"旧写法被删掉了"可被 grep 到，别再把它加回来。
 
 # 训练结束：等后台保存线程写完，再画 loss 曲线图，收尾 csv
 if master_process:

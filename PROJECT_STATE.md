@@ -9,16 +9,21 @@
 
 ## 🚀 速查（最常用的东西就在这一节，别往下翻）
 
-**当前状态**：🧩 **主线已切到「人格层」（`v3_persona`，2026-09-14）—— Step A 冒烟在跑**。
-单元 `nanoseek-persona-smoke`（`on_failure=--collect`，**跑完自己消失**，别以为死了）；
-配置 `configs/base_v3_persona.yaml`，`init_from: out/base_v3_dlg/last.pt`（step 14000），
-`mask_mode: resp_span`。日志 `out/base_v3_persona_train.log`，产物 `out/base_v3_persona/`。
-★ 它只有 **86k token 语料 / 300 步 ≈ 28 epoch**，是**链路验证**不是效果 —— 细节与
-"本层不要把人设写进仓库"的约束见 **§0.5.14**（先读它的开头那条自我约束）。
+**当前状态**：🧩 **主线是「人格层」（`v3_persona`）—— Step A 冒烟已跑完，Step B（NDB 在线写）未开始**。
+单元 `nanoseek-persona-smoke`（`--collect` ⇒ **跑完自己消失，`inactive` 是正常的**）：
+`Result=success`、300/300 步、19.8 min、异常 0；`results.csv` train/val **3.5563/3.4986 → 0.1233/0.1278**
+（★ 86k 语料 × 300 步 ≈ 28 epoch ⇒ **背下来了**，只证明链路，**别当效果**）。
+端到端验收（采样 → `parse_log` 回读）四条全过：收尾 **6/6**、往返一致、`<resp>` 不进 loss、无相邻同说话人。
+配置 `configs/base_v3_persona.yaml`，`init_from: out/base_v3_dlg/last.pt`，
+**`mask_mode: resp_span`**（单流格式必需）。日志 `out/base_v3_persona_train.log`，产物 `out/base_v3_persona/`。
+详细口径与"不许把人设写进仓库"的约束见 **§0.5.14**（先读它的开头那条自我约束）。
+★ 同批修掉一个 off-by-one：跑满 `max_iters` 后旧代码**还会多跑一个优化器步**
+（`--max_iters=3` 打印 4 步）—— 已修，见 §0.5.14 末尾。
 ✅ **B 段对话专修已跑完**（2026-09-14 13:28）—— 单元 `nanoseek-v3-dlg`，
 `Result=success`、**14000/14000** 步、12:59:55、`NRestarts=0`；配置 `configs/base_v3_dlg.yaml`，
 `init_from: out/base_v2/last.pt`（= step **61000**）。产物 `out/base_v3_dlg/`
-（`last.pt` = 14000；归档 5000/10000/13000/14000）。⚠ 该单元**现在 inactive 是正常的**。
+（`last.pt` = 14000；归档 5000/10000/13000/14000）。
+⚠ 该单元**现在 inactive 是正常的**；⚠ 它是**修 off-by-one 之前**跑的，优化器步实际 14001。
 **A 段（`base_v3_know.yaml`）已被用户拍板跳过**（见 §0.5.10）。
 ⚪ 基座 `nanoseek-base-v2` **已停**（2026-09-13 12:48 stop，终态 step **61776**，其 `last.pt` = 61000）；
 `nanoseek-pause-65000` 看守**从未触发、已作废** —— 别照抄它们的命令判断"训练死了没"。
@@ -1086,15 +1091,55 @@ NDB 这种不基于上下文的预设）。B 段（`v3_dlg`）练出的是**对�
 
 #### 五、Step A（冒烟）与 Step B（NDB 在线写）
 
-- **Step A（本节的现状）**：语料只有 86k token（8192 token/步 ⇒ **10.5 步 1 epoch**），
-  300 步 ≈ **28 epoch**，必然只能**背下来**。它要证明的是**链路**
-  （单流语料 → `resp_span` loss → 权重更新 → 采样 → `parse_log` 回读 → 污染率），
-  **不是效果**。⇒ **别拿它的 loss/样本当人格质量结论。**
-- **Step B（未做）**：`train.py` 当前**在线写 NDB 的调用是 0 个**（`out/mem_store/` 为空），
-  现成的 `MemoryCrossAttention` 路径是**预构建库只读**（= 用户否决过的"灌注"路线）。
-  唯一被证明过的**在线写**模式是 `local/train_residual_db_hidden.py:220`
-  （`r_db.write_from_logits(...)` + `model/residual_neural_db.py:240`）。
+- **Step A ✅ 已跑完（2026-09-14 23:48，`[实测]` 单次）**：语料 86k token（8192 token/步
+  ⇒ **10.5 步 1 epoch**），300 步 ≈ **28 epoch** ⇒ 必然**背下来**。
+  单元 `nanoseek-persona-smoke`：`Result=success`、`status=0/SUCCESS`、
+  墙钟 **1187.6s（19.8 min）**、`3.43 s/it`、吞吐 ≈2460 t/s、峰值显存 **1.7G**、
+  **异常关键字 0**（`Traceback|OutOfMemory|非有限值`）。产物在 `out/base_v3_persona/`
+  （`last.pt`/`best.pt` 各 300 步、`results.csv`、`loss_curve.png`）。
+  `results.csv`（train / val）：**3.5563 / 3.4986 → 0.1233 / 0.1278**（6 个评估点）。
+  ⇒ 这只证明**链路能跑通**（单流语料 → `resp_span` loss → 权重更新 → 落盘），
+  **别拿它的 loss 或样本当人格质量结论** —— 28 epoch 的 loss 下降就是"背下来了"。
+- **端到端验收 ✅（`scripts/single_stream_e2e.py`，`[实测]` 单次，6 段）**：
+  拿 `best.pt` 按**部署时的输入形状**（`对象X：…\n<resp>`）采样，再喂
+  `parse_log` 读回来。四条结果：
+
+  | 判据 | 实测 |
+  |---|---|
+  | 模型**自己收尾**（吐出 `<eos>`） | **6/6** |
+  | `parse_log(render()).render() == render()` | **全 True** |
+  | `<resp>` 落在 loss 区间内（应 0） | **0** |
+  | 渲染行级相邻同说话人（应 0） | **0** |
+
+  ①③ 是这一层最关键的两条：`<eos>` 收尾率 6/6 说明 `resp_span` 的**右端**学会了，
+  `<resp>` 从不进 loss 说明**左端**口径在权重里兑现了。
+  ⚠ 报告含**生成的人设正文** ⇒ 按边界放在仓库外
+  `~/datasets/persona/reports/persona_smoke_e2e.txt`（第一版我写进了 `analysis/`，已挪走）。
+  ⚠ 我第一版把"相邻同说话人"在**句子层**数（`DialogueStream` 内部按句存条目），
+  于是每段都误报 1~2 处"违规" —— **是我的口径错，不是生成错**（§5.11 同族）。
+  对齐到**渲染行**（轮次）后为 0。
+  ⚠ 采样侧仍有两个缺口（`sample_py.py` 删掉尾部 `<eos>` + `decode` 默认吞机制符；
+  两个 eval 入口没有单流 `--style`）⇒ 已记 **`TECH_DEBT §2` P1**，
+  本脚本是**临时绕过**（把被删的 `<eos>` 补回去再解码），不是把缺口修好了。
+
+- **★ 同批修掉一个 off-by-one：跑满 `max_iters` 后还会多跑一个优化器步**（用户实测发现）。
+  旧代码把 `if iter_num > max_iters: break` 放在循环**末尾**、`iter_num += 1` **之后**
+  ⇒ `--max_iters=3` 打印「训练完成：**4** 步」、tqdm 走到 `4it`；那一步不评估不落盘
+  （白算），却**改了内存里的权重** ⇒ 盘上的 `last.pt` 与内存权重**差一步**。
+  已把判据上移到**评估之后、优化器步之前**并改成 **`>=`**：
+  优化器步**恰好** `max_iters` 次，最后一次评估/落盘仍在 `iter_num == max_iters`
+  ⇒ **`results.csv` 口径与 ckpt 编号都不变**（冒烟实测修前 3 步 / 修后 2 步）。
+  闸门 `tests/test_training_loop.py`（AST 读源码 + 手写旧/新形状的已知答案对照）。
+  ⚠ **历史 run 的记账要减 1 步**：B 段标称 14000 步，实际优化器步是 **14001**（修前）。
+- **Step B（未做，`train.py` **没有** NDB 写入）**：当前**在线写 NDB 的调用是 0 个**
+  （`out/mem_store/` 为空），现成的 `MemoryCrossAttention` 路径是**预构建库只读**
+  （= 用户否决过的"灌注"路线）。唯一被证明过的**在线写**模式是
+  `local/train_residual_db_hidden.py:220`（`r_db.write_from_logits(...)` +
+  `model/residual_neural_db.py:240`）。
   ⇒ 要做的是把这条接进 `train.py`，然后跑 **有写 / 无写** 的 A-B 对照。
+  ★ **本次 Step A 冒烟没有带 NDB**（`configs/base_v3_persona.yaml` 里没有任何 `ndb_*`
+  键，`ndb_store` 沿用 `base_v2` 的空值）—— 这是**有意的**，与"一步一步来"一致：
+  先把单流格式的链路证明干净，再叠 NDB，否则出问题分不清是格式还是 NDB。
 - 语料还剩三层没写：**对比探针**（`persona_contrast_probe.txt`，**是评估探针不是训练数据**，
   别混进 bin）、**独白层**、**对话层**。三层写完再定正式步数
   （改步数必须同时改 `V3_STAGE_STEPS` + 本节 + `configs/base_v3_persona.yaml`）。

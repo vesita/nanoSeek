@@ -293,7 +293,56 @@ v1 约定 —— **同一类缺陷有几个入口，就得逐个改**，改一�
 
 ---
 
+### 1.14 训练跑满 `max_iters` 之后**还会多跑一个优化器步**（2026-09-14 用户实测发现并修复）
+
+**症状**：`--max_iters=3` 打印「训练完成：**4** 步（达 max_iters 3）」，tqdm 走到 `4it`（>100%）。
+**根因**：终止判据 `if iter_num > max_iters: break` 写在循环**末尾**、且在 `iter_num += 1`
+**之后**，于是流程是 `[eval@k] → [优化器步 k] → k+=1 → (k>max_iters 才 break)`。
+跑满之后那一步：① 不评估、不落盘（**白算**，每个 run 固定浪费 1 步）；
+② 但它**改了内存里的权重**，而 `last.pt` 是循环顶部 `iter_num == max_iters` 时存的
+⇒ **盘上权重与内存权重差一步**；`resume` 时那一步会被重做。
+**修法**：判据上移到**评估之后、优化器步之前**，算符改 **`>=`**（不是 `>`）。
+修后语义：优化器步**恰好** `max_iters` 次（`iter_num` 0..`max_iters-1`），
+最后一次评估/落盘仍在 `iter_num == max_iters` ⇒ **`results.csv` 口径与 ckpt 编号都不变**。
+**证据（已知答案的输入）**：`--max_iters=2` 冒烟修前打印 3 步、修后打印 **2 步**；
+`results.csv` 两版都是 step 0/1/2（只有优化器步数变了）。
+**闸门**：`tests/test_training_loop.py` —— 用 **AST 读源码**（`train.py` 是模块级脚本，
+不能 import），断言 `termination < optimizer < iter_num+=1` 且算符必须是 `GtE`；
+自带**手写旧形状/新形状片段**的已知答案对照（判据不是恒真的）。
+
+**为什么现在才发现**：这个 off-by-one 只在"打印的步数"和"盘上权重"上露出，
+loss/val 曲线完全正常（1/14000 步的差异测不出来）⇒ 单测与曲线都不会报警，
+只有人读日志时数着"怎么是 4 步"才会发现。
+
+---
+
 ## 2. 待还的债（按「代价 ÷ 修复成本」排序）
+
+### P1 — 单流 `<resp>` 格式在**采样/评估入口**没有一等支持（2026-09-14）
+
+**位置**：`inference/scripts/sample_py.py`、`inference/scripts/eval_dialogue.py`、
+`inference/scripts/eval_multiturn.py`。
+**代价**：人格层（`v3_persona`，单流 `<resp>` 格式）训出来的模型，
+现成入口**给不出干净的评估证据**，三处叠加：
+
+1. **机制符被吃掉**（本项目栽过三次的那个坑，§7 铁律 14）：`sample_py.py` 命中 `<eos>` 时
+   `gen = gen[:new_start+i]` **把 `<eos>` 从返回的 ids 里删掉**（"EOS 及其后不输出"），
+   且所有 `tok.decode(...)` 都用默认 `skip_special_tokens=True`
+   ⇒ 采样产物**不能直接喂 `training.dialogue_stream.parse_log`**（是一个没闭合的 `<resp>`），
+   打印出来的样本也看不见 `<resp>`/`<eos>`。
+2. `eval_multiturn.TURN_MARKERS`（§1.13 刚补的）**不含 `<resp>`** ⇒ 单流模型自己开的轮次
+   检测不到，截断不触发、自开轮次率失真。
+3. `eval_dialogue.py` / `eval_multiturn.py` 的 `--style` **只有 `ab` / `user-model`**，
+   没有单流这一种。
+**临时绕过**：`scripts/single_stream_e2e.py` 用 `generate_ids` 拿 token 级结果、
+把采样器**故意删掉**的那个 `<eos>` 补回去、再用 `skip_special_tokens=False` 解码，
+然后喂 `parse_log` 做往返 + loss 区间检查。
+**动作**：给 `sample_py.py` 加 `--keep-special`（保留结尾 `<eos>` + 全量解码，默认关，
+**不改既有评估产物**）；给两个 eval 入口加第三种 `--style`（单流）。
+**为什么不当场改**：改 `sample_py.py` 的默认 decode 会**动既有 8 个模型的评估产物**，
+属于"口径变更"，要有对照臂才动（同 §1.13 的教训）。
+
+---
 
 ### P1 — 分段训练的"验收尺子"是**两条数据管线**，只报一把会得出相反结论（2026-09-14）
 
