@@ -1,0 +1,65 @@
+# ============================================================================
+# v3 分段训练 · 人格第 2 轮（v3_persona，收尾）—— **v3_persona2**
+# ============================================================================
+# 继承 base_v2.yaml，只覆盖本段配方。用法：
+#     .venv/bin/python training/train.py configs/base_v3_persona2.yaml
+#
+# ★ 本段是整条链的**最后一段** ⇒ 按 §0.5.10 的性质（每段独立 WSD、各自退火到 min_lr），
+#   **"哪一段放最后，哪一段就是最终人设"**。所以它负责把通识段冲淡的人设收回来。
+#
+# ★ 与第一轮（`base_v3_persona.yaml`）的差别**只有两个**：`init_from` 与 `out_dir`。
+#   步数 / 语料 / 掩码 / lr 配方全部对齐 —— 这样两轮的对比才有意义。
+#   ★ 别改这里的 max_iters 而不改第一轮：两轮步数不同就没法说"第二轮把第一轮的声线收回来了"。
+extends: base_v2.yaml
+
+# --- 1) 产物隔离（铁律 12）--------------------------------------------------
+out_dir: out/base_v3_persona2
+
+# --- 2) 权重来源：通识段终态 -------------------------------------------------
+init_from: out/base_v3_know2/last.pt
+
+# --- 3) 语料 + 打包 ---------------------------------------------------------
+# 与第一轮同一份单流 `<resp>` 语料（809,598 train token；验收见 `scripts/resp_bin_probe.py`）。
+data_prefix: v3_persona
+use_doc_packing: true
+pack_align: false
+
+# --- 4) loss masking：本段**必须开**，且必须是 resp_span ---------------------
+# 单流格式下 `<resp>` 由 harness 喂、不该被模型生成 ⇒ loss 只算「`<resp>` 之后 → 对应 `<eos>` 含」。
+# 权威定义是 `training/dialogue_stream.py::loss_token_spans`。
+use_loss_masking: true
+mask_mode: resp_span
+
+# --- 5) 学习率配方 ----------------------------------------------------------
+schedule: wsd
+stage: full
+learning_rate: 0.0002
+min_lr: 0.00002
+warmup_iters: 90
+stable_frac: 0.8
+
+# --- 6) 步数（与第一轮对齐：900 步 = 9.1 epoch）-----------------------------
+# ★ 改步数必须同时改两处：`tests/test_project_layout.py::V3_STAGE_STEPS`
+#   + `PROJECT_STATE §0.5.10 / §0.5.14` 的方案表。
+max_iters: 900
+lr_decay_iters: 900
+
+# --- 7) 评估节律 ------------------------------------------------------------
+eval_interval: 100
+
+# --- 8) NDB（外挂，**默认启用**；模块见 AGENTS §1 的门面表）------------------
+# ★ 库按**本段起点的基座**重建（键 = chunk 均值，基座漂移了空间就对不上）：
+#     local/build_chunk_store.py --ckpt_dir out/base_v3_know2 \
+#         --store out/mem_store/store_base_v3_know2_gen10m.pt \
+#         --mode mean --layer -6 --chunk 64 --limit_m 10
+# ★ 只开读；写侧 `write_online` 是规则式的（人给的惊讶分位），不是模型决定（TECH_DEBT §2 P1）。
+ndb_store: out/mem_store/store_base_v3_know2_gen10m.pt
+ndb_layer: -6
+ndb_chunk: 64
+ndb_top_k: 8
+ndb_exclude_radius: 512
+ndb_dropout: 0.1
+ndb_retr_noise: 0.0
+ndb_att_sim: 2.0
+ndb_lr: 0.0003
+ndb_eval_iters: 64

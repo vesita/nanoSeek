@@ -282,6 +282,15 @@ def test_no_test_imports_train_py():
 # ==========================================================================
 V3_STAGE_CONFIGS = sorted(glob.glob(str(ROOT / 'configs' / 'base_v3_*.yaml')))
 
+# 「NDB 默认启用」断言里显式豁免的历史配方（必须写理由，见那个测试）。
+NDB_EXEMPT_STAGES = {
+    'base_v3_dlg.yaml': '已跑完的 B 段（2026-09-14）。那次跑的时候没接 NDB，'
+                        '它的 `ndb_store: ""` 是 PROJECT_STATE §0.5.14 与 '
+                        'analysis/B_stage_review.md 记录在案的事实 —— 补上就是篡改记录。',
+    'base_v3_know.yaml': '保留备用的 A 段配方（2026-09-13 定，从未跑过）。'
+                         '保持原样以便与当初的设计对齐；将来真要跑，先补 ndb_* 再跑。',
+}
+
 # 每段的步数在这里再写一遍，逼着"改配置就必须同时改这里"（和 §5 配方表同一个套路）。
 # 依据 PROJECT_STATE §0.5.10：
 #   - A 段 `base_v3_know.yaml`（3k，v3_know 知识/CoT）**已被用户 2026-09-13 拍板跳过**
@@ -293,17 +302,57 @@ V3_STAGE_CONFIGS = sorted(glob.glob(str(ROOT / 'configs' / 'base_v3_*.yaml')))
 #     2026-09-14 新增。★ 它有三处**有意的例外**，都写在下面对应断言旁边：
 #     ① 必须开 `use_loss_masking`（+ `mask_mode: resp_span`）；
 #     ② `data_prefix == 'v3_persona'`；
-#     ③ 现在的 300 步是**冒烟**（语料只有 86k token），不是正式配方。
+#     ③ 步数在 2026-09-15 由**冒烟 300 步**改成正式配方 **900 步**（语料已补到 809,598
+#        token ⇒ 98.8 步/epoch，900 步 = 9.1 epoch）。
+#   - ★ 2026-09-15 新增两段，计划是 `persona(1) → 通识 → persona(2)`：
+#     `base_v3_know2.yaml`（18,000 步 = v3_know 的 **0.302 epoch**，接 persona1）
+#     与 `base_v3_persona2.yaml`（900 步，接 know2，**最后一段 ⇒ 最终人设由它决定**）。
+#     ⚠ `base_v3_know.yaml`（A 段，3k，接 base_v2）**仍然保留**、仍然登记——
+#       它是"补知识段"的备用配方，与新加的 `base_v3_know2.yaml`（接 persona1）不是一回事。
 V3_STAGE_STEPS = {
     'base_v3_know.yaml': 3000,
     'base_v3_dlg.yaml': 14000,
-    'base_v3_persona.yaml': 300,
+    'base_v3_persona.yaml': 900,
+    'base_v3_know2.yaml': 18000,
+    'base_v3_persona2.yaml': 900,
 }
 
 
 def test_v3_stage_configs_exist():
     """三阶段配方文件必须存在（否则下面那些参数化测试会静默变成 0 项、恒真通过）。"""
     assert V3_STAGE_CONFIGS, "找不到 configs/base_v3_*.yaml —— 三阶段配方没落地"
+
+
+def test_v3_stage_configs_enable_ndb():
+    """★ **NDB 是训练的默认组件**（2026-09-15 用户定）⇒ 每个**新** v3 阶段都必须显式启用它。
+
+    这条把"要记得加 `ndb_*`"变成断言。动机是本项目反复踩的同一类坑：
+    一个**看起来配好了、实际没生效**的开关（`keep_step_ckpts`、`gradient_checkpointing`、
+    `use_neural_db` 都是），跑完几十小时才发现 NDB 根本没开。
+
+    判据用 `ndb_store` 非空 —— 它是 `train.py` 里唯一的启用判据
+    （`:761` 起 `if ndb_store:` 才装载模块并注册 forward hook）。
+
+    ⚠ 只查**阶段**（`base_v3_*`）；`pilot_*` 是一次性臂，不强制。
+    ★ 两份**历史配方**显式豁免 —— 给它们补 `ndb_store` 会让它们谎报自己是什么实验
+      （`base_v3_dlg.yaml` 已经跑完，那次跑的时候没有 NDB；它的 `ndb_store: ""`
+      是 `PROJECT_STATE §0.5.14` 与 `analysis/B_stage_review.md` 记录在案的事实）。
+    """
+    for name, reason in NDB_EXEMPT_STAGES.items():
+        assert reason.strip(), f"{name}: 豁免必须写理由（否则就是个静默的漏网口子）"
+    missing = []
+    for cfg_path in V3_STAGE_CONFIGS:
+        name = os.path.basename(cfg_path)
+        if name in NDB_EXEMPT_STAGES:
+            continue
+        store = load_yaml(cfg_path).get('ndb_store', '')
+        if not str(store).strip():
+            missing.append(name)
+    assert not missing, (
+        f"这些 v3 阶段配置没有启用 NDB（`ndb_store` 为空）：{missing}\n"
+        f"★ NDB 现在是训练的默认组件 —— 新增阶段必须带上 ndb_store / ndb_layer / ndb_chunk，\n"
+        f"  且 `ndb_layer`+`ndb_chunk` 必须与建库时一致（键是 chunk 均值，空间对不上就检索不到）。\n"
+        f"  确实是历史配方、不该改的，加进 NDB_EXEMPT_STAGES 并写明理由。")
 
 
 def test_all_config_out_dirs_are_pairwise_distinct():

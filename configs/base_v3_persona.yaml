@@ -58,20 +58,39 @@ schedule: wsd
 stage: full
 learning_rate: 0.0002
 min_lr: 0.00002
-warmup_iters: 30         # 300 步的 10%（B 段 200/14000 也是这个比例）
+warmup_iters: 90         # 900 步的 10%（B 段 200/14000 也是这个比例）
 stable_frac: 0.8
 
 # --- 6) 步数 ----------------------------------------------------------------
-# ★★ 现在这 300 步是**冒烟**，不是正式配方：语料只有 86k token（792 条 / 28% 句唯一率），
-#    8192 token/步 ⇒ 10.5 步 1 epoch ⇒ 300 步 ≈ **28 epoch**，必然只能背下来。
-#    它要证明的是**链路**（单流语料 → resp_span loss → 权重更新 → 采样 → parse_log 回读），
-#    不是效果。persona 的 monologue / dialogue 层还没写，写完再定正式步数。
+# 语料 809,598 train token ÷ 8192 token/步 = **98.8 步/epoch**（2026-09-15 补完语料后）。
+#   900 步 = **9.1 epoch** —— 目标是"把人设语气压进权重"，不是背下模板。
+#   ⚠ 这段语料是模板生成的（~7,312 个不同句子 / 43k 个句子实例）⇒ 它是**声线绑定**，
+#     不是表达多样性的来源。别靠加 epoch 解决多样性（那只会背得更死）。
 # ★ 改步数必须同时改两处（有测试钉着，铁律见 AGENTS §8）：
-#    `tests/test_project_layout.py::V3_STAGE_STEPS` + `PROJECT_STATE §0.5.14` 的方案表。
-max_iters: 300
-lr_decay_iters: 300
+#   `tests/test_project_layout.py::V3_STAGE_STEPS` + `PROJECT_STATE §0.5.14` 的方案表。
+max_iters: 900
+lr_decay_iters: 900
 
-# --- 7) 评估节律（本段段短，必须加密，否则 best.pt 永不落盘）----------------
-# base_v2 的 eval_interval=1000 > max_iters=300 ⇒ 只会在结束前算一次，
-# `always_save_checkpoint: false` 下 best.pt 永远不会写。降到 50 ⇒ 6 个评估点。
-eval_interval: 50
+# --- 7) 评估节律 ------------------------------------------------------------
+# 900 步 / 100 = 9 个评估点（`always_save_checkpoint: false` 下要够密才能选出 best.pt）。
+eval_interval: 100
+
+# --- 8) NDB（外挂：forward hook + `ndb_store`；模块见 AGENTS §1 的门面表）-----
+# ★ 本段**只开读**：库由 `local/build_chunk_store.py` 离线建成（`--mode mean`），
+#   训练只学「怎么用记忆」。写侧 `MemoryCrossAttention.write_online` 是**规则式**的
+#   （人给的惊讶分位），不是"模型自己决定写"，所以本轮不开（见 TECH_DEBT §2 P1）。
+# ★ `ndb_att_sim` 是本项目最该被验证的一个旋钮：免训练探针（step 19000）实测 λ=2
+#   能用 11% 的干净增益换到「检索出错时记忆仍然有益」
+#   （25% 错误：λ=2 是 +0.24，λ=0 是 −0.36）。
+#   两条 400 步短臂的头对头见 `configs/pilot_persona_lam{0,2}.yaml`。
+# ★ 必须与建库时的 `--chunk` / `--layer` 一致，否则检索空间对不上（键 = chunk 均值）。
+ndb_store: out/mem_store/store_base_v3_dlg_gen10m.pt
+ndb_layer: -6
+ndb_chunk: 64
+ndb_top_k: 8             # 探针实测读取深度在 k≈8 饱和（P1），再大反而变差
+ndb_exclude_radius: 512  # 屏蔽与查询过近的条目，防自匹配（答案泄漏）
+ndb_dropout: 0.1         # 逼基座「有无记忆都能跑」
+ndb_retr_noise: 0.0      # 训练期检索噪声：0 = 关（监控口径干净）
+ndb_att_sim: 2.0         # ★ 把检索相似度的跨槽 z 分数加进注意力 logit（探针验证过的鲁棒性修法）
+ndb_lr: 0.0003
+ndb_eval_iters: 64

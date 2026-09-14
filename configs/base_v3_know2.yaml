@@ -1,0 +1,72 @@
+# ============================================================================
+# v3 分段训练 · 通识段（v3_know，接在人格第 1 轮之后）—— **v3_know2**
+# ============================================================================
+# 继承 base_v2.yaml，只覆盖本段配方。用法：
+#     .venv/bin/python training/train.py configs/base_v3_know2.yaml
+#
+# ★ 本段在计划里的位置：`persona(1) → 通识 → persona(2)`。
+#   `PROJECT_STATE §0.5.10` 写死了一条性质：每段都是**独立 WSD 循环、各自退火到 min_lr**
+#   ⇒ **哪一段放最后，哪一段就是"最终人设"**。所以最后还有一段 persona2 把人设收回来。
+#   通识段的代价是**冲淡人设**（v2 val CE 会变差，见 §5.12 的两把尺子）——这是有意的。
+#
+# ★ 为什么不是 `configs/base_v3_know.yaml`：那一份的 `init_from` 接的是 `out/base_v2/last.pt`
+#   （A 段排在最前的位置），本段要接**人格第 1 轮的产物**，且步数与数据口径都不同。
+extends: base_v2.yaml
+
+# --- 1) 产物隔离（铁律 12：warm start 会触发 _backup_old_run）--------------
+out_dir: out/base_v3_know2
+
+# --- 2) 权重来源：人格第 1 轮终态 -------------------------------------------
+init_from: out/base_v3_persona/last.pt
+
+# --- 3) 语料 + 打包 ---------------------------------------------------------
+# `v3_know` = 497M token 的 QA + 修好终止符位置后的 CoT（`build_stages.py --only v3_know`）。
+data_prefix: v3_know
+use_doc_packing: true
+pack_align: false        # ★★ pack_align=True 有 67~73% 的 token 覆盖漏洞（§5.10）
+
+# --- 4) loss masking：本段必须**关**（与人格层相反，理由不是"改主意了"）----
+# `v3_know` 的语料是普通文本/CoT，没有 `<resp>` 单流结构；开着 masking 只会白读。
+# ★ 人格层是**唯一**开 masking 的阶段，判据绑在 `mask_mode == 'resp_span'` 上。
+use_loss_masking: false
+
+# --- 5) 学习率配方（开一段新的 WSD 循环，不是续训）--------------------------
+schedule: wsd
+stage: full
+learning_rate: 0.0002
+min_lr: 0.00002
+warmup_iters: 200        # 与 `base_v3_dlg.yaml` 同取法（步数长，200 足够）
+stable_frac: 0.8
+
+# --- 6) 步数：0.302 epoch ----------------------------------------------------
+# v3_know train = **487,755,407** token ÷ 8192 = **59,540 步/epoch**。
+#   18,000 步 = **0.302 epoch** —— 文档里 §0.5.10 论证过：3k 步（0.05 epoch）是
+#   "最站不住的档位"（花 4h 什么都换不来），而真跑 1 epoch = 59,540 步 ≈ 56h 跑不起。
+#   0.302 epoch ≈ **146M token 实例**，量级与 B 段（14k 步 × 8192 = 115M）相当 ⇒ 是真训练。
+#   ⚠ 代价：≈ 22~25h（NDB 开着，老 run 实测 5.0 s/步）。**这是"吃进新 QA + 一次 LR 重启"，
+#     不是"把知识背完"** —— 别拿它当"通识能力已就绪"的证据。
+# ★ 改步数必须同时改两处（有测试钉着）：`tests/test_project_layout.py::V3_STAGE_STEPS`
+#   + `PROJECT_STATE §0.5.10 / §0.5.14` 的方案表。
+max_iters: 18000
+lr_decay_iters: 18000
+
+# --- 7) 评估节律 ------------------------------------------------------------
+# 18000 / 2000 = 9 个评估点（否则 best.pt 只在结束前算一次，永远不落盘）。
+eval_interval: 2000
+
+# --- 8) NDB（外挂；模块见 AGENTS §1 的门面表）--------------------------------
+# ★ 库必须**按本段起点的基座重建**（键是 chunk 均值，基座漂移了检索空间就对不上）：
+#     local/build_chunk_store.py --ckpt_dir out/base_v3_persona \
+#         --store out/mem_store/store_base_v3_persona_gen10m.pt \
+#         --mode mean --layer -6 --chunk 64 --limit_m 10
+# ★ 本段只开读；写侧是规则式的，不是模型决定（TECH_DEBT §2 P1）。
+ndb_store: out/mem_store/store_base_v3_persona_gen10m.pt
+ndb_layer: -6
+ndb_chunk: 64
+ndb_top_k: 8
+ndb_exclude_radius: 512
+ndb_dropout: 0.1
+ndb_retr_noise: 0.0
+ndb_att_sim: 2.0         # 与 persona1 同配置：λ 的取舍由两条短臂的头对头决定
+ndb_lr: 0.0003
+ndb_eval_iters: 64
