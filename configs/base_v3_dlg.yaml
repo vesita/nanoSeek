@@ -5,13 +5,13 @@
 #     .venv/bin/python training/train.py configs/base_v3_dlg.yaml
 #
 # ★★ 2026-09-13 用户拍板：**跳过 A 段（v3_know）**，本段直接从基座权重启动。
-#   理由（见 PROJECT_STATE §0.5.10）：A 段唯一能实测的理由"冲刷 <eos> 先验"
+#   理由（见 dev-notes/83 §0.5.10）：A 段唯一能实测的理由"冲刷 <eos> 先验"
 #   已被 scripts/eos_prior_probe.py 推翻（P(<eos>) 只比随机位置高 1.9×），
 #   而 3k 步 = 0.05 epoch 本来就短到做不成任何可测的事。
 #   `configs/base_v3_know.yaml` **保留**（配方不删，将来补知识段可再跑），
 #   但它**不再是**本段的前置条件。
 #
-# 依据：PROJECT_STATE.md §0.5.10「训练方案」。
+# 依据：dev-notes/83 §0.5.10「训练方案」。
 #
 extends: base_v2.yaml
 
@@ -34,7 +34,7 @@ init_from: out/base_v2/last.pt
 data_prefix: v3_dlg
 
 use_doc_packing: true
-pack_align: false        # ★★ 见 base_v3_know.yaml 的长注释 / PROJECT_STATE §0.5.12
+pack_align: false        # ★★ 见 base_v3_know.yaml 的长注释 / dev-notes/83 §0.5.12
 use_loss_masking: false  # ★ 三阶段都必须关
 
 # --- 4) 学习率配方（开一段新的 WSD 循环，不是续训）--------------------------

@@ -40,7 +40,7 @@ stable_frac: 0.8
 
 # --- 6) 步数（与第一轮对齐：900 步 = 9.1 epoch）-----------------------------
 # ★ 改步数必须同时改两处：`tests/test_project_layout.py::V3_STAGE_STEPS`
-#   + `PROJECT_STATE §0.5.10 / §0.5.14` 的方案表。
+#   + `dev-notes/83 §0.5.10 / §0.5.14` 的方案表。
 max_iters: 900
 lr_decay_iters: 900
 

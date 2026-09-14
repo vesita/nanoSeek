@@ -104,7 +104,7 @@ use_hca: false
 use_kv_memory: false
 use_lightning_indexer: false
 # ★ 2026-09-11 由 true 改为 **false**：全量语料预训练（用户已确认的路线）。
-#   依据（PROJECT_STATE §0.5 / §6）：masking 是**行级**判据（一行里有 <eos>/<cont> 才整行
+#   依据（dev-notes/83 §0.5 / §6）：masking 是**行级**判据（一行里有 <eos>/<cont> 才整行
 #   算 loss），而全库终止符密度只有 0.1427% ⇒ 只有 6.14% 的语料能产生梯度：
 #     * c4_zh 名义 20.25%（1.89 亿字符）终止符 **0 个** → 恒不可见
 #     * 全库有效语料仅 57.6M token；multi_turn_dialogue 独占 40.2% 的终止符

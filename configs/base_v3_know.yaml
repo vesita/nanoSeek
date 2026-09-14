@@ -5,7 +5,7 @@
 # 用法：
 #     .venv/bin/python training/train.py configs/base_v3_know.yaml
 #
-# 依据：PROJECT_STATE.md §0.5.10「训练方案」。
+# 依据：dev-notes/83 §0.5.10「训练方案」。
 #
 extends: base_v2.yaml
 
@@ -36,7 +36,7 @@ use_doc_packing: true
 #    v3_lang 67.05%（对抗审计实测，主 AI 独立复算逐位一致）。
 #    `pack_align=False` = 全域随机窗口 + 同一张块对角掩码，覆盖 ≈100%。
 #    这与当年 `use_loss_masking` 是**同一类失败**：语料在无声地不产生梯度。
-#    详见 PROJECT_STATE §0.5.12 与 AGENTS §5.10。
+#    详见 dev-notes/83 §0.5.12 与 AGENTS §5.10。
 pack_align: false
 
 # ★ 三阶段都必须关：v3_lang 一个终止符都没有，开了直接零梯度；

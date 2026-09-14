@@ -13,7 +13,7 @@
 ## 保护名单（无论如何都不碰）
 
 * `out/base_v2`      —— 当前主 run，训练正在写它
-* `out/nanoseek_100m` —— v1 基座，`PROJECT_STATE §0.5.6` 的 v1/v2 配对比较要用它的 `last.pt`
+* `out/nanoseek_100m` —— v1 基座，`dev-notes/83 §0.5.6` 的 v1/v2 配对比较要用它的 `last.pt`
 
 ## 用法
 

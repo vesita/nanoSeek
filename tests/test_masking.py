@@ -225,7 +225,7 @@ def test_permuting_batch_permutes_mask():
 # --------------------------------------------------------------------------
 @pytest.mark.slow
 def test_documented_terminator_ids_match_real_tokenizer():
-    """PROJECT_STATE / masking.py 都写 `<eos>=128, <cont>=130`。
+    """dev-notes/83 / masking.py 都写 `<eos>=128, <cont>=130`。
 
     旧文档曾写 117/119（已作废）。这条测试直接把文档绑到真词表上。
     """

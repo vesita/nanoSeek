@@ -48,7 +48,7 @@ uv run ruff check             # lint 门禁（同样是 pytest 里的一条测�
    `data_prefix: v2` 写错时训练会在启动时报错；但 `meta` 文件缺失只会让 vocab
    静默回退 —— 这条把它也拦住。
 
-另外它还会拿 `PROJECT_STATE.md §5` 的那张表逐项对照 `configs/base_v2.yaml`，
+另外它还会拿 `dev-notes/83 §5` 的那张表逐项对照 `configs/base_v2.yaml`，
 防止"文档说 A、配置是 B"。
 
 ## 写测试时踩过的坑（都留在注释里了）

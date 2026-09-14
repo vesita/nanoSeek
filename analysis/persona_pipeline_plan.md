@@ -16,7 +16,7 @@
 | 5 | `tests/test_project_layout.py` | 292-295 (`V3_STAGE_STEPS`) | 若配置文件匹配 `configs/base_v3_*.yaml`，必须登记 `'base_v3_persona.yaml': <步数>` | `test_v3_stage_config_safety` 在第 364 行断言失败：`base_v3_persona.yaml: 新增的 v3 阶段配置必须同时登记进 V3_STAGE_STEPS` | 源码确认 |
 | 6 | `tests/test_project_layout.py` | 362-363 (`data_prefix.startswith('v3_')`) | 若继续归在 v3 命名下但 `data_prefix` 叫 `v4_persona`，断言 `cfg['data_prefix'].startswith('v3_')` 失败 | `test_v3_stage_config_safety` 报 `data_prefix='v4_persona' 不是 v3 阶段数据` 挂掉 | 源码确认 |
 | 7 | `scripts/watch.sh` | 20-21 (`OUT_DIR`, `LOG`) | 换到新 run 时，必须将第 20-21 行改为：<br>`OUT_DIR="${1:-out/base_v4_persona}"`<br>`LOG="${2:-out/base_v4_persona_train.log}"` | 铁律 4/12 事故：`watch.sh` 会继续看旧 run 日志；`prune_ckpts.sh`（第 53 行）只清理默认的 `OUT_DIR`，新目录的 ckpt 不会被修剪，**单卡磁盘会被打爆** | 源码确认 |
-| 8 | `PROJECT_STATE.md` 与 `AGENTS.md` | 多处速查与方案表 | 更新配方说明、当前 run 状态、timer 监控对象 | 出现“以为在监控”或后续接手者误查旧单元 | 源码确认 |
+| 8 | `dev-notes/83-dev-notes/83最终快照.md` 与 `AGENTS.md` | 多处速查与方案表 | 更新配方说明、当前 run 状态、timer 监控对象 | 出现“以为在监控”或后续接手者误查旧单元 | 源码确认 |
 
 ---
 
@@ -288,14 +288,14 @@
      ```python
      364:     assert name in V3_STAGE_STEPS, (
      365:         f"{name}: 新增的 v3 阶段配置必须同时登记进 V3_STAGE_STEPS"
-     366:         f"（并更新 PROJECT_STATE §0.5.10 的方案表）")
+     366:         f"（并更新 dev-notes/83 §0.5.10 的方案表）")
      ```
      **断言失败**：如果未在 `tests/test_project_layout.py` 的 `V3_STAGE_STEPS` 字典中登记该 yaml 名字，测试**必定红**。
    - **行号 367-369 断言**：
      ```python
      367:     assert cfg['max_iters'] == V3_STAGE_STEPS[name], (
      368:         f"{name}: max_iters={cfg['max_iters']} 与登记的 {V3_STAGE_STEPS[name]} 不符 —— "
-     369:         f"改步数必须同时改这里和 PROJECT_STATE §0.5.10 的方案表")
+     369:         f"改步数必须同时改这里和 dev-notes/83 §0.5.10 的方案表")
      ```
      **断言失败**：若 yaml 里的步数与登记步数不一致，测试**红**。
    - **行号 362-363 断言**：

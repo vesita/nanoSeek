@@ -324,7 +324,7 @@ def test_continue_question_constant_is_gone(prep):
     v3 语料 1,466,294 条回复里，按"整条回复以 吧/呢 结尾"只翻转 0.65%，抽检 40 条
     绝大多数是语气助词（我还没拿呢）与祈使/建议（我们明天做个计划吧），不是递回；
     按"正文出现过 吧/呢"会翻转 3.02%，第一条抽检就是**《摔跤吧！爸爸》**（电影名）。
-    证据与抽检原文见 `prepare.py` 该常量原处的注释 / `PROJECT_STATE §0.5.11`。
+    证据与抽检原文见 `prepare.py` 该常量原处的注释 / `dev-notes/83 §0.5.11`。
     """
     assert not hasattr(prep, 'CONTINUE_QUESTION'), \
         'CONTINUE_QUESTION 已因证据不足被删除；要恢复请先拿出递回判定的新证据'

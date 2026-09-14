@@ -52,7 +52,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 DATA = os.path.join(ROOT, 'data', 'chinese')
 PREPARE = os.path.join(DATA, 'prepare.py')
 
-# 阶段 → 源文件名（支持 fnmatch 通配）。划分依据见 PROJECT_STATE §0.5.9。
+# 阶段 → 源文件名（支持 fnmatch 通配）。划分依据见 dev-notes/83 §0.5.9。
 #   lang  识字：通用书面语（网页/百科/文学）—— 学字、词、句法
 #   know  知识：问答 / 指令 / 任务 / 推理链 —— 学事实与推理
 #   dlg   对话：有来有回的多轮对话 —— 学轮次结构与对话逻辑
@@ -63,7 +63,7 @@ PREPARE = os.path.join(DATA, 'prepare.py')
 #          `mask_mode: resp_span`（见 `configs/base_v3_persona.yaml`），否则
 #          `build_assistant_mask` 的"整行含终止符"规则会把 `<resp>` 自己也算进 loss。
 #  源文件 `persona_identity.txt` 本体**不在仓库里**（放在 ~/datasets/ 下，软链进
-#  new_sources/；见 PROJECT_STATE §0.5.14）。文件名刻意保持中性。
+#  new_sources/；见 dev-notes/83 §0.5.14）。文件名刻意保持中性。
 STAGES = {
     'v3_lang': [
         'c4_zh.txt', 'wikipedia_cn.txt',

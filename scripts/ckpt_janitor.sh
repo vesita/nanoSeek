@@ -21,7 +21,7 @@
 #         --property=WorkingDirectory=/home/vesita/coding/my/nanoSeek \
 #         /bin/bash -c '<命令> > out/<日志>.log 2>&1'
 #
-# 保留本文件只为历史追溯（退役记录见 PROJECT_STATE.md §0.1）。
+# 保留本文件只为历史追溯（退役记录见 dev-notes/83 §0.1）。
 
 set -uo pipefail
 cat >&2 <<'EOF'
@@ -35,6 +35,6 @@ cat >&2 <<'EOF'
     bash scripts/watch.sh                              # 巡检（含幂等清理）
     .venv/bin/python -m training.checkpoints out/base_v2   # 手工清理一次
 
-  详见 PROJECT_STATE.md §0.1「守夜人已退役」与 AGENTS.md 铁律 0 / 11。
+  详见 dev-notes/83 §0.1「守夜人已退役」与 AGENTS.md 铁律 0 / 11。
 EOF
 exit 64

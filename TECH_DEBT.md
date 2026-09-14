@@ -14,7 +14,7 @@
 ```bash
 .venv/bin/python -m pytest -q -m 'not slow'   # 全绿；跳过 slow 时 < 1 秒跑完
 ```
-⚠️ 用 `.venv/bin/python`，**不要** `uv run`（会另解析一套环境，见 `PROJECT_STATE §11.1`）。
+⚠️ 用 `.venv/bin/python`，**不要** `uv run`（会另解析一套环境，见 `dev-notes/83 §11.1`）。
 ⚠️ 条数不写死（会过期）。
 
 覆盖面与**每条为什么值得测**见 `tests/README.md`。重点不是数量，而是：
@@ -183,7 +183,7 @@ dsh-subprocess-14240-<hash>.scope: Killed unit cgroup '...' with SIGKILL on clie
 **修法**：改用 `systemd-run --user --unit=<name> --collect ...`，
 它建**独立的用户单元**（`/user.slice/.../app.slice/<name>.service`），不在 dsh 的 scope 里。
 已实测：重启训练 + 看守后，两者 cgroup 与当前 dsh scope 完全不同。
-命令固化在 `PROJECT_STATE §0.4`，纪律固化在 `AGENTS.md` 铁律 0 / `PROJECT_STATE §8` 铁律 0。
+命令固化在 `dev-notes/83 §0.4`，纪律固化在 `AGENTS.md` 铁律 0 / `dev-notes/83 §8` 铁律 0。
 
 **通用教训**：**"后台"不等于"持久"**。判断一个后台任务能否活过宿主的生命周期，
 要看它落在哪个 **cgroup/unit**，而不是看有没有 `nohup`/`setsid`。
@@ -203,10 +203,10 @@ dsh-subprocess-14240-<hash>.scope: Killed unit cgroup '...' with SIGKILL on clie
 
 **问题**：§0.4 已改成 `systemd-run --user`（铁律 0），但**另外两处没跟着改**：
 
-1. `PROJECT_STATE §5` 的**两阶段命令块**（阶段一启动、65000 暂停看守、阶段二退火）
+1. `dev-notes/83 §5` 的**两阶段命令块**（阶段一启动、65000 暂停看守、阶段二退火）
    仍写着 `setsid nohup ... & disown`。这是**最危险的一处** ——
    阶段二的对话退火命令会被照着抄，而按铁律 0，那样起的训练**会话一重启就被 SIGKILL**。
-2. `PROJECT_STATE §0.1` 把 `scripts/ckpt_janitor.sh` 称作「★ 守夜人」并推荐启动，
+2. `dev-notes/83 §0.1` 把 `scripts/ckpt_janitor.sh` 称作「★ 守夜人」并推荐启动，
    而它的启动说明同样是 `setsid nohup`；更根本的是**它的职责已被铁律 11 取消**
    （保留策略搬进了训练内部，每次归档落盘就地稀疏化），
    留着一个"会被误当成第二道防线"的进程本身就是负资产。
@@ -365,7 +365,7 @@ loss/val 曲线完全正常（1/14000 步的差异测不出来）⇒ 单测与�
 **位置**：`model/memory_cross_attn.py`（`write_online` 已有，未接线）、
 `training/train.py`（`ndb_att_sim` / `ndb_retr_noise` 键已在、`:763-768` 已消费）。
 **代价**：
-1. **「写」是用户的硬要求**（`PROJECT_STATE §1` 第 3 条、§6.5），但至今 `train.py` 里
+1. **「写」是用户的硬要求**（`dev-notes/83 §1` 第 3 条、§6.5），但至今 `train.py` 里
    NDB **写入调用数是 0**；历史上的库全是离线 `--mode mean` 一次建成的。
 2. **检索鲁棒性悬崖未修**：实测 **10% 检索出错就废掉 65% 收益，25% 出错时记忆净有害**
    （`analysis/NDB_cotrain_STATE_2026-09-10.md` §2.2）。探针（P6）已验证
@@ -443,7 +443,7 @@ v3_dlg val real **2.7415 → 2.1875**（−0.554，8/8 非空源变好）；
 单元是**窗口**不是 token —— 实测窗口级 CE 的 σ≈2.0 nats，`eval_iters=200`（800 窗口）
 的真实 **σ_eval ≈ 0.087**。这条错误结论会直接诱导人做"跑 N 步比单点 val"的判断，
 而 NDB 的 Δ 只有 0.02~0.07 —— **信号会被噪声淹掉 2~4 倍**。
-**动作**：改掉那句话，指向 `PROJECT_STATE.md §0.5.3`。
+**动作**：改掉那句话，指向 `dev-notes/83 §0.5.3`。
 **证据**：`scripts/ckpt_paired_eval.py`（800 窗口分块 sd 实测 0.0865）+ 两条独立推算。
 
 ### P0 — 名义数据配比 ≠ 实际训练分布：40% 的语料对训练完全不可见
@@ -490,7 +490,7 @@ v3_dlg val real **2.7415 → 2.1875**（−0.554，8/8 非空源变好）；
 **位置**：`inference/scripts/sample_py.py::build_model_from_checkpoint` 写死 `best.pt`。
 **代价**：想评 `ckpt_step_21000.pt` 这种中间归档，只能先
 `ln -f <ckpt> out/_eval_x/best.pt` 造目录 —— 而 `best.pt` 本身是
-**噪声选出来的**（`PROJECT_STATE §0.5.4`），所以"评估工具默认评 best.pt"
+**噪声选出来的**（`dev-notes/83 §0.5.4`），所以"评估工具默认评 best.pt"
 这件事本身就在**推荐用噪声点**。
 **动作**：加 `--ckpt <path>` / `--ckpt-name` 参数，默认仍 best.pt 但允许覆盖。
 
@@ -559,7 +559,7 @@ GRPO updater）散落各处，改动模型接口时要一起改。
 **证据**：只有 `dev_scripts/probe_v3.py`、`dev_scripts/diag_arith_reward.py` 引用它，
 而 `dev_scripts/` 本身也是历史脚本。
 
-**建议动作**：确认 RL 方向暂停后整体移到 `archive/rl/`，并在 `PROJECT_STATE.md` 记一句。
+**建议动作**：确认 RL 方向暂停后整体移到 `archive/rl/`，并在 `dev-notes/83-dev-notes/83最终快照.md` 记一句。
 
 ### P1 — `model/attention.py`（757 行）里 4 条互斥实现路径，只有 1 条被测
 
@@ -662,5 +662,5 @@ ruff check --select F841 --output-format concise   # 27 处，逐个看，可能
 | 改名/重构漏改引用 | `test_lint.py`（F821/F811） |
 | 写了"两臂其实一样"的空测试 | `tests/README.md` 的坑表 + 各处的"对照必须能区分"断言 |
 | 测试变成"启动一次训练" | `test_no_test_imports_train_py` |
-| 配置与文档分叉 | `test_base_v2_matches_documented_decisions` 逐项对照 PROJECT_STATE §5 |
+| 配置与文档分叉 | `test_base_v2_matches_documented_decisions` 逐项对照 dev-notes/83 §5 |
 | 文档里的数字变成谎言 | `test_documented_cosine_vs_wsd_table` 直接复现 §5 的表 |

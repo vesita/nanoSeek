@@ -123,7 +123,7 @@ def test_unknown_schedule_fails_loud():
 
 
 # --------------------------------------------------------------------------
-# 3) 钉住 PROJECT_STATE.md §5 那张 cosine vs WSD 对照表
+# 3) 钉住 dev-notes/83 §5 那张 cosine vs WSD 对照表
 #    文档里的数字必须能被代码复现，否则文档会慢慢变成谎言。
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize("it,cosine,wsd", [

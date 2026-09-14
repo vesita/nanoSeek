@@ -3,7 +3,7 @@
 - **复核者**：独立子代理（换输入通道：自写解析/统计代码，从原始文本重新计算）
 - **日期**：2026-09-13
 - **方法声明**：
-  - **没有**读 `PROJECT_STATE.md` / `analysis/*.md` 的结论表；
+  - **没有**读 `dev-notes/83-dev-notes/83最终快照.md` / `analysis/*.md` 的结论表；
   - **没有**复用 `data/chinese/clean_corpus.py` / `verify_clean_corpus.py` 的代码；
   - 所有代码写在 `/tmp/audit/`（`dlg_lib.py` / `a1_singleturn.py` / `a2_continuity.py` /
     `a3_control.py` / `coverage.c` / `a4_dedup.py` / `a4diag.py` / `a5a6_bin.py` /

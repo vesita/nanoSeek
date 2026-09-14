@@ -21,7 +21,7 @@
 #      `mask_mode == 'resp_span'` 上，并要求 `data_prefix == 'v3_persona'`
 #      —— 别的阶段写 resp_span 会被断言拦下（那说明配错了语料）。
 #
-# 依据：PROJECT_STATE.md §0.5.14；语料规格在仓库外（~/datasets/persona/_spec.md）。
+# 依据：dev-notes/83 §0.5.14；语料规格在仓库外（~/datasets/persona/_spec.md）。
 extends: base_v2.yaml
 
 # --- 1) 产物隔离 ------------------------------------------------------------
@@ -47,7 +47,7 @@ init_from: out/base_v3_dlg/last.pt
 data_prefix: v3_persona
 
 use_doc_packing: true
-pack_align: false        # ★★ 见 base_v3_know.yaml 的长注释 / PROJECT_STATE §0.5.12
+pack_align: false        # ★★ 见 base_v3_know.yaml 的长注释 / dev-notes/83 §0.5.12
 
 # --- 4) loss masking：本段**必须开**，且必须是 resp_span ---------------------
 use_loss_masking: true
@@ -67,7 +67,7 @@ stable_frac: 0.8
 #   ⚠ 这段语料是模板生成的（~7,312 个不同句子 / 43k 个句子实例）⇒ 它是**声线绑定**，
 #     不是表达多样性的来源。别靠加 epoch 解决多样性（那只会背得更死）。
 # ★ 改步数必须同时改两处（有测试钉着，铁律见 AGENTS §8）：
-#   `tests/test_project_layout.py::V3_STAGE_STEPS` + `PROJECT_STATE §0.5.14` 的方案表。
+#   `tests/test_project_layout.py::V3_STAGE_STEPS` + `dev-notes/83 §0.5.14` 的方案表。
 max_iters: 900
 lr_decay_iters: 900
 

@@ -126,13 +126,13 @@ def test_every_config_key_is_in_the_logged_snapshot(cfg_path):
 
 
 # ==========================================================================
-# 3) ★ 新基座配置必须与 PROJECT_STATE §5 记录的一致
+# 3) ★ 新基座配置必须与 dev-notes/83 §5 记录的一致
 # ==========================================================================
 def test_base_v2_matches_documented_decisions():
-    """把 PROJECT_STATE §5 那张表变成断言 —— 文档与配置不允许悄悄分叉。
+    """把「基座配方」钉成断言 —— 配置不允许被悄悄改掉（每一项都有实测支撑）。
 
-    这张表是「基座配方」的唯一依据（每一项都有实测支撑，见 §2.3）。
-    配置被改动而文档没改（或反过来）都会让下一个人按错误的前提做决定。
+    改这里的期望值就必须同时改 `configs/base_v2.yaml`，反之亦然：
+    靠人记住"这个值当初是多少 / 为什么"是不可靠的，而配方错了会白烧几十小时 GPU。
     """
     path = ROOT / 'configs' / 'base_v2.yaml'
     if not path.exists():
@@ -145,7 +145,7 @@ def test_base_v2_matches_documented_decisions():
         # 'resume' 是更安全的重启默认 —— 若写 'scratch'，误用 §0.4 那条（不带
         # --init_from 的）重启命令会触发 `_backup_old_run` 把整个 run 静默移进 old/。
         # 本断言的作用正是逼着"文档和配置一起改"，所以以后要改这个值，
-        # **必须同时改 PROJECT_STATE §5 那张表**，不要只改这里。
+        # **必须同时改 dev-notes/83 §5 那张表**，不要只改这里。
         'init_from': 'resume',
         'batch_size': 4,
         'gradient_accumulation_steps': 8,
@@ -157,7 +157,7 @@ def test_base_v2_matches_documented_decisions():
         'lr_decay_iters': 70000,
         # 2026-09-11 由 true 改成 false（全量语料预训练）。这是**有意**的路线切换，
         # 不是笔误：masking=true 时只有 6.14% 的语料能产生梯度（c4_zh 一个终止符都没有）。
-        # 详见 PROJECT_STATE §0.5 与 configs/base_v2.yaml 里那段注释。
+        # 详见 dev-notes/83 §0.5 与 configs/base_v2.yaml 里那段注释。
         'use_loss_masking': False,
         # ★ NDB 是训练的默认组件（2026-09-15 用户定）。采用的方案是 `model/ngram_ndb.py`：
         # 读与写都由模型门控、表在训练中**在线**累积 ⇒ 没有 `ndb_store` 这类离线库文件。
@@ -168,14 +168,14 @@ def test_base_v2_matches_documented_decisions():
         'ndb_lr': 0.001,
     }
     wrong = {k: (cfg.get(k, '<缺失>'), v) for k, v in expected.items() if cfg.get(k, '<缺失>') != v}
-    assert not wrong, f"配置与 PROJECT_STATE §5 不符（键: (实际, 期望)）：{wrong}"
+    assert not wrong, f"基座配方与断言不符（键: (实际, 期望)）：{wrong}"
 
 
 def test_base_v2_decay_covers_full_run():
     """退火必须覆盖整个训练：`lr_decay_iters` == `max_iters`。
 
     旧基线是 30000/70000 —— 退火在 30000 结束、之后 40000 步平在 min_lr，
-    PROJECT_STATE §5 明确列为要修的项。
+    dev-notes/83 §5 明确列为要修的项。
     """
     path = ROOT / 'configs' / 'base_v2.yaml'
     if not path.exists():
@@ -288,7 +288,7 @@ def test_no_test_imports_train_py():
 V3_STAGE_CONFIGS = sorted(glob.glob(str(ROOT / 'configs' / 'base_v3_*.yaml')))
 
 # 每段的步数在这里再写一遍，逼着"改配置就必须同时改这里"（和 §5 配方表同一个套路）。
-# 依据 PROJECT_STATE §0.5.10：
+# 依据 dev-notes/83 §0.5.10：
 #   - A 段 `base_v3_know.yaml`（3k，v3_know 知识/CoT）**已被用户 2026-09-13 拍板跳过**
 #     —— 它唯一能实测的理由"冲刷 <eos> 先验"被 `scripts/eos_prior_probe.py` 推翻。
 #     ★ **配置保留**（配方不删，将来补知识段仍用它），所以步数继续登记在这里；
@@ -362,7 +362,7 @@ def test_all_config_out_dirs_are_pairwise_distinct():
 def test_v3_stage_config_safety(cfg_path):
     """★ v3 分阶段配方的五条硬不变量。
 
-    这条测试的存在理由是一次**真实险情**：方案文档（PROJECT_STATE §0.5.10）里那串参数
+    这条测试的存在理由是一次**真实险情**：方案文档（dev-notes/83 §0.5.10）里那串参数
     只列了 `--init_from=out/base_v2/last.pt --data-prefix v3_know …`，**没写 `--out_dir`**。
     而 `train.py:1022` 在 `init_from != 'resume'` 时会对 out_dir 调 `_backup_old_run()` ——
     warm start 用的正是 `<路径>.pt` 这种形式，**不是** 'resume'。
@@ -392,7 +392,7 @@ def test_v3_stage_config_safety(cfg_path):
     assert cfg['use_doc_packing'] is True, f"{name}: 必须 use_doc_packing=True"
     assert cfg['pack_align'] is False, (
         f"{name}: pack_align 必须 False —— True 时 v3_know 有 72.91% 的 train token "
-        f"永远进不了任何窗口（PROJECT_STATE §0.5.12）")
+        f"永远进不了任何窗口（dev-notes/83 §0.5.12）")
 
     # (4) loss masking：默认**必须关**（v3_lang 一个终止符都没有；v3_dlg 全 token 等权）。
     #     ★★ 例外（2026-09-14，人格层）：单流 `<resp>` 语料的**全部**监督信号都在
@@ -419,7 +419,7 @@ def test_v3_stage_config_safety(cfg_path):
         f"{name}: data_prefix={cfg['data_prefix']!r} 不是 v3 阶段数据")
     assert name in V3_STAGE_STEPS, (
         f"{name}: 新增的 v3 阶段配置必须同时登记进 V3_STAGE_STEPS"
-        f"（并更新 PROJECT_STATE §0.5.10 的方案表）")
+        f"（并更新 dev-notes/83 §0.5.10 的方案表）")
     assert cfg['max_iters'] == V3_STAGE_STEPS[name], (
         f"{name}: max_iters={cfg['max_iters']} 与登记的 {V3_STAGE_STEPS[name]} 不符 —— "
-        f"改步数必须同时改这里和 PROJECT_STATE §0.5.10 的方案表")
+        f"改步数必须同时改这里和 dev-notes/83 §0.5.10 的方案表")

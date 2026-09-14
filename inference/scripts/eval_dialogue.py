@@ -35,7 +35,7 @@ from inference.scripts.sample_py import build_model_from_checkpoint, generate_id
 #   * v2 语料（dev-notes/61 去标签后）用 `A：` / `B：` —— 已实测确认
 #   * v1 及更早的基座用 `用户：` / `模型：`
 #   ⇒ 用 `--style` 显式声明，**别混着眼**。
-#   ⚠ 真要比较 v1 / v2，**不要**用本脚本的 d1/d2（见 `PROJECT_STATE §0.5.5`），
+#   ⚠ 真要比较 v1 / v2，**不要**用本脚本的 d1/d2（见 `dev-notes/83 §0.5.5`），
 #     要用**配对 CE**（`scripts/ckpt_paired_eval.py`）—— CE 只吃 token，不受标签格式影响。
 PROMPT_STYLES = {
     # v2 主线（当前）

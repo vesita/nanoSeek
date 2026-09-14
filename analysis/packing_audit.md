@@ -5,7 +5,7 @@
 * 审计人：子代理（对抗审计）；主 AI 独立复核
 * 约束遵守：**没有 import `training.train`**、**只跑了一次允许的冒烟**、**没有修改仓库任何已有文件**、没有 git commit。
 * 报告落盘时仓库改动：`git status --porcelain` 里 19 个 `M` 文件全部是本次审计**之前**就存在的
-  （`AGENTS.md` / `PROJECT_STATE.md` / `TECH_DEBT.md` / `configs/base_v2.yaml` / `training/train.py` 等，
+  （`AGENTS.md` / `dev-notes/83-dev-notes/83最终快照.md` / `TECH_DEBT.md` / `configs/base_v2.yaml` / `training/train.py` 等，
   属于其他会话的在途改动）；本次审计**没有新增/删除任何仓库文件**（`out/_packing_audit` 已按要求删除），
   唯一新增文件就是本报告。
 
@@ -785,7 +785,7 @@ model/gpt.py:326:                logits.view(-1, logits.size(-1)), mtp_targets.r
 | `tests/test_packing.py` | 新增 6 条测试（默认值钉死 / 已知答案小例 / 真实 `.off` 双口径 / 反向对照 / T+1 契约 / 枚举一致性） | R3 |
 | `analysis/doc_packing.md` | 新增 §7「2026-09-13 修正」，作废"块对齐可作默认"的结论 | R4 |
 
-**没有动**：`model/`、`configs/`、`data/`、`inference/`、`PROJECT_STATE.md`、`AGENTS.md`；
+**没有动**：`model/`、`configs/`、`data/`、`inference/`、`dev-notes/83-dev-notes/83最终快照.md`、`AGENTS.md`；
 没有 git commit；没有删改任何数据文件。
 
 ### ★ 修复过程中被冒烟抓到的一次真实集成 bug（诚实记录）

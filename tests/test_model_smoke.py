@@ -121,7 +121,7 @@ def test_get_num_params_counts_unique_tensors(tiny_model):
 def test_state_dict_sum_inflates_due_to_weight_tying(tiny_model):
     """★ 文档记的坑：`sum(state_dict().values().numel())` 会**重复计数**共享张量。
 
-    PROJECT_STATE §2.1：真实 81.58M，但 `state_dict()` 求和 = 90.19M（+10.6%），
+    dev-notes/83 §2.1：真实 81.58M，但 `state_dict()` 求和 = 90.19M（+10.6%），
     因为 `wte` / `lm_head` / `mtp_head` 是同一个张量被列了 3 遍，
     再叠加 `state_dict()` 还会带上 buffer（参数以外的张量）。
     统计参数量时必须用 `get_num_params()`。
@@ -151,7 +151,7 @@ def test_state_dict_sum_inflates_due_to_weight_tying(tiny_model):
 
 @pytest.mark.slow
 def test_real_config_param_counts_match_documentation():
-    """钉住 PROJECT_STATE 的两个关键数字：**81.58M（开 MTP）/ 75.15M（关 MTP）**。
+    """钉住 dev-notes/83 的两个关键数字：**81.58M（开 MTP）/ 75.15M（关 MTP）**。
 
     参数量被算错过一次（state_dict 求和 → 90.19M），这两个数字是后续所有
     "模型多大 / 每参数多少 token"讨论的基准，值得用测试守住。
@@ -181,7 +181,7 @@ def test_real_config_mtp_and_swiglu_setting():
     with open(REAL_CFG, encoding='utf-8') as f:
         raw = yaml.safe_load(f)
     assert raw['use_aux_free_balance'] is True
-    # 旧基线开了 MTP/mHC，新基座关掉（依据见 PROJECT_STATE §5）
+    # 旧基线开了 MTP/mHC，新基座关掉（依据见 dev-notes/83 §5）
     assert 'use_mtp' in raw and 'use_mhc' in raw
 
 

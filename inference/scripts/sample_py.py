@@ -85,7 +85,7 @@ def load_tokenizer(ckpt):
 
 
 # 轮次标签 = 换行 + 说话人。★ 必须同时覆盖两套约定（2026-09-13 修）：
-#   `用户：/模型：` = v1 及更早；`A：/B：` = v2 起（PROJECT_STATE §5）。
+#   `用户：/模型：` = v1 及更早；`A：/B：` = v2 起（dev-notes/83 §5）。
 # 只认一套的实测后果：v2 基座自己开 `\nA：\nB：` 轮次时检测不到 →
 #   * stop_on_turn 永不触发，回复一路顶到 max_new_tokens（chat.py 表现为「收不住」）
 #   * eval_multiturn 的「自开轮次率」恒为 0%（漏报模型其实会开轮次）
