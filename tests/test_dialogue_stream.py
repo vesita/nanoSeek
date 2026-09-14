@@ -25,7 +25,9 @@ from training.dialogue_stream import (  # noqa: E402
     DialogueStream,
     iter_training_samples,
     parse_log,
+    read_corpus,
     split_line,
+    write_corpus,
 )
 
 W = lambda s: list(s)  # noqa: E731  # 假编码器：1 字符 = 1 token
@@ -38,10 +40,36 @@ def make(window: int = 256, **kw) -> DialogueStream:
 # ---------------------------------------------------------------- 分句器复用
 
 
-def test_reuses_repo_sentence_splitter():
-    """证明真的复用了 `data/chinese/split_sentences.py`，而不是静默退化成不切句。"""
+def test_reuses_the_canonical_segmenter():
+    """分句走 **canonical 的 `training/segmentation.py`**（2026-09-14 抽象出来）。
+
+    之前这里靠 `importlib` 按文件路径去 load `data/chinese/split_sentences.py`，
+    因为 `data/chinese/` 不是包。现在那条路已删（见 `_load_split_line_removed` 桩）。
+    """
+    from training import segmentation
+    assert split_line is segmentation.split_line, '必须就是 canonical 实现本身'
     assert split_line('a。b。') == ['a。', 'b。']
     assert split_line('你好，我是李华。') == ['你好，我是李华。']  # 逗号不是句末
+
+
+def test_old_importlib_loader_is_gone():
+    """★ 旧的按路径 load 写法必须已退役（桩会抛异常），别被复制粘贴回来。"""
+    import training.dialogue_stream as ds
+    assert not hasattr(ds, '_load_split_line')
+    with pytest.raises(RuntimeError):
+        ds._load_split_line_removed()
+
+
+def test_read_write_corpus_roundtrip(tmp_path):
+    """语料**统一读写**：`write_corpus` → `read_corpus` 必须逐段还原。"""
+    logs = ['对象A：你好。\n<resp>你好呀。<eos>', '对象B：在吗？\n<resp>在的。<eos>']
+    p = tmp_path / 'c.txt'
+    assert write_corpus(str(p), logs) == 2
+    assert read_corpus(str(p)) == logs
+    # 负向对照：朴素 `split('\n\n')` 会把末尾换行留给**最后一段**（不是多出空段）
+    raw = p.read_text(encoding='utf-8').split('\n\n')
+    assert raw != logs and raw[-1].endswith('\n'), \
+        '朴素 split 确实会让最后一段带上末尾换行（这正是要统一读写的原因）'
 
 
 # ---------------------------------------------------------------- 单流渲染
