@@ -318,6 +318,38 @@ loss/val 曲线完全正常（1/14000 步的差异测不出来）⇒ 单测与�
 
 ## 2. 待还的债（按「代价 ÷ 修复成本」排序）
 
+### P0 — 一手实验记录只放在 `out/`（gitignore）里 ⇒ 已经真丢过一站（2026-09-15）
+
+**位置**：`out/ndb_run/STATE.md`（以及一切 `out/**/STATE.md` 形态的 handoff 文件）。
+**代价（已兑现，不是假想）**：NDB「共训站」的**唯一完整记录**（471 行）只写在
+`out/ndb_run/STATE.md`，而 **`.gitignore:57` 忽略 `out/`** ⇒ **它从未进过 git**。
+配套制品（基座 `out/base_probe/best.pt` step 12000、库 `out/mem_store/store5mA.pt`、
+`out/ndb_run/` 的 ckpt）**已全部消失**（多个 `out/` 目录 mtime 停在 2026-09-11 23:31，
+**原因无记录**）。结果是：全项目最硬的 NDB 正面结果（**共训 Δ=−0.0738**，冻结基线 −0.0348 的 2.1×）
+在主文档里**一个数字都没有**，并且 4 天后被另一份文档写成了「已被否决」。
+**已做**：原件逐字归档 → `analysis/NDB_cotrain_STATE_2026-09-10.md`；
+复核写进 `dev-notes/80-NDB共训站丢失事故与方向纠偏.md`。
+**待还**：`out/` 下**其余** handoff / state / 证据文件按同一标准清点一遍；
+并考虑给 `training/train.py` 加一条"run 结束时把 STATE 摘要落到 `analysis/` 或日志目录"的约定。
+**纪律（已进 `AGENTS.md §1`）**：**只把结论写在 gitignore 的目录里 = 没写。**
+
+### P1 — NDB 的「写」与 `ndb_att_sim`（鲁棒性修法）都从没在训练里跑过（2026-09-15）
+
+**位置**：`model/memory_cross_attn.py`（`write_online` 已有，未接线）、
+`training/train.py`（`ndb_att_sim` / `ndb_retr_noise` 键已在、`:763-768` 已消费）。
+**代价**：
+1. **「写」是用户的硬要求**（`PROJECT_STATE §1` 第 3 条、§6.5），但至今 `train.py` 里
+   NDB **写入调用数是 0**；历史上的库全是离线 `--mode mean` 一次建成的。
+2. **检索鲁棒性悬崖未修**：实测 **10% 检索出错就废掉 65% 收益，25% 出错时记忆净有害**
+   （`analysis/NDB_cotrain_STATE_2026-09-10.md` §2.2）。探针（P6）已验证
+   **`ndb_att_sim` λ=2** 能把它翻正（25% 错误：+0.24 vs λ=0 的 −0.36），
+   而**专门为它准备的 pilot（`out/pilot_sim/`，`ndb_att_sim: 2.0`）跑了 6 分钟就死了**
+   （`ndb.csv`/`results.csv` 都是 0 字节）。
+**动作**：把 `write_online` 接进训练循环（配置键**必须定义在 `config_keys`(:313) 之前**，铁律 8；
+写只在训练 micro-batch 内、`estimate_loss`/体检期间关闭，防 val 泄漏）；
+然后跑**有写 / 无写** A-B，并**同时报 Δ 与鲁棒性曲线**（只报 Δ 会掩盖"写污染了库"）。
+**为什么没当场做**：用户要求**启动训练前先报方案等批准**，且这需要先重建库（旧库已删）。
+
 ### P1 — 单流 `<resp>` 格式在**采样/评估入口**没有一等支持（2026-09-14）
 
 **位置**：`inference/scripts/sample_py.py`、`inference/scripts/eval_dialogue.py`、
