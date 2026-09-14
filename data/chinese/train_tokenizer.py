@@ -62,7 +62,12 @@ def build_char_wordlevel(paths, out_json, hanzi_top=4400, mech_slots=16,
                   #   实测落在 id=140，即机制区第一个预留位 `<res0>`；词表仍 8192，
                   #   id 0..139 与汉字区 384..8191 逐位未变，既有 bin/ckpt 全部继续有效。
                   #   用法见 training/dialogue_stream.py。
-                  "<resp>"]
+                  "<resp>",
+                  # ★ 2026-09-14 追加（同样**只能往后加**）：
+                  #   `<topic>` = 「换话题了，上一个话题到此结束」的段首提示。
+                  #   实测落在 id=141（机制区第二个预留位）；词表仍 8192，
+                  #   id 0..140 与汉字区 384..8191 逐位未变，既有 bin/ckpt 全部继续有效。
+                  "<topic>"]
     # 剩余稀疏占位：未来机制符扩展区
     mech_reserved = [f"<res{i}>" for i in range(max(0, mech_zone_slots - len(mech_names)))]
     mec = mech_names + mech_reserved

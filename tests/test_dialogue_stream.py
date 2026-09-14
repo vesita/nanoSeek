@@ -20,6 +20,8 @@ if _ROOT not in sys.path:
 from training.dialogue_stream import (  # noqa: E402
     EOS,
     SELF_LABEL,
+    TOPIC,
+    TOPIC_ID,
     TURN_CUE,
     TURN_CUE_ID,
     DialogueStream,
@@ -388,6 +390,94 @@ def test_loss_token_spans_empty_when_nothing_committed():
     assert s.loss_token_spans() == []
 
 
+# ---------------------------------------------------------------- 换话题标记
+
+
+def _covered_text(s: DialogueStream) -> str:
+    """把 loss 区间覆盖到的文本拼起来（假编码器下 1 字 = 1 token）。"""
+    ids = list(s.encode(s.render()))
+    return ''.join(''.join(ids[a:b]) for a, b in s.loss_token_spans())
+
+
+def test_topic_marker_is_a_prefix_on_the_new_topic_turn():
+    """`<topic>` 插在**开启新话题那一段的开头**，不是单独一行。
+
+    单独一行会被分句器的「机制符片段并入上一句」规则粘走，也会破坏
+    `parse_log` 的"一行 = 一轮"不变式。
+    """
+    s = make()
+    s.append('对象A', '你好。')
+    s.commit('你好呀。')
+    s.append('对象A', '对了，问你个别的。', new_topic=True)
+    assert s.render() == '对象A：你好。\n<resp>你好呀。<eos>\n对象A：<topic>对了，问你个别的。'
+
+
+def test_topic_marker_on_the_models_own_turn():
+    s = make()
+    s.append('对象A', '你好。')
+    s.commit('你好呀。')
+    s.append('对象A', '嗯。')          # 中间隔一个用户轮（真实场景如此）
+    s.commit('说起来，你刚才提的那事我还想问一句。', new_topic=True)
+    assert '<resp><topic>说起来' in s.render(), s.render()
+
+
+def test_models_own_topic_marker_is_inside_loss():
+    """★ 关键：模型自己换话题时，`<topic>` 落在 **loss 区间内** ⇒ 模型能学会输出它。
+
+    这正是"主动换话题"（服务「善于发问」）的监督信号。
+    """
+    s = make()
+    s.append('对象A', '你好。')
+    s.commit('你好呀。')
+    s.append('对象A', '嗯。')
+    s.commit('说起来，我还想问一句。', new_topic=True)
+    assert TOPIC in _covered_text(s), '模型自己的 <topic> 必须算 loss'
+
+
+def test_other_party_topic_marker_is_outside_loss():
+    """负向对照：**别人**换话题的 `<topic>` 只是上下文，不参与 loss。"""
+    s = make()
+    s.append('对象A', '你好。', new_topic=True)
+    s.commit('你好呀。')
+    assert TOPIC not in _covered_text(s), '别人说的 <topic> 不该算 loss'
+
+
+def test_topic_marker_survives_parse_roundtrip():
+    s = make()
+    s.append('对象A', '你好。')
+    s.commit('你好呀。')
+    s.append('对象A', '换个话题。', new_topic=True)
+    s.commit('说来听听。', new_topic=True)
+    back = parse_log(s.render(), W)
+    assert back.render() == s.render()
+    assert back.history() == s.history()
+
+
+def test_iter_training_samples_supports_new_topic_flag():
+    """剧本第三项（可选）标记"这一段开启新话题"。"""
+    script = [
+        ('对象A', '你好。'),
+        (SELF_LABEL, '你好呀。'),
+        ('对象A', '对了，问你个别的。', True),
+        (SELF_LABEL, '你问。', True),
+    ]
+    (p0, r0), (p1, r1) = list(iter_training_samples(script, W, window=200))
+    assert p0 == '对象A：你好。\n<resp>' and r0 == f'你好呀。{EOS}'
+    assert p1.endswith('对象A：<topic>对了，问你个别的。\n<resp>'), p1
+    assert r1 == f'{TOPIC}你问。{EOS}', '训练目标要包含 <topic>（模型自己要生成它）'
+
+
+def test_topic_and_resp_are_single_tokens():
+    """★ 钉住 tokenizer 事实：`<resp>`=140、`<topic>`=141，都是**单 token**。"""
+    from tokenizers import Tokenizer
+
+    tok = Tokenizer.from_file(os.path.join(_ROOT, 'data', 'chinese', 'char_tokenizer.json'))
+    for text, tid in [(TURN_CUE, TURN_CUE_ID), (TOPIC, TOPIC_ID)]:
+        assert tok.encode(text, add_special_tokens=False).ids == [tid], text
+        assert tok.decode([tid], skip_special_tokens=False) == text
+    assert tok.get_vocab_size() == 8192
+
+
 # ---------------------------------------------------------------- 钉住 tokenizer
 
 
@@ -431,6 +521,7 @@ def test_tokenizer_source_matches_the_built_artifact():
             names = ast.literal_eval(node.value)
     assert names, '没能从 train_tokenizer.py 里解析出 mech_names'
     assert names[12] == TURN_CUE, f'mech_names[12] 应为 {TURN_CUE!r}（→ id 140），实际 {names[12]!r}'
+    assert names[13] == TOPIC, f'mech_names[13] 应为 {TOPIC!r}（→ id 141），实际 {names[13]!r}'
 
     vocab = json.load(io.open(
         os.path.join(_ROOT, 'data', 'chinese', 'char_tokenizer.json'), encoding='utf-8')

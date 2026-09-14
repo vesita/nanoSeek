@@ -88,6 +88,8 @@ from training.segmentation import ContextWindow, split_line  # noqa: F401  (spli
 SELF_LABEL = '自己'      # ★ 内部哨兵：表示"这是模型的轮次"。**不渲染成 `自己：`**，渲染成 `<resp>`
 TURN_CUE = '<resp>'      # 模型轮次的内联标记；tokenizer id = 140，**单 token**
 TURN_CUE_ID = 140
+TOPIC = '<topic>'        # 「换话题」标记；tokenizer id = 141，**单 token**
+TOPIC_ID = 141
 EOS = '<eos>'            # 轮末终止符（保留；`<cont>` 已退休）
 EOS_ID = 128
 
@@ -188,19 +190,33 @@ class DialogueStream:
 
     # ---------- 写入 ----------
 
-    def append(self, speaker: str, text: str) -> None:
-        """加入一个说话人的一段话（会按句拆开），并把窗口收到尺寸内。"""
+    def append(self, speaker: str, text: str, *, new_topic: bool = False) -> None:
+        """加入一个说话人的一段话（会按句拆开），并把窗口收到尺寸内。
+
+        `new_topic=True` 时在这一段**开头**插一个 `<topic>`（单 token，id 141）——
+        提醒模型"上一个话题已经结束了"。它属于**这一段的内容**，于是：
+
+        - 别人的段 ⇒ 模型只把它当上下文，「知道该换话题了」；
+        - **模型自己的段**（`commit(..., new_topic=True)`）⇒ 它落在 loss 区间**之内**，
+          ⇒ **模型自己也能学会在换话题时输出它**（主动换话题，服务「善于发问」）。
+
+        ★ 放在段首（而不是单独一行）：单独一行会被分句器的「机制符片段并入上一句」
+          规则粘到上一句去，也会让 `parse_log` 的"一行 = 一轮"不变式破掉。
+        """
+        if new_topic:
+            text = TOPIC + text
         sents = [s for s in split_line(text, max_len=self.max_sentence_len) if s.strip()]
         if sents:
             self._win.extend([(speaker, s) for s in sents])
 
-    def commit(self, text: str) -> None:
+    def commit(self, text: str, *, new_topic: bool = False) -> None:
         """把模型**生成的回复**记入日志（标记 `<resp>` 由 `_label` 补，函数只存正文）。
 
         `emit_eos=True`（默认）时在本轮**最后一句**末尾贴 `<eos>`，贴完**重新收窗**。
+        `new_topic=True` 时正文开头加 `<topic>`（见 `append`）。
         """
         before = len(self._entries)
-        self.append(self.self_label, text)
+        self.append(self.self_label, text, new_topic=new_topic)
         if self.emit_eos and len(self._entries) > before:
             spk, sent = self._entries[-1]
             self._entries[-1] = (spk, sent + EOS)
@@ -400,12 +416,15 @@ def iter_training_samples(
 ) -> Iterator[Tuple[str, str]]:
     """把一段剧本滚成训练样本：每个「模型轮」产出一条 `(prompt, reply)`。
 
-    `script` ＝ `[(speaker, text), ...]`。`speaker == SELF_LABEL`（`自己`）的条目
-    表示**这是模型该说的内容**：先产出当时的 `(prompt, reply)`，再记入日志。
+    `script` ＝ `[(speaker, text), ...]`，第三项可选：`(speaker, text, new_topic)`，
+    `new_topic=True` 表示这一段**开启新话题**（段首会插 `<topic>`）。
+    `speaker == SELF_LABEL`（`自己`）的条目表示**这是模型该说的内容**：先产出当时的
+    `(prompt, reply)`，再记入日志。
 
     产出：
       - `prompt` ＝ 日志 + 末尾 `<resp>`（模型输入，**不含**待生成的回复）
-      - `reply`  ＝ 训练目标 ＝ **内容 + `<eos>`**（不含 `<resp>`，那是 harness 喂的）
+      - `reply`  ＝ 训练目标 ＝ **内容 + `<eos>`**（不含 `<resp>`，那是 harness 喂的；
+        但**含** `<topic>` —— 它属于模型自己说的话，所以模型要学会在换话题时输出它）
 
     ★★ **严格连续**（有测试钉住）：`prompt_k + reply_k == 日志_{k+1}`，逐字符相等、
     **没有任何替换**。所以整条流可以直接拼成一个 bin，用「`<resp>` → `<eos>`」定区间
@@ -415,9 +434,13 @@ def iter_training_samples(
     模型得在「已经有若干轮历史、头部可能已被弹掉」的状态下接话。
     """
     stream = DialogueStream(encode, window, **kwargs)
-    for speaker, text in script:
+    for item in script:
+        speaker, text = item[0], item[1]
+        # 第三项（可选）为 True 表示"这一段开启新话题"，会在段首插一个 `<topic>`
+        new_topic = bool(item[2]) if len(item) > 2 else False
         if speaker == SELF_LABEL:
-            yield stream.prompt(), text + (EOS if stream.emit_eos else '')
-            stream.commit(text)
+            body = (TOPIC if new_topic else '') + text
+            yield stream.prompt(), body + (EOS if stream.emit_eos else '')
+            stream.commit(text, new_topic=new_topic)
         else:
-            stream.append(speaker, text)
+            stream.append(speaker, text, new_topic=new_topic)
