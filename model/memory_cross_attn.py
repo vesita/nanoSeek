@@ -208,8 +208,18 @@ class MemoryCrossAttention(nn.Module):
         qn = q / (q.norm(dim=-1, keepdim=True) + 1e-6)
         mn = mem_chunks / (mem_chunks.norm(dim=-1, keepdim=True) + 1e-6)
         sim_used = (qn.unsqueeze(-2) * mn).sum(-1)  # (B,C,k) ∈ [-1,1]
-        sim_z = ((sim_used - sim_used.mean(dim=-1, keepdim=True))
-                 / (sim_used.std(dim=-1, keepdim=True) + 1e-6))  # 跨槽 z 分数
+        # ★ 跨槽 z 分数：告诉注意力「这些条目里哪个真的更相关」。
+        #   ⚠ 只在 k ≥ 2 时有定义：k = min(top_k, 库里的活跃条数)，库只有 1 条时 k=1，
+        #   而 `std` 在单元素上是 NaN（correction=1），且 `0 * nan = nan`
+        #   ⇒ 即使 `sim_gain=0` 也会把整个 forward 污染成 NaN。
+        #   实测（2026-09-15）：live=1 → 输出 isnan=True；live≥2 → 干净。
+        #   k=1 时槽之间**本来就没有名次可排** ⇒ 取 0（等价于「这条相关性信息不存在」），
+        #   这是 k≥2 公式在退化情形下的正确极限，而不是补丁。
+        if sim_used.shape[-1] >= 2:
+            sim_z = ((sim_used - sim_used.mean(dim=-1, keepdim=True))
+                     / (sim_used.std(dim=-1, keepdim=True) + 1e-6))
+        else:
+            sim_z = torch.zeros_like(sim_used)
         Q = self.wq(hc)  # (B,C,chunk,D)
         if self.per_token:
             mv = self.vals[idx].float()  # (B,C,k,chunk,rank)
