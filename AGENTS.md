@@ -86,13 +86,26 @@ HSA_OVERRIDE_GFX_VERSION=10.3.0 HSA_ENABLE_SDMA=0    # gfx1030 必需
 **全部在 `PROJECT_STATE.md` 的 🚀 速查一节**（续训 / 看单元状态 / 巡检 / 配对重评 /
 质量评估 / 密度体检 / 闸门 / 冒烟）。这里不重复，避免两处文档分叉。
 
-**三条最常用的**（其余去速查节抄）：
+**四条最常用的**（其余去速查节抄）：
 ```bash
 bash scripts/watch.sh                                  # 巡检（唯一认可的入口，铁律 6）
 systemctl --user status nanoseek-v3-dlg.service        # 训练还活着吗
 tail -c 1500 out/base_v3_dlg_train.log                 # 最新进度
+tail -40 out/watch_heartbeat.log                       # ★ 我不在时，定时器替我记的巡检心跳
 ```
 ⚠ 训练日志在 **`out/base_v3_dlg_train.log`**（`out_dir` **之外**，铁律 3）。
+
+★★ **巡检已由 systemd 定时器兜底：`nanoseek-watch.timer`（每 30 分钟跑一次 `watch.sh`，
+输出追加进 `out/watch_heartbeat.log`）**。2026-09-14 实测的教训：
+AI 会话的 `sleep N` 链**是单点故障** —— 半夜 bash 定时器到点结束后，harness 的完成通知
+**迟了 6 小时**才送到我手里（会话被挂起/休眠时通知不推进），于是那 6 小时里**没有任何巡检**，
+而我（和读文档的人）会以为在监控。训练没受影响（systemd 单元独立于会话，
+`NRestarts=0`、进度条时长与墙钟逐秒吻合），但"以为在监控"本身就是本项目最忌讳的失败模式
+（同铁律 6/11 的根因）。
+⇒ 纪律：**任何"定期要发生"的动作，必须是 systemd 用户单元（`*.timer`），
+`sleep` 链只用来让我自己醒来后看一眼**；醒来先读 `out/watch_heartbeat.log` 补盲区，
+再跑一次 `watch.sh` 做即时确认。定时器本身用
+`systemctl --user list-timers nanoseek-watch.timer` 验证。
 ⚠★ **换 run 必须同步改 `scripts/watch.sh:16-17` 的默认 `OUT_DIR`/`LOG`** ——
 它俩是写死的默认值。不同步的后果不是"少看日志"：**新目录的 ckpt 不会被 prune，磁盘会被写满**，
 而且日志/异常关键字扫的是旧 run（2026-09-13 起 `watch.sh` 默认已指向 `out/base_v3_dlg`）。
@@ -296,6 +309,7 @@ step > 22000   全 token 均匀采样、全部算 loss                 val ≈ 4
 | 10 | **重启训练 ⇒ 监控节律重置回 300s** | 问题一般发生在早期 |
 | 11 | **保留/清理策略不许只活在外部进程里** —— 外部看守会随会话重启一起死（见铁律 0）| `results.csv` 续训被截成 0 字节；归档清理依赖看守 |
 | **12** | **★ warm start（`init_from=<路径>.pt`）必须配独立 `out_dir`** —— 判据是 `init_from != 'resume'`，而 `<路径>.pt` **不是** `resume` ⇒ `_backup_old_run` 照样触发 | 2026-09-13 拟三阶段方案时命令块里写了 `--init_from=out/base_v2/last.pt` 却**漏了 `--out_dir`**；照抄 + `configs/base_v2.yaml`（`out_dir: out/base_v2`）会把基座 61000 步的**全部 ckpt（含 `last.pt` 自己）静默挪进 `old/`**。⚠ 模型**先加载、后归档**，所以**不会当场崩** —— 这正是它阴险的地方。已建 `configs/base_v3_{know,dlg}.yaml` 并加两条断言（`test_v3_stage_config_safety` / `test_all_config_out_dirs_are_pairwise_distinct`）。与铁律 3、9 **同一个根因**（`out_dir` 会被整体归档）|
+| **13** | **★「定期要发生」的运维动作必须落在 systemd 用户 `*.timer` 里，不许只活在 AI 会话的 `sleep` 链里** | 2026-09-14：`sleep 1800` 巡检链 02:05 到点后，harness 的**完成通知迟了 6 小时**才送达（会话挂起时通知不推进）⇒ 6 小时内**零巡检**，而所有人都以为在监控。训练没受影响（`NRestarts=0`），但"以为在监控"是铁律 6/11 同族失败模式。已建 `nanoseek-watch.timer` → `out/watch_heartbeat.log`；`sleep` 链只用来让自己醒来。详见本页 §4 |
 
 ---
 

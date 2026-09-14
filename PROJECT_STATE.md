@@ -33,6 +33,11 @@ systemctl --user status nanoseek-v3-dlg.service --no-pager | head -14
 # ② 巡检：只认这一条，别手敲长命令（铁律 11）★ 默认已指向 out/base_v3_dlg
 bash scripts/watch.sh
 
+# ②b 补盲区：systemd 定时器 nanoseek-watch.timer 每 30 分钟自动跑一次 watch.sh，
+#     输出追加到这里。AI 会话被挂起/通知迟到时，这是唯一可靠的记录（§8 铁律 14）
+tail -40 out/watch_heartbeat.log
+systemctl --user list-timers nanoseek-watch.timer --no-pager   # 它还在跑吗
+
 # ③ 要看 val 趋势 → 配对重评（单点 val 不可信，见 §0.5.3）
 .venv/bin/python scripts/ckpt_paired_eval.py --ckpts out/base_v2/ckpt_step_22000.pt --batches 800
 
@@ -1683,6 +1688,19 @@ buffer、`local/ngram_memory_probe.py`、`local/ngram_sample_capacity.py`、`loc
     并用两条断言钉住：`test_project_layout.py::test_v3_stage_config_safety`
     与 `::test_all_config_out_dirs_are_pairwise_distinct`。详见 §0.5.10。
     与第 3、9 条**同一个根因**（`out_dir` 会被整体归档），只是触发条件不同。
+
+14. **★ 「定期要发生」的运维动作必须落在 systemd 用户单元（`*.timer`）里，不许只活在 AI 会话的 `sleep` 链里。**
+    （2026-09-14 实测踩到）2026-09-13 23:35 我挂的 `sleep 1800` 巡检定时器于 02:05 到点结束，
+    但 harness 的**完成通知迟了 6 小时**才送达（会话被挂起/休眠时通知不推进）⇒
+    02:05~08:06 这 6 小时里**一次巡检都没发生**，而我和读文档的人都以为在监控。
+    ⚠ 训练本身**没受影响**（`systemd` 单元独立于会话：`NRestarts=0`、
+    进度条累计时长 7:37:49 与墙钟 00:28:29→08:06:29 逐秒吻合），
+    但"以为在监控"正是铁律 6/11 同一族失败模式。
+    → 已建 `nanoseek-watch.timer`（每 30 分钟跑一次 `watch.sh`，输出追加进
+    **`out/watch_heartbeat.log`**；单元文件在 `~/.config/systemd/user/`）。
+    纪律：**醒来先读 `out/watch_heartbeat.log` 补盲区，再跑 `watch.sh` 做即时确认**；
+    `sleep` 链降级为"让我自己醒来"的提示器。验证：
+    `systemctl --user list-timers nanoseek-watch.timer`。
 
 ---
 
