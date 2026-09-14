@@ -306,6 +306,54 @@ class DialogueStream:
                 f'溢出={self.overflow})')
 
 
+def parse_log(
+    text: str,
+    encode: Callable[[str], Sequence[int]],
+    window: int = 10 ** 9,
+    **kwargs,
+) -> DialogueStream:
+    """把 `render()` 产出的日志**解析回** `DialogueStream`。
+
+    这是"造完语料要能读回来验证"的入口 —— 没有它，"格式对不对"只能靠肉眼。
+    等价性判据（有测试钉住）：`parse_log(s.render(), ...).render() == s.render()`。
+
+    识别两类行：
+      - `<resp>...`            → 模型自己的轮次（`speaker = self_label`）
+      - `名字：...`            → 其他人
+      - 其余（含空行）         → 续行，接到上一条的文本后面
+
+    ⚠ 默认 `window` 取极大值：解析时**不能**再弹句子，否则"读回来"和"写出去"不等价。
+      要按真实窗口裁剪，显式传 `window`。
+    """
+    cue = kwargs.get('cue', TURN_CUE)
+    colon = kwargs.get('colon', '：')
+    stream = DialogueStream(encode, window, **kwargs)
+    for line in text.split('\n'):
+        if not line.strip():
+            continue
+        if line.startswith(cue):
+            body = line[len(cue):]
+            # ★ `<eos>` 必须**粘在最后一句上**，不能让它单独成句。
+            #   否则 `split_line('我是小寻。<eos>')` 会给出 ['我是小寻。', '<eos>']，
+            #   多出一个条目 —— 渲染看不出来（同说话人会被合并），但**滑窗按句弹出时
+            #   会把 `<eos>` 单独弹掉**，那就是真坏数据。
+            tail = ''
+            if body.endswith(EOS):
+                body, tail = body[:-len(EOS)], EOS
+            stream.append(stream.self_label, body)
+            if tail and stream._entries:
+                spk, sent = stream._entries[-1]
+                stream._entries[-1] = (spk, sent + tail)
+        elif colon in line:
+            speaker, body = line.split(colon, 1)
+            stream.append(speaker, body)
+        elif stream._entries:
+            # 续行：接到上一条后面（保持原来的说话人）
+            spk, sent = stream._entries[-1]
+            stream._entries[-1] = (spk, sent + line)
+    return stream
+
+
 def iter_training_samples(
     script: Sequence[Entry],
     encode: Callable[[str], Sequence[int]],

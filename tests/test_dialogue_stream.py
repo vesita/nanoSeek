@@ -24,6 +24,7 @@ from training.dialogue_stream import (  # noqa: E402
     TURN_CUE_ID,
     DialogueStream,
     iter_training_samples,
+    parse_log,
     split_line,
 )
 
@@ -226,6 +227,54 @@ def test_stream_is_strictly_contiguous():
     assert p1.startswith(p0 + r0), 'prompt_k + reply_k 必须是 prompt_{k+1} 的前缀'
     # 负向对照：若中间插了任何东西（比如旧的"替换"写法），前缀关系就断了
     assert not p1.startswith(p0 + r0 + '\n' + r0), '判据要能区分出多余内容'
+
+
+def test_render_parse_roundtrip():
+    """★ 造完语料必须能**读回来**：`parse_log(render(s))` 与 `s` 等价。
+
+    没有这条，"格式对不对"只能靠肉眼；有了它，生成出来的语料一落地就能自动验。
+    """
+    s = make()
+    s.append('对象A', '你好，我是李华。')
+    s.commit('你好呀。我是小寻。')
+    s.rename('对象A', '李华')
+    s.append('李华', '你多大了？')
+    s.commit('还在长个儿呢。你呢？')
+
+    log = s.render()
+    back = parse_log(log, W)
+    assert back.render() == log, '读回来再写出去必须逐字相同'
+    assert back.history() == s.history()
+    assert back.loss_token_spans() == s.loss_token_spans()
+
+
+def test_parse_log_accepts_multiple_conversations_in_one_file():
+    """语料文件里会有很多段对话 —— 解析器不能把它们搅在一起。
+
+    约定：段与段之间用**空行**分隔，解析器跳过空行；句子本身不会跨段。
+    """
+    a = make()
+    a.append('对象A', '你是谁？')
+    a.commit('我是小寻。你呢？')
+    b = make()
+    b.append('对象B', '在吗？')
+    b.commit('在的。')
+
+    text = a.render() + '\n\n' + b.render()
+    back = parse_log(text, W)
+    assert back.render() == a.render() + '\n' + b.render()
+    # 但两段属于同一条流 ⇒ 解析后是一串连续记录（这是刻意的：滑窗本来就跨段）
+    assert len(back.history()) == len(a.history()) + len(b.history())
+
+
+def test_parse_log_respects_window_when_asked():
+    """显式给窗口时，解析就要按窗口裁剪 —— 与"读回来等价"是两个不同用途。"""
+    s = make()
+    for i in range(30):
+        s.append('A', f'完整句子{i}。')
+    back = parse_log(s.render(), W, window=25)
+    assert back.dropped > 0
+    assert back.context_len() <= back.window or back.overflow
 
 
 def test_group_turns_option():
