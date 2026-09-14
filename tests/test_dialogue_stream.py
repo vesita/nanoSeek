@@ -18,6 +18,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from training.dialogue_stream import (  # noqa: E402
+    EOS,
     SELF_LABEL,
     TURN_CUE,
     TURN_CUE_ID,
@@ -31,6 +32,12 @@ W = lambda s: list(s)  # noqa: E731  # 假编码器：1 字符 = 1 token
 
 def make(window: int = 256, **kw) -> DialogueStream:
     return DialogueStream(W, window, **kw)
+
+
+def strip_cue(prompt: str) -> str:
+    """把 prompt 末尾那行 cue 去掉，得到"持久记录"形态。"""
+    assert prompt.endswith('\n' + TURN_CUE)
+    return prompt[: -len('\n' + TURN_CUE)]
 
 
 # ---------------------------------------------------------------- 分句器复用
@@ -53,9 +60,33 @@ def test_render_matches_the_designed_flow():
     assert s.prompt() == 'A：你好，我是李华。\n<你该说话了>'
     # 持久记录里还没有模型的话
     assert s.render() == 'A：你好，我是李华。'
-    # 模型生成「你好」之后，以 `自己：` 记回持久记录
+    # 模型生成「你好」之后，以 `自己：` 记回持久记录，并按约定贴 <eos>
+    s.commit('你好')
+    assert s.render() == 'A：你好，我是李华。\n自己：你好<eos>'
+
+
+def test_emit_eos_can_be_disabled():
+    """用户原话里那一步的**字面**形态（不带 `<eos>`）—— 关掉 `emit_eos` 即可复现。"""
+    s = make(window=256, emit_eos=False)
+    s.append('A', '你好，我是李华。')
     s.commit('你好')
     assert s.render() == 'A：你好，我是李华。\n自己：你好'
+
+
+def test_cont_is_never_emitted():
+    """★ 用户 2026-09-14 决定：**合并 `<cont>`、保留 `<eos>`**。
+
+    新格式里 `<cont>` 不再出现（它的语义已被轮次机制取代），但**token 本身仍在词表里**
+    —— 既有 bin 里有 50 万个它，删了旧 bin 就解不出来。
+    """
+    s = make(window=256)
+    s.append('对象A', '在吗？')
+    s.commit('在的！你说。')
+    s.append('对象A', '好的。')
+    s.commit('嗯嗯，我听着。')
+    text = s.render()
+    assert '<eos>' in text
+    assert '<cont>' not in text
 
 
 def test_prompt_never_ends_with_self_label():
@@ -137,7 +168,7 @@ def test_commit_uses_self_label():
     s = make()
     s.append('对象A', '我叫李华。')
     s.commit('你好呀。')
-    assert s.history() == [('对象A', '我叫李华。'), (SELF_LABEL, '你好呀。')]
+    assert s.history() == [('对象A', '我叫李华。'), (SELF_LABEL, f'你好呀。{EOS}')]
 
 
 def test_rename_binds_a_name():
@@ -171,25 +202,50 @@ def test_iter_training_samples_shapes():
 
     p0, r0 = out[0]
     assert p0 == '对象A：你好，我是李华。\n<你该说话了>'
-    assert r0 == '你好呀。', '训练目标**不含标签**'
+    assert r0 == f'你好呀。{EOS}', '训练目标 = 内容 + <eos>（不含标签）'
 
     p1, r1 = out[1]
-    assert '自己：你好呀。' in p1, '上一轮必须已以 `自己：` 记入'
+    assert f'自己：你好呀。{EOS}' in p1, '上一轮必须已以 `自己：` 记入'
     assert p1.endswith(TURN_CUE)
-    assert r1 == '我叫小寻。'
+    assert r1 == f'我叫小寻。{EOS}'
+
+
+def test_prompt_is_rebuilt_with_self_label_substituting_the_cue():
+    """★ cue 是**临时**的：下一轮 prompt 里，末尾 cue 被 `自己：` **取代**。
+
+    这正是用户说的"自动补齐 `自己：` 这个前缀"。
+    ⇒ 训练数据是 **(prompt, target) 对**，不是一条连续 token 流
+      （prompt_{k+1} 不是 prompt_k + target_k 的简单拼接，中间发生过替换）。
+      这条不变量是拼接式写数据**必错**的地方，所以钉下来。
+    """
+    script = [
+        ('对象A', '你好，我是李华。'),
+        (SELF_LABEL, '你好呀。我是小寻。'),
+        ('对象A', '你多大了？'),
+        (SELF_LABEL, '还在长个儿呢。'),
+    ]
+    (p0, r0), (p1, _) = list(iter_training_samples(script, W, window=200))
+
+    # 正确的不变量：持久记录(p0) + `自己：` + r0 是 p1 的前缀（r0 已自带 <eos>）
+    rebuilt = strip_cue(p0) + f'\n{SELF_LABEL}：' + r0
+    assert p1.startswith(rebuilt), f'\n  rebuilt={rebuilt!r}\n  p1     ={p1!r}'
+    # 负向对照：朴素拼接（不做替换）**必须不成立** —— 证明这条判据在真干活
+    assert not p1.startswith(strip_cue(p0) + '\n' + r0)
+    # cue 出现过，但持久记录里没有 cue
+    assert TURN_CUE in p0 and TURN_CUE not in rebuilt
 
 
 def test_group_turns_option():
-    """默认一句一行（与用户样例一致）；`group_turns=True` 时渲染合并、内部仍按句存。"""
+    """默认 `group_turns=True`：同一说话人的连续句子渲染成一行（内部仍按句存，便于滑窗）。"""
+    grouped = make()
+    grouped.append('A', '你好。我是李华。')
+    assert grouped.history() == [('A', '你好。'), ('A', '我是李华。')], '内部按句存'
+    assert grouped.render() == 'A：你好。我是李华。', '渲染时合并'
+
     per_sent = make(group_turns=False)
     per_sent.append('A', '你好。我是李华。')
     assert per_sent.history() == [('A', '你好。'), ('A', '我是李华。')]
     assert per_sent.render() == 'A：你好。\nA：我是李华。'
-
-    grouped = make(group_turns=True)
-    grouped.append('A', '你好。我是李华。')
-    assert grouped.history() == [('A', '你好。'), ('A', '我是李华。')]
-    assert grouped.render() == 'A：你好。我是李华。'
 
 
 # ---------------------------------------------------------------- 钉住 tokenizer

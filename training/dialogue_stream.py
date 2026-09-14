@@ -55,6 +55,19 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SELF_LABEL = '自己'
 TURN_CUE = '<你该说话了>'
 TURN_CUE_ID = 140  # 机制符区间第一个预留位（原 <res0>）被改名为 cue；见模块 docstring
+EOS = '<eos>'
+
+# ★ 2026-09-14 用户决定：**合并 `<cont>`、保留 `<eos>`**。
+#   - `<cont>`（id 130）在新格式里**不再生成** —— 它的语义（"我说完但请对方继续"）
+#     已被轮次机制取代：cue 标记「该你说了」，下一个说话人标签标记「我接上了」。
+#   - `<eos>`（id 128）**保留**，贴在每轮模型回复末尾（与仓库既有约定一致，
+#     见 `prepare.py:248`）。
+#   ⚠ **token 本身不能删**：既有 bin 里 `<cont>` 有 50 万个（v2 344,673 /
+#     v3_dlg 163,989），删了旧 bin 就解不出来。只是"新数据不再生成"。
+#   ★ 附带好处：`prepare.py::annotate_replies` **只认 `用户：`/`模型：`**（`:222`），
+#     非匹配行**原样保留**（`:251-255`）⇒ 我们的 `对象A：`/`自己：` 格式**完全绕过**
+#     那套标注（也不做 70% `A：/B：` 改写、不加引号、不走 `_should_continue`），
+#     **`prepare.py` 一个字都不用改**。
 
 
 def _load_split_line():
@@ -98,9 +111,14 @@ class DialogueStream:
     max_sentence_len : int
         交给 `split_line` 的超长句二次切阈值。
     group_turns : bool
-        False（默认）＝**一句一行**，与用户的样例一致，也让「按句分布」显式可见；
-        True ＝ 把连续同一说话人的句子合并成一行（标签更少）。
-        ⚠ 尚未定，故做成参数。
+        True（默认）＝把连续同一说话人的句子**合并成一行**。
+        ⚠ 默认值是 True 而不是 False，理由是**训练目标要与渲染一致**：
+        模型一次生成的是"整轮回复"，若渲染成"一句一行"，`prompt + target`
+        就和下一轮的 prompt 对不上了（多出了重复标签）。见
+        `tests/test_dialogue_stream.py::test_samples_are_self_consistent`。
+        内部仍**按句存储**，所以窗口照样在句子边界弹出。
+    emit_eos : bool
+        True（默认）＝每轮模型回复末尾追加 `<eos>`（`<cont>` 已按用户决定废弃）。
     """
 
     def __init__(
@@ -112,7 +130,8 @@ class DialogueStream:
         cue: str = TURN_CUE,
         colon: str = '：',
         max_sentence_len: int = 80,
-        group_turns: bool = False,
+        group_turns: bool = True,
+        emit_eos: bool = True,
     ) -> None:
         self.encode = encode
         self.window = int(window)
@@ -121,6 +140,7 @@ class DialogueStream:
         self.colon = colon
         self.max_sentence_len = max_sentence_len
         self.group_turns = group_turns
+        self.emit_eos = emit_eos
         self._entries: List[Entry] = []
         self.dropped = 0        # 累计弹出的**整句**数（不是 token 数）
         self.overflow = False   # 单句本身就超窗 ⇒ 软上限放行（否则会死循环）
@@ -143,8 +163,17 @@ class DialogueStream:
         self.enforce_window()
 
     def commit(self, text: str) -> None:
-        """把模型**生成的内容**以 `自己：` 记入持久记录（不含标签，标签这里补）。"""
+        """把模型**生成的内容**以 `自己：` 记入持久记录（标签这里补）。
+
+        `emit_eos=True`（默认）时，在本轮**最后一句**末尾追加 `<eos>` ——
+        与仓库既有约定一致（`<eos>` 直接贴在整条回复末尾，见 `prepare.py:248`）。
+        `<cont>` 已按用户 2026-09-14 的决定**不再生成**。
+        """
+        before = len(self._entries)
         self.append(self.self_label, text)
+        if self.emit_eos and len(self._entries) > before:
+            spk, sent = self._entries[-1]
+            self._entries[-1] = (spk, sent + EOS)
 
     def rename(self, old: str, new: str) -> int:
         """把某说话人的历史标签整体改名（「对象A → 名字」的绑定）。
@@ -242,8 +271,17 @@ def iter_training_samples(
     表示**这是模型该说的内容**：先产出当时的 `(prompt, reply)`，再以 `自己：` 记入流
     （模拟真实回放）。非 `自己` 的条目直接加入流。
 
-    产出：`prompt` **以 cue 结尾**（这就是训练输入），`reply` 是**不含标签**的原文
-    （训练目标；终止符 `<eos>`/`<cont>` 由上游 `prepare.py` 那一层负责，本模块不管）。
+    产出：`prompt` **以 cue 结尾**（这就是训练输入），`reply` 是**训练目标** ——
+    等于「内容 + `<eos>`」（`emit_eos=True` 时）。
+
+    ★ **自洽不变量**（有测试钉着）：把第 k 条样本的 `prompt + reply` 拼起来，
+    必须是第 k+1 条 `prompt` 的前缀。**这条不成立就说明训练数据和推理时的上下文
+    不是同一种形态**，模型会学到一套、用时另一套。
+    见 `tests/...::test_samples_are_self_consistent`。
+
+    ⚠ 终止符由**本模块自己插**：`prepare.py::annotate_replies` 只认
+    `用户：`/`模型：`，我们的 `对象A：`/`自己：` 格式会被它**原样放行**（`:251-255`），
+    所以**不能指望上游补** `<eos>`。
 
     ⚠ 样本之间的**窗口状态是连续的**（同一条流滚下去）——这正是要训的东西：
     模型得在「已经有若干轮历史、头部可能已被弹掉」的状态下接话。
@@ -251,7 +289,9 @@ def iter_training_samples(
     stream = DialogueStream(encode, window, **kwargs)
     for speaker, text in script:
         if speaker == SELF_LABEL:
-            yield stream.prompt(), text
+            prompt = stream.prompt()
+            # 训练目标 = 模型实际要生成的东西：内容 + 终止符（`<cont>` 已废弃）
+            yield prompt, text + (EOS if stream.emit_eos else '')
             stream.commit(text)
         else:
             stream.append(speaker, text)
