@@ -56,7 +56,13 @@ def build_char_wordlevel(paths, out_json, hanzi_top=4400, mech_slots=16,
     # ── 区 2: 机制符区间（统一管理 + 稀疏预留）──
     # 命名机制符（前几个固定语义，顺序即 id，绝不更改）：
     mech_names = ["<eos>", "<unk>", "<cont>", "<pad>", "<bos>", "<sep>",
-                  "<call>", "<result>", "<think>", "<answer>", "<tool>", "<search>"]
+                  "<call>", "<result>", "<think>", "<answer>", "<tool>", "<search>",
+                  # ★ 2026-09-14 追加（**只能往后加**，绝不能插队或改序 —— 顺序即 id）：
+                  #   `<你该说话了>` = 「该你说了」的轮首提示（轮末的 `<cont>` 是它的对偶）。
+                  #   实测落在 id=140，即机制区第一个预留位 `<res0>`；词表仍 8192，
+                  #   id 0..139 与汉字区 384..8191 逐位未变，既有 bin/ckpt 全部继续有效。
+                  #   用法见 training/dialogue_stream.py。
+                  "<你该说话了>"]
     # 剩余稀疏占位：未来机制符扩展区
     mech_reserved = [f"<res{i}>" for i in range(max(0, mech_zone_slots - len(mech_names)))]
     mec = mech_names + mech_reserved
