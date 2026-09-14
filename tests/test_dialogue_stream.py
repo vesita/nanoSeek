@@ -277,6 +277,44 @@ def test_parse_log_respects_window_when_asked():
     assert back.context_len() <= back.window or back.overflow
 
 
+def test_no_window_limit_skips_measurement():
+    """★ 无穷窗口**不做任何测量** —— 否则解析整份语料是 O(n²)。
+
+    2026-09-14 实测：`parse_log` 一份 10 万字符的语料，因为每次 append 都把整份日志
+    重新 encode，跑到 60s 超时被杀。这里用 spy 数 `encode` 调用次数（不用计时，
+    避免计时测试不稳定）。
+    """
+    calls = []
+
+    def enc(s):
+        calls.append(s)
+        return list(s)
+
+    st = DialogueStream(enc, 10 ** 9)
+    for i in range(50):
+        st.append('A', f'句子{i}。')
+    calls.clear()
+    st.append('A', '再来一句。')
+    assert calls == [], f'无窗口限制时不该调用 encode，实际 {len(calls)} 次'
+    assert st.overflow is False
+
+
+def test_finite_window_still_enforces_and_measures():
+    """负向对照：有限窗口**必须**照旧测量并裁剪（别把上面的优化做成了空开关）。"""
+    calls = []
+
+    def enc(s):
+        calls.append(s)
+        return list(s)
+
+    st = DialogueStream(enc, 30)
+    for i in range(20):
+        st.append('A', f'句子{i}。')
+    assert calls, '有限窗口必须测量'
+    assert st.dropped > 0
+    assert st.context_len() <= st.window or st.overflow
+
+
 def test_group_turns_option():
     """默认 `group_turns=True`：同一说话人的连续句子渲染成一行（内部仍按句存，便于滑窗）。"""
     grouped = make()

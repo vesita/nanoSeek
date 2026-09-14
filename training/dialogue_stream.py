@@ -83,6 +83,13 @@ TURN_CUE_ID = 140
 EOS = '<eos>'            # 轮末终止符（保留；`<cont>` 已退休）
 EOS_ID = 128
 
+# 视作「不裁剪」的窗口阈值。★ 为什么需要它：`enforce_window()` 每次 append 都要
+# encode 整份日志来量长度。窗口正常（256）时日志被裁到 ≤ window，量一次是常数级；
+# 但**无限窗口**下日志一直长 ⇒ 每次 append 都是 O(n) ⇒ 整份语料解析是 **O(n²)**
+# （2026-09-14 实测：parsing 一份 10 万字符的语料把验证脚本跑到 60s 超时被杀）。
+# ⇒ 无穷窗口直接跳过测量（语义上也对：不裁剪就不必量）。
+_NO_WINDOW_LIMIT = 10 ** 8
+
 Entry = Tuple[str, str]  # (speaker, sentence)
 
 
@@ -212,8 +219,13 @@ class DialogueStream:
         """从头部弹出**整句**，直到模型输入（日志 + 末尾 `<resp>`）放得进窗口。
 
         - 只在**句子边界**弹 ⇒ 永远不会留下半句；
-        - 至少保留 1 句 ⇒ 单句超窗时不死循环，而是置 `overflow=True`（软上限）。
+        - 至少保留 1 句 ⇒ 单句超窗时不死循环，而是置 `overflow=True`（软上限）；
+        - **窗口视作无限时直接返回**，不做任何测量（否则解析整份语料是 O(n²)，见
+          `_NO_WINDOW_LIMIT` 的注释）。
         """
+        if self.window >= _NO_WINDOW_LIMIT:
+            self.overflow = False
+            return
         while len(self._entries) > 1 and self.context_len() > self.window:
             self._entries.pop(0)
             self.dropped += 1
