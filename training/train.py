@@ -61,6 +61,7 @@ except Exception:
 from model import GPTConfig, GPT
 from model.config_loader import load_config
 from training.masking import build_assistant_mask as _build_assistant_mask
+from training.masking import build_resp_span_mask as _build_resp_span_mask
 # 纯函数抽到 training/schedules.py：本文件是模块级脚本（import 即开训），
 # 写在里面的函数无法被 pytest 覆盖。这里只做「读全局 → 转调纯函数」。
 from training.schedules import lr_at as _lr_at, pick_bin_names
@@ -221,6 +222,13 @@ z_loss_weight = 0.0          # Router Z-Loss 权重；0 = 关闭，建议 1e-4 �
 gradient_checkpointing = False  # 梯度检查点：block 级重算，压降 65%~75% 激活显存（100M 模型 8GB 卡必开）
 # --- loss masking（chat 微调惯例：只对 assistant 回复算 loss）---
 use_loss_masking = True      # False = 全部 token 参与训练（非对话语料）
+# mask 规则（2026-09-14 新增，实现见 training/masking.py）：
+#   'eos_line'  = 行内含 <eos>/<cont> ⇒ **整行**算 loss（既有行为，逐位不变）
+#   'resp_span' = `<resp>` 之后 → 对应 `<eos>`（含）算 loss（**不含 <resp>**）
+#                 —— 「单流 + <resp>」格式（training/dialogue_stream.py）用这个
+# ★★ 必须定义在下面 config_keys 快照**之前**（铁律 8），否则 yaml 里设了会被静默改回默认。
+mask_mode = 'eos_line'
+mask_resp_ids = []
 # 去标签 masking（dev-notes/61）：按回复终止符 <eos>/<cont> 定位模型回复行。
 # 默认空 = 按模式分支（char/byte）解析；找不到标记会全部 mask → loss NaN（有防护）。
 mask_reply_ids = []
@@ -313,7 +321,13 @@ if char_level:
     _cv = _Tok.from_file(os.path.join('data', dataset, 'char_tokenizer.json')).get_vocab()
     # 去标签 masking（dev-notes/61）：数据不再用「用户：/模型：」标签，改由每条模型回复
     # 后的终止符 <eos>/<cont> 定位回复行（新三区词表：<eos>=117, <cont>=119）。
-    mask_reply_ids = [_cv['<eos>'], _cv['<cont>']]
+    if mask_mode == 'resp_span':
+        # resp_span 的真正判定用 <resp>/<eos>；mask_reply_ids 这里只服务"窗口非空"打包判据
+        #（窗口内含 <eos> ⟺ 该窗口有有效 token，这条在 resp_span 下依然成立）。
+        mask_reply_ids = [_cv['<eos>']]
+        mask_resp_ids = [_cv['<resp>']]
+    else:
+        mask_reply_ids = [_cv['<eos>'], _cv['<cont>']]
     mask_sep_ids = [_cv['\n'], _cv['\n']]
 # 字节直入模式联动（--byte-level=true）：中文每字 3 字节 → block 放大保持有效上下文；
 # vocab_size 由 meta_byte.pkl（257）提供。CSA 参数作用于**聚合后**的 token（1 聚合=1 字），
@@ -437,8 +451,14 @@ if use_doc_packing:
         print(f"  .off sha256[{_split}] = {_h}")
 
 def build_assistant_mask(y):
-    """(B, T) bool mask 的薄包装：标记 id 来自配置，实现见 training/masking.py。
-    去标签版（dev-notes/61）：用 <eos>/<cont> 终止符定位模型回复行。"""
+    """(B, T) bool mask 的薄包装：规则与标记 id 都来自配置，实现见 `training/masking.py`。
+
+    - `mask_mode='eos_line'`（默认）：token 所在行内含 `<eos>/<cont>` ⇒ **整行**算 loss；
+    - `mask_mode='resp_span'`：`<resp>` 之后 → 对应 `<eos>`（含）算 loss
+      （**不含 `<resp>` 本身** —— 它是 harness 喂的，模型不该生成它）。
+    """
+    if mask_mode == 'resp_span':
+        return _build_resp_span_mask(y, mask_resp_ids, mask_reply_ids)
     return _build_assistant_mask(y, mask_reply_ids, mask_sep_ids)
 
 

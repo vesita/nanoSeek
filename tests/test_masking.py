@@ -12,12 +12,13 @@
 2. 随机对照：用一份朴素的 Python 参考实现跑 300 组随机输入，逐位对齐。
    向量化实现（cummin + flip）非常容易写错边界，随机对照才能覆盖到。
 """
+import itertools
 import random
 
 import pytest
 import torch
 
-from training.masking import build_assistant_mask
+from training.masking import build_assistant_mask, build_resp_span_mask
 
 NL = 0        # 换行
 EOS = 128     # <eos> 收尾
@@ -239,3 +240,261 @@ def test_documented_terminator_ids_match_real_tokenizer():
     ids = dict(vocab) if isinstance(vocab, dict) else {t: i for t, i in vocab}
     assert ids.get('<eos>') == EOS, f"<eos> 实际是 {ids.get('<eos>')}，文档写的是 {EOS}"
     assert ids.get('<cont>') == CONT, f"<cont> 实际是 {ids.get('<cont>')}，文档写的是 {CONT}"
+
+
+# ==========================================================================
+# 4) build_resp_span_mask：「单流 + <resp>」格式的精确掩码（2026-09-14 新增）
+# ==========================================================================
+# 规则：**`<resp>` 之后 → 对应 `<eos>`（含）** 算 loss。与 build_assistant_mask
+#（行内含终止符 ⇒ 整行）的唯一区别是**不含 `<resp>` 本身** —— 它是 harness 喂的，
+# 模型不该生成它。见 training/dialogue_stream.py::loss_token_spans。
+RESP = 140
+TOPIC = 141
+RESP_IDS = (RESP,)
+EOS_IDS = (EOS,)
+
+
+def _ref_resp_mask(rows, resp_ids=RESP_IDS, eos_ids=EOS_IDS):
+    """朴素参考实现：**逐字照抄** `masking.py::build_resp_span_mask` docstring 里的
+    四条判据，O(n²) 但 n≤24，只求"肉眼可核对"。
+
+    ⚠ **别"顺手优化"成一次扫描的状态机。** 第一版就是这么写的，而它错了：
+    状态机在遇到 `<resp>` 时立刻开始给后续 token 打标，**根本不知道 `<eos>` 会不会来**，
+    于是在**未闭合**的 `<resp>` 上会把尾巴整段标成 True
+    （例：`<resp>a<eos><resp>b` ⇒ 它给 `b` 打标，实现正确答案是 False）。
+    那次是**参考写错了，不是实现错** —— 消融时先怀疑参考。
+    """
+    out = []
+    for row in rows:
+        n = len(row)
+        m = [False] * n
+        for t in range(n):
+            # 判据 1+2：t 之前存在 `<resp>`（prev_resp < t 由 j in range(t) 保证）
+            prev_resp = -1
+            for j in range(t):
+                if row[j] in resp_ids:
+                    prev_resp = j
+            if prev_resp < 0:
+                continue
+            # 判据 3：自那个 `<resp>` 之后（严格早于 t）还没遇到 `<eos>`
+            prev_eos = -1
+            for j in range(t):
+                if row[j] in eos_ids:
+                    prev_eos = j
+            if prev_eos > prev_resp:
+                continue
+            # 判据 4：t 之后（含 t）存在 `<eos>` —— 没闭合的回复整段不算
+            next_eos = n
+            for j in range(t, n):
+                if row[j] in eos_ids:
+                    next_eos = j
+                    break
+            if next_eos >= n:
+                continue
+            m[t] = True
+        out.append(m)
+    return out
+
+
+def _check_resp(rows):
+    rows = _pad_nl(rows)
+    y = torch.tensor(rows, dtype=torch.long)
+    got = build_resp_span_mask(y, RESP_IDS, EOS_IDS)
+    exp = torch.tensor(_ref_resp_mask(rows), dtype=torch.bool)
+    assert got.shape == y.shape and got.dtype == torch.bool
+    if not torch.equal(got, exp):
+        # ⚠ 只打印**第一处不一致的行** —— 400 行批处理时整表 dump 会把日志淹没
+        #   （实测一次失败吐了 14KB，把真正的信息挤没了）。
+        bad = (got != exp).any(dim=1).nonzero().flatten().tolist()
+        i = bad[0]
+        cols = (got[i] != exp[i]).nonzero().flatten().tolist()
+        raise AssertionError(
+            f"{len(bad)}/{len(rows)} 行与参考实现不一致；第一处 row[{i}]：\n"
+            f"  y   ={rows[i]}\n"
+            f"  got ={got[i].tolist()}\n"
+            f"  exp ={exp[i].tolist()}\n"
+            f"  不一致列={cols}")
+
+
+def _authority_spans(ids, cue=RESP_IDS, eos=EOS_IDS):
+    """`DialogueStream.loss_token_spans()` 的算法逐字复刻（顺序扫描）。
+
+    ★ 这是 loss 口径的**权威定义**：`build_resp_span_mask` 只是它的向量化实现，
+    两者必须对**所有**输入给出同一个 mask（含相邻 `<resp>` 这种退化输入）。
+    """
+    out = []
+    i = 0
+    while i < len(ids):
+        if tuple(ids[i:i + len(cue)]) == tuple(cue):
+            k = i + len(cue)
+            while k < len(ids) and tuple(ids[k:k + len(eos)]) != tuple(eos):
+                k += 1
+            if k < len(ids):
+                out.append((i + len(cue), k + len(eos)))
+                i = k + len(eos)
+                continue
+        i += 1
+    return out
+
+
+def _ref_from_spans(rows, cue=RESP_IDS, eos=EOS_IDS):
+    out = []
+    for row in rows:
+        m = [False] * len(row)
+        for a, b in _authority_spans(row, cue, eos):
+            for j in range(a, b):
+                m[j] = True
+        out.append(m)
+    return out
+
+
+def test_resp_span_excludes_resp_but_includes_the_rest():
+    """★ 核心契约：`<resp>你好。<eos>` ⇒ `<resp>` **不算**，正文与 `<eos>` 算。"""
+    y = torch.tensor([[RESP, 5, 6, EOS, NL]])
+    m = build_resp_span_mask(y, RESP_IDS, EOS_IDS)
+    assert m.tolist() == [[False, True, True, True, False]]
+
+
+# 穷举用的短行字母表（含 `<topic>`：它落在区间内要算 loss）
+_ALPHA = (NL, EOS, RESP, TOPIC, 7)
+
+
+def test_resp_span_two_references_agree_exhaustively():
+    """两个**独立写法**的参考实现，在全部长度 ≤7 的短行上必须逐位一致。
+
+    四判据版（`_ref_resp_mask`）和权威顺序扫描版（`_ref_from_spans`）是两条不同的
+    思路；它们互相钉住，才不会出现"参考实现只是把被测实现换个写法抄一遍"的空对照。
+    """
+    for L in range(1, 8):
+        for row in itertools.product(_ALPHA, repeat=L):
+            row = list(row)
+            a = _ref_resp_mask([row])[0]
+            b = _ref_from_spans([row])[0]
+            assert a == b, f"两个参考在 row={row} 上分歧：四判据={a} 权威={b}"
+    # 顺带把**实现**也穷举一遍（L≤6，15625 行一次过批处理）——随机对照会漏掉
+    # 概率极低的组合（相邻 cue 就是这么漏掉的，随机种子里 400 行没抽到）。
+    rows = _pad_nl([list(r) for L in range(1, 7)
+                    for r in itertools.product(_ALPHA, repeat=L)])
+    y = torch.tensor(rows, dtype=torch.long)
+    got = build_resp_span_mask(y, RESP_IDS, EOS_IDS)
+    exp = torch.tensor(_ref_from_spans(rows), dtype=torch.bool)
+    bad = (got != exp).any(dim=1).nonzero().flatten().tolist()
+    assert not bad, (f"{len(bad)} 行不一致，第一处 row={rows[bad[0]]}\n"
+                     f"  got={got[bad[0]].tolist()}\n  权威={exp[bad[0]].tolist()}")
+
+
+def test_resp_span_consecutive_cue_matches_authority():
+    """★ **相邻 `<resp>`** ⇒ 第二个 `<resp>` **算 loss**（`[F,T,T]`，不是 `[F,F,T]`）。
+
+    权威定义 `DialogueStream.loss_token_spans` 是顺序扫描：第一个 `<resp>` 的扫描
+    一路找到 `<eos>`，中间那个 `<resp>` 只是**正文**（它不是 `<eos>`），于是落进区间。
+    第一版向量化实现用"含自身"的 `prev_resp` + `prev_resp < t` 来实现"cue 自身不算"，
+    在相邻 cue 上就分叉了（它给 `[F,F,T]`）—— **这次是实现的错，不是参考的错**。
+
+    真实流里 `append/commit` 不会产出相邻 cue，所以这是**口径一致性**测试而非行为测试；
+    留着它是因为"两条路径换一个输入就分叉"正是最该被钉住的一类 bug。
+    """
+    for row in ([RESP, RESP, EOS],
+                [RESP, RESP, 5, EOS],
+                [RESP, RESP, RESP, 5, EOS],
+                [RESP, RESP, 5, EOS, NL, RESP, 6]):
+        got = build_resp_span_mask(torch.tensor([row]), RESP_IDS, EOS_IDS)[0].tolist()
+        exp = _ref_from_spans([row])[0]
+        assert got == exp, f"row={row}\n  got={got}\n  权威={exp}"
+    # 把关键那一格写死，防止两个参考被同时改错
+    assert build_resp_span_mask(torch.tensor([[RESP, RESP, EOS]]),
+                                RESP_IDS, EOS_IDS)[0].tolist() == [False, True, True]
+
+
+def test_resp_span_vs_eos_line_only_differ_on_resp():
+    """★★ **负向对照**：两种模式的差异**恰好只**在 `<resp>` 上。
+
+    这条同时证明：① 新规则确实修掉了"把 `<resp>` 算进 loss"；② 其余位置两者一致
+    （否则就不是"修一处"，而是换了口径）。
+    """
+    y = torch.tensor([[RESP, 5, 6, EOS, NL, 9, 9, NL, RESP, 7, EOS]])
+    old = build_assistant_mask(y, (EOS, CONT), SEP)
+    new = build_resp_span_mask(y, RESP_IDS, EOS_IDS)
+    assert old.tolist()[0] == [True, True, True, True, False, False, False, False, True, True, True]
+    assert new.tolist()[0] == [False, True, True, True, False, False, False, False, False, True, True]
+    # ⚠ `old != new` 形状是 (B, T)，`.nonzero()` 返回的是**行/列下标对**，
+    #   直接 flatten 会得到 [0,0,0,8]（[[0,0],[0,8]] 展平）而不是 [0,8]。
+    #   这里只关心第 0 行的列下标。
+    diff = (old != new)[0].nonzero().flatten().tolist()
+    assert diff == [0, 8], f'差异应只在下标 0/8（两个 <resp>），实际 {diff}'
+
+
+def test_resp_span_user_line_excluded():
+    """用户行（没有 `<resp>`）整行排除 —— 即使在两轮模型回复之间。"""
+    _check_resp([[RESP, 1, EOS, NL, 10, 11, NL, RESP, 2, EOS]])
+
+
+def test_resp_span_without_closing_eos_counts_nothing():
+    """没有闭合的 `<eos>` ⇒ 整段不算 loss（防半截回复）。"""
+    y = torch.tensor([[RESP, 5, 6, NL, RESP, 7]])
+    assert not build_resp_span_mask(y, RESP_IDS, EOS_IDS).any()
+
+
+def test_resp_span_eos_without_resp_counts_nothing():
+    y = torch.tensor([[5, 6, EOS, NL]])
+    assert not build_resp_span_mask(y, RESP_IDS, EOS_IDS).any()
+
+
+def test_resp_span_topic_inside_the_span_is_counted():
+    """`<topic>` 落在区间内 ⇒ 算 loss（模型要学会自己输出它）。"""
+    y = torch.tensor([[RESP, TOPIC, 5, EOS, NL]])
+    assert build_resp_span_mask(y, RESP_IDS, EOS_IDS).tolist() == [[False, True, True, True, False]]
+
+
+def test_resp_span_empty_line_reply():
+    """`<resp><eos>`（空回复）⇒ 只有 `<eos>` 算 loss。"""
+    y = torch.tensor([[RESP, EOS, NL]])
+    assert build_resp_span_mask(y, RESP_IDS, EOS_IDS).tolist() == [[False, True, False]]
+
+
+def test_resp_span_degenerate_inputs():
+    assert build_resp_span_mask(torch.zeros((3, 0), dtype=torch.long), RESP_IDS, EOS_IDS).shape == (3, 0)
+    assert build_resp_span_mask(torch.zeros((0, 5), dtype=torch.long), RESP_IDS, EOS_IDS).shape == (0, 5)
+    _check_resp([[RESP]])
+    _check_resp([[EOS]])
+    _check_resp([[NL]])
+
+
+def test_resp_span_ignores_none_ids():
+    y = torch.tensor([[RESP, 1, EOS]])
+    assert torch.equal(build_resp_span_mask(y, (None, RESP), EOS_IDS),
+                       build_resp_span_mask(y, RESP_IDS, EOS_IDS))
+
+
+def test_resp_span_random_rows_match_reference():
+    """400 组随机行逐位对齐参考实现（顺带覆盖 `<topic>`、连续 resp、空行）。"""
+    rng = random.Random(20260914)
+    rows = []
+    for _ in range(400):
+        row = []
+        for _ in range(rng.randint(1, 24)):
+            r = rng.random()
+            if r < 0.25:
+                row.append(NL)
+            elif r < 0.35:
+                row.append(EOS)
+            elif r < 0.45:
+                row.append(RESP)
+            elif r < 0.50:
+                row.append(TOPIC)
+            else:
+                row.append(rng.randint(1, 200))
+        rows.append(row)
+    _check_resp(rows)
+
+
+def test_resp_span_batch_is_row_independent():
+    """批内各行独立（抓 cummax/cummin 沿错维度这类只在 B>1 暴露的 bug）。"""
+    rng = random.Random(11)
+    rows = _pad_nl([[rng.choice([NL, EOS, RESP, TOPIC, rng.randint(1, 50)])
+                     for _ in range(rng.randint(1, 20))] for _ in range(12)])
+    y = torch.tensor(rows, dtype=torch.long)
+    batch = build_resp_span_mask(y, RESP_IDS, EOS_IDS)
+    for i, row in enumerate(rows):
+        one = build_resp_span_mask(torch.tensor([row], dtype=torch.long), RESP_IDS, EOS_IDS)[0]
+        assert torch.equal(batch[i], one), f"第 {i} 行批处理与单行不一致"
