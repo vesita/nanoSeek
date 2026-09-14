@@ -314,6 +314,33 @@ v1 约定 —— **同一类缺陷有几个入口，就得逐个改**，改一�
 loss/val 曲线完全正常（1/14000 步的差异测不出来）⇒ 单测与曲线都不会报警，
 只有人读日志时数着"怎么是 4 步"才会发现。
 
+### 1.15 NDB 从 9 个模块收敛到 2 个（2026-09-15）
+
+**背景**：`model/` 下曾同时躺着 9 个 NDB 相关模块，其中 7 个是已被实测淘汰的路线。
+它们会让下一个人（和 AI）读错方向 —— 实测代价就是：我按文档把 `ngram_ndb.py` 判成
+"已被取代"，于是说错了"当前 NDB 是灌注、写门控是死的"，**而真正可学写的那个就在旁边**。
+
+**保留的两个**（`model/` 下与 NDB 有关的**只有**这两个）：
+
+| 模块 | 是什么 |
+|---|---|
+| `model/ngram_ndb.py` | **可读可写的 NDB，读写策略都由模型自己学**。`w_t=σ(W_w·h)` 写门控 + `g_t=σ(W_r·[h;槽统计量;w_t])` 读门控 + `softmax(level_weight)` 多级混合；表是 no_grad 的 token 计数，不进 `state_dict`。**`w_t` 进 `read_gate` 输入 ⇒ `∂L/∂W_w ≠ 0`**（实测 grad=0.0134，`tests/test_ngram_ndb.py:292` 钉着） |
+| `model/memory_cross_attn.py` | **神经元级长程读接口**（RETRO-lite）。读侧实测最强（共训 Δ=−0.0738）；写侧 `write_online` 是**规则式种子写**（人给的惊讶分位），不是模型决定 |
+
+**删除的 7 个**（连同 `GPTConfig` 的 6 个旧字段、`Block` 的挂载点、`train.py` 的 GC/导出例程、
+`gpt.py` 的参数分组子句一起清掉）：
+`neural_db.py`（旧 PK-NDB，values 参与梯度 ⇒ 撑爆 8G 卡）、`residual_neural_db.py`（Δ→−0.0002）、
+`product_key_memory.py`、`neuron_db.py`（v5）、`neuron_db_mix.py`、`external_memory.py`、
+`interface_network.py`。删除历史见提交信息与 `git log --diff-filter=D`。
+
+**验收**（全绿）：pytest / ruff；`--init_from=scratch` **和** 真 warm start
+（`out/base_v3_dlg/last.pt`）各 2 步冒烟均 `exit 0`、`参数量 75.15M`；
+确认 `out/base_v2/last.pt`、`out/base_v3_persona/` 未被触碰（冒烟走 `/tmp`）。
+
+⚠ **`local/` 下约 10 个一次性脚本会 ImportError**（它们 import 了被删模块）。
+`local/` 是 gitignore 的本机杂物间，不是交付物；需要那些脚本时用
+`git log --diff-filter=D` 取回对应模块即可。
+
 ---
 
 ## 2. 待还的债（按「代价 ÷ 修复成本」排序）

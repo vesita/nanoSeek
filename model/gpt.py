@@ -338,9 +338,8 @@ class GPT(nn.Module):
             split_heads = {}   # GLM-5 Muon Split：id(p) → (n_heads, head_first)
             for n, p in param_dict.items():
                 if (n.startswith('transformer.wte') or n.startswith('lm_head')
-                        or n.startswith('byte_emb') or n.startswith('byte_unagg')
-                        or 'neural_db' in n):
-                    adamw_decay.append(p)   # 嵌入/输出头/神经数据库稀疏槽位走 AdamW，不进 Muon 正交化
+                        or n.startswith('byte_emb') or n.startswith('byte_unagg')):
+                    adamw_decay.append(p)   # 嵌入/输出头走 AdamW，不进 Muon 正交化
                 elif p.dim() < 2:
                     adamw_nodecay.append(p) # norm/bias
                 elif p.dim() > 2:

@@ -187,11 +187,6 @@ kv_memory_output_gate = False         # KV 记忆输出门控 (Output Gate) + �
 sample_boundary_reset = True          # 样本边界重置与因果阻断：遇到 <eos> 时清空记忆黑板并阻断滑窗跨样本注意
 # --- V4 结构设计升级（实验性，默认全关）---
 use_attn_sink = True         # Attention Sinks：打破重复坍缩的必要条件（三重 A/B 验证）
-use_neural_db = False        # 神经网络数据库全局开关 (PK-NDB)
-neural_db_layer = 6          # 挂载层数：默认第 6 层（中枢语义层）
-neural_db_sub_keys = 512     # 子空间键数量：512*512 = 262,144 槽位
-neural_db_top_k = 32         # 稀疏检索 Top-K
-neural_db_gc_interval = 200  # 自动淘汰与复活周期步数
 use_mhc = False              # mHC 超连接：4 流并行残差
 hc_mult = 4                  # mHC 残差流数（V4 原版 = 4）
 use_lightning_indexer = False   # 学习型块选择替代 CSA raw top-k
@@ -604,9 +599,6 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   kv_memory_output_gate=kv_memory_output_gate, sample_boundary_reset=sample_boundary_reset,
                   use_csa_fused_qkv=use_csa_fused_qkv, use_csa_bmm=use_csa_bmm,
                   use_attn_sink=use_attn_sink,
-                  use_neural_db=use_neural_db, neural_db_layer=neural_db_layer,
-                  neural_db_sub_keys=neural_db_sub_keys, neural_db_top_k=neural_db_top_k,
-                  neural_db_gc_interval=neural_db_gc_interval,
                   use_mhc=use_mhc, hc_mult=hc_mult,
                   use_lightning_indexer=use_lightning_indexer, num_hash_layers=num_hash_layers,
                   block_order=block_order, no_attn_layers=no_attn_layers,
@@ -1380,16 +1372,6 @@ while True:
                 except Exception as _e:  # 清理是尽力而为，绝不能有能力搞崩训练
                     pbar.write(f"⚠ 归档清理跳过：{type(_e).__name__}: {_e}")
 
-            # 神经网络数据库 GC 例程：逢 gc_interval（默认 200 步）触发一次僵尸槽位清理与变异复活
-            if getattr(config, 'use_neural_db', False) and iter_num > 0:
-                gc_int = getattr(config, 'neural_db_gc_interval', 200)
-                if iter_num % gc_int == 0:
-                    for block in getattr(raw_model.transformer, 'h', []):
-                        if getattr(block, 'has_neural_db', False) and block.neural_db is not None:
-                            gc_stats = block.neural_db.purge_and_revive()
-                            pbar.write(f"  🧹 神经数据库 GC: 活跃槽位 {gc_stats['total_slots'] - gc_stats['dead_slots']}/{gc_stats['total_slots']} | "
-                                       f"重置僵尸槽位 {gc_stats['dead_slots']} (均值使用率 {gc_stats['avg_usage']:.5f})")
-
             if is_best:
                 save_checkpoint_async(checkpoint, os.path.join(out_dir, 'best.pt'))
                 pbar.write(f"✓ 新最佳 val {best_val_loss:.4f} → best.pt（并已更新 last.pt）")
@@ -1624,19 +1606,6 @@ if master_process:
         print(f"训练完成：{iter_num} 步（达 max_iters {max_iters}）")
     print(f"  最终 best_val_loss {best_val_loss:.4f} · 总耗时 {time.time()-train_start:.1f}s")
 join_save_threads()
-# 神经网络数据库：训练结束导出独立 db.pt（可移植模块，供跨 checkpoint/跨模型迁移）
-if master_process and getattr(config, 'use_neural_db', False):
-    _exported = False
-    for _block in getattr(raw_model.transformer, 'h', []):
-        if getattr(_block, 'has_neural_db', False) and _block.neural_db is not None:
-            try:
-                _db_path = os.path.join(out_dir, 'neural_db.pt')
-                _block.neural_db.save_db(_db_path)
-                if not _exported:
-                    print(f"  神经数据库已导出（可移植）→ {_db_path}")
-                _exported = True
-            except Exception as _e:
-                print(f"  ⚠ 神经数据库导出失败（不影响主训练）: {type(_e).__name__}: {str(_e)[:80]}")
 if results_csv is not None:
     results_csv.close()
 if health_csv is not None:

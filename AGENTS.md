@@ -30,23 +30,21 @@
     ⚠ 报告含生成正文 ⇒ 放仓库外 `~/datasets/persona/reports/`，**别写进 `analysis/`**。
     ★ 采样/评估入口对单流格式**还没有一等支持**（`sample_py` 删尾部 `<eos>` + `decode`
     吞机制符；两个 eval 入口缺单流 `--style`）⇒ 见 `TECH_DEBT §2` P1。
-    ⏭ **Step B（未做）**：把**在线写** NDB 接进 `train.py`（现在**调用数是 0**，`out/mem_store/` 空）。
-    ★ `MemoryCrossAttention` 已补 `write_online`（可学习写门控 + 环形库，提交 `2d1df80`）—— 即把
-    `model/ngram_ndb.py`（v7）那套「模型自己决定写」的机制**移植到神经元级载体**上。
-    ⚠ **不许再写「v7 / TDB 是用户否决的灌注路线」**——那是提交 `1e0c121`（2026-09-14）的**误归因**，
-    已于 2026-09-15 更正（见 `PROJECT_STATE §6 的 ★ 更正`）。真相：`dev-notes/79 §7` 说两者**互补**
-    （TDB 管局部续写、长程 NDB 管跨窗依赖）；v7 缺的是**在线数字**（A/B 从未跑过），不是被否决。
-    ★★ **2026-09-15 复核发现更严重的一件事：整个「NDB 共训」站在主文档里丢了。**
-    **`analysis/NDB_cotrain_STATE_2026-09-10.md`（原件 471 行，已从 gitignore 的 `out/` 里抢救进仓库）**
-    记着全项目最硬的 NDB 结果 —— **共训 Δ=−0.0738（step 19000）= 冻结基线 −0.0348 的 2.1×**，
-    Δ_held/Δ=0.82（可迁移读策略），Δ_rand 强正（确实在读内容）；
-    另有**检索鲁棒性悬崖**（10% 检索错 → 废掉 65% 收益；25% 错 → 净有害），
-    **修法 `ndb_att_sim` λ=2 已在代码里、探针验过、但从未在训练里跑过**。
-    该 run 被用户停在 19781 去跑 pilot，**pilot 没跑完**（`pilot_sim` 6 分钟即死、CSV 全 0 字节），
-    **制品全删**（`out/base_probe/`、`out/mem_store/` 都空了）⇒ **它是"做了一半被丢下"，不是"被否定"**。
-    ⇒ **谈 NDB 前先读 `PROJECT_STATE §6.0`**（完整复核在 **`dev-notes/80-NDB共训站丢失事故与方向纠偏.md`**）；
-    **结论只能来自跑完且有产物的实验**。★ **一手证据不许只放在 gitignore 的目录（`out/`）里 —— 那等于没写。**
-    下一步要做的是**「有写 / 无写」A-B 对照**，且**别再用"换更大的库"当解法**（5M≡10M，容量不是瓶颈）。
+    ⏭ **Step B（未做）**：把 NDB 的**写**接进 `train.py`（现在写入调用数是 0，`out/mem_store/` 空）。
+    ★★ **本项目的 NDB 是"外挂"**（forward hook + `ndb_store`），**不进 `GPTConfig` / `Block`** ——
+    `model/` 下与 NDB 有关的只有两个模块，先认清再动手：
+    | 模块 | 它是什么 | 采用的口径 |
+    |---|---|---|
+    | **`model/ngram_ndb.py`** | **可读可写的 NDB：读写策略都由模型自己学** | `w_t=σ(W_w·h)` 写门控 + `g_t=σ(W_r·[h;槽统计量;w_t])` 读门控 + `softmax(level_weight)` 多级混合；表是 no_grad 的 token 计数（不进 `state_dict` ⇒ 不增模型体积）。**`w_t` 进 `read_gate` 的输入 ⇒ `∂L/∂W_w ≠ 0`**（`ngram_ndb.py:384/:422/:427`，`tests/test_ngram_ndb.py:292` 钉着） |
+    | **`model/memory_cross_attn.py`** | **神经元级长程读接口**（RETRO-lite：chunk 均值库 + cross-attention） | 读侧是本项目测过的最强结果（共训 **Δ=−0.0738**）；写侧 `write_online` 是**规则式种子写**（人给的惊讶分位 `quantile`），**不是模型决定** |
+    ★ 两条路线的关系（`dev-notes/79 §7`）：**TDB 管局部续写、长程 NDB 管跨窗依赖，互补不替代**。
+    ★ NDB 已有的实测结论（都在 `analysis/NDB_cotrain_STATE_2026-09-10.md` / `PROJECT_STATE §6.0`）：
+    **共训 Δ=−0.0738（step 19000）= 冻结基线 −0.0348 的 2.1×**，`Δ_held/Δ=0.82`（可迁移读策略）；
+    头号风险是**检索鲁棒性悬崖**（10% 检索错 → 废掉 65% 收益；25% 错 → 净有害），
+    修法 `ndb_att_sim` λ=2 已在代码里、探针验过、**尚未在训练里跑过**；
+    **库大小不是瓶颈**（5M≡10M）。
+    ★ **一手证据一律放被 git 跟踪的路径**（`analysis/` / `dev-notes/`）——
+    `out/` 在 `.gitignore` 里，放那里的记录等于没写。
 1. **B 段对话专修已跑完（2026-09-14 13:28）** —— 单元 `nanoseek-v3-dlg`（`Result=success`，
    14000/14000 步，12:59:55，`NRestarts=0`），配置 `configs/base_v3_dlg.yaml`，
    warm start 自 `out/base_v2/last.pt`（step **61000**）。产物在 `out/base_v3_dlg/`
@@ -479,7 +477,8 @@ CE 只吃 token，不受标签格式影响，是更硬的证据。
 configs/            训练配置（base_v2.yaml = 基座；base_v3_persona.yaml = **当前站**；base_v3_{know,dlg}.yaml = 前两站；★ 必须放在 out_dir 之外）
 training/train.py   ★ 1473 行的模块级脚本 —— import 它就等于开始训练，不能单测
 training/           已抽出的纯函数模块（schedules / masking / checkpoints / run_logs / diag）
-model/              模型与组件（gpt.py / ngram_ndb.py 是 NDB 原型）
+model/              模型与组件（NDB 只有两个模块：ngram_ndb.py = 可读可写、读写都由模型学；
+                    memory_cross_attn.py = 神经元级长程读接口）
 scripts/            运维脚本（watch.sh、探针、清理、cleanup_out.py）
 inference/          推理/评估/采样（评估入口都在这）
 tests/              单测（含 lint 门禁）；改代码后必跑
@@ -526,7 +525,7 @@ dev-notes/          历史实验记录（编号笔记，写新结论时接着编
 
 **维护本页的两条约束**：
 - **预算 65536 字节**（harness 的 `maxBytes`），超了会**从宽泛的文件开始省略**。
-  ★ **2026-09-15 实测：本页已 49,728 字节 = 预算的 76%**（原文写"约 16~17 KB、不到三成"，
+  ★ **2026-09-15 实测：本页已 49,672 字节 = 预算的 76%**（原文写"约 16~17 KB、不到三成"，
   早已过期）。**余量只剩 ~15.8 KB**，所以新增内容要先想"能不能并进已有条目"，
   别再当成"随便写"。**状态与数字**（step 数、val、磁盘）一律放
   `PROJECT_STATE.md` —— 写在本页会立刻过期，而过期的指令比没有指令更危险。

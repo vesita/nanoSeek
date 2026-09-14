@@ -1139,14 +1139,14 @@ NDB 这种不基于上下文的预设）。B 段（`v3_dlg`）练出的是**对�
   ⇒ **`results.csv` 口径与 ckpt 编号都不变**（冒烟实测修前 3 步 / 修后 2 步）。
   闸门 `tests/test_training_loop.py`（AST 读源码 + 手写旧/新形状的已知答案对照）。
   ⚠ **历史 run 的记账要减 1 步**：B 段标称 14000 步，实际优化器步是 **14001**（修前）。
-- **Step B（未做，`train.py` **没有** NDB 写入）**：当前**在线写 NDB 的调用是 0 个**
-  （`out/mem_store/` 为空）。⚠ 本节曾写「现成的 `MemoryCrossAttention` 是**预构建库只读**
-  （= 用户否决过的"灌注"路线）」—— **该归因已作废**（见 §6 的 ★ 更正，2026-09-15），
-  且该模块**已补 `write_online`**（可学习写门控 `σ(W_w·h)` + 环形库，提交 `2d1df80`）。
-  仓库里另有一条**独立实现过**的在线写：`model/ngram_ndb.py`（v7 的 `write_enabled()`），
-  以及更早的 `local/train_residual_db_hidden.py:220`（`r_db.write_from_logits(...)` +
-  `model/residual_neural_db.py:240`）。
-  ⇒ 要做的是把在线写接进 `train.py`，然后跑 **有写 / 无写** 的 A-B 对照。
+- **Step B（未做，`train.py` **没有** NDB 写入）**：当前**在线写的调用是 0 个**
+  （`out/mem_store/` 为空）。`model/` 下与 NDB 有关的现在只有两个模块：
+  | 模块 | 是什么 | 采用的口径 |
+  |---|---|---|
+  | **`model/ngram_ndb.py`** | **可读可写的 NDB：读写策略都由模型自己学** | `w_t=σ(W_w·h)` 写门控 + `g_t=σ(W_r·[h;槽统计量;w_t])` 读门控 + `softmax(level_weight)` 多级混合；表是 no_grad 的 token 计数（不进 `state_dict` ⇒ 不增模型体积）。**`w_t` 进 `read_gate` 的输入 ⇒ `∂L/∂W_w ≠ 0`**（`ngram_ndb.py:384/:422/:427`，实测 `write_gate.weight.grad = 0.0134`，`tests/test_ngram_ndb.py:292` 钉着） |
+  | **`model/memory_cross_attn.py`** | **神经元级长程读接口**（RETRO-lite：chunk 均值库 + cross-attention） | 读侧是本项目测过的最强结果（共训 **Δ=−0.0738**）；写侧 `write_online` 是**规则式种子写**（人给的惊讶分位 `quantile`），**不是模型决定** |
+  ⇒ 要做的是把 `ngram_ndb` 的写接进 `train.py`（或把它的 `w_t → read_gate` 接线迁到神经元级载体上），
+  然后跑 **有写 / 无写** 的 A-B 对照。
   ★ **本次 Step A 冒烟没有带 NDB**（`configs/base_v3_persona.yaml` 里没有任何 `ndb_*`
   键，`ndb_store` 沿用 `base_v2` 的空值）—— 这是**有意的**，与"一步一步来"一致：
   先把单流格式的链路证明干净，再叠 NDB，否则出问题分不清是格式还是 NDB。
@@ -1662,9 +1662,12 @@ bash scripts/watch.sh
 > §10 第 3 条），它的 −0.0723 是**离线且跨预算**（268M 槽 ≈2.1GB vs ③ 的 10M token 预算）
 > ⇒ 依 §5.11 **不能**与 −0.0348 并排读。
 > ★★ **下一个人：不要说「v7 被否决」，要说「v7 的在线数字从未跑过」。**
-> ★ 2026-09-15 实际进展：`model/memory_cross_attn.py` 已补 `write_online`
-> （可学习写门控 `σ(W_w·h)` + 环形库，提交 `2d1df80`）—— **正是把 v7 的「模型自己决定写」
-> 机制移植到神经元级载体上**，两条线在此合流。
+> ★ 2026-09-15 实际进展 + **同日更正**：`model/memory_cross_attn.py` 补了 `write_online`
+> （环形库），但它是**规则式**的（人给的惊讶分位 `quantile`，即"灌注"的在线版）。
+> 同提交里那个 `write_gate` **无梯度路径 = 死参数**，**已删除**。
+> ⇒ **结论改了：两条线没有"合流"。** 「模型自己决定读写」的实现在 **`model/ngram_ndb.py`（v7）**，
+> 那里 `w_t` 进 `read_gate` 输入、`∂L/∂W_w ≠ 0`（实测 grad=0.0134，`tests/test_ngram_ndb.py:292`）。
+> 要把"模型自己决定写"搬到神经元级载体上，**移植的是那套接线，不是这个空壳**。
 
 ### 6.0 ★★ 被丢掉的一站：**NDB 共训 `out/ndb_run/`** —— 全项目最硬的 NDB 正面结果
 **来源：`out/ndb_run/STATE.md`（471 行，2026-09-10 维护；2026-09-14 21:31 被加了「已被本页取代」的头）。**
@@ -1861,8 +1864,8 @@ L = 8              槽位 M = 268M（约 2.1GB，本机 11GB 可用内存装得�
 值是**离散 token**（与 h 无关 → 不重蹈 §14.8）；库是**数据统计量**（不随基座收敛归零 → 不重蹈 §10）；
 用**计数累加**（不是梯度式槽更新 → 不重蹈 §8.4 的发散）。
 
-**已有代码雏形**：`model/residual_neural_db.py:210 read_knn`、`model/product_key_memory.py:106 token_ids`
-buffer、`local/ngram_memory_probe.py`、`local/ngram_sample_capacity.py`、`local/ngram_value_capacity.py`。
+**已有实现**：`model/ngram_ndb.py`（本页 §12，读写都由模型学）、
+`local/ngram_memory_probe.py`、`local/ngram_sample_capacity.py`、`local/ngram_value_capacity.py`。
 
 ### 6.6 ⚠ 一个必须正面处理的矛盾
 §14.1 记着用户判定：**"token 级 DB 与 harness 记忆工具无本质区别"**，于是转向神经元级。

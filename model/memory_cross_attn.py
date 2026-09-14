@@ -57,15 +57,12 @@ class MemoryCrossAttention(nn.Module):
         # 检索相关性增益 λ：把「条目与查询的余弦相似度 z 分数」加进注意力 logit。
         # 初值 0 = 起点等价于旧行为（逐位一致），由训练自己决定是否使用这条免费信息。
         self.sim_gain = nn.Parameter(torch.tensor(float(att_sim_gain)))
-        # ★ 可学习**写门控**（2026-09-15）：`σ(w·h + b)` 决定每个 chunk 要不要写进库。
-        #   为什么需要它：只按"惊讶分位"选，是**外部规则**在决定写什么，不是模型；
-        #   而 `model/ngram_ndb.py`（v7）里这条正是 `write_gate`，本项目已有先例。
-        #   ★ 它挂在 `self` 上 ⇒ 自动进 `ndb.parameters()`，
-        #     `train.py` 的 `ndb_opt`（AdamW，lr=ndb_lr）会训它，无需改训练脚本的优化器。
-        #   偏置初值 +1.0 ⇒ 起点 σ(1)≈0.73（先平均地写，和 v7 同一取法，便于对照）。
-        self.write_gate = nn.Linear(n_embd, 1, bias=True)
-        nn.init.zeros_(self.write_gate.weight)
-        nn.init.constant_(self.write_gate.bias, 1.0)
+        # ★ 本模块**没有**可学习写门控：`write_online` 是 `@torch.no_grad()` 的**规则式**写入
+        #   （人给的惊讶分位），写什么由规则定，不由模型定。
+        #   ⇒ **本项目采用的、由模型自己决定读写的 NDB 是 `model/ngram_ndb.py`**：
+        #     `w_t = σ(W_w·h)` 在 `read()` 里带梯度重算并进 `read_gate` 的输入
+        #     （`ngram_ndb.py:384/:422/:427`）⇒ `∂L/∂W_w ≠ 0`，
+        #     `tests/test_ngram_ndb.py:292` 就钉着这条。要迁移的正是那套接线。
         # store：no_grad，永不被优化器触碰
         self.register_buffer("store", store_keys.detach().clone(), persistent=False)
         if store_pos is not None:
@@ -121,23 +118,25 @@ class MemoryCrossAttention(nn.Module):
 
     @torch.no_grad()
     def write_online(self, h, targets, logits, *, quantile=0.02,
-                     ignore_index=-100, write_gate_threshold=0.5):
-        """★ 在线写（no_grad）：把本 batch 里模型**最答不上来**的 chunk 均值键写进库里。
+                     ignore_index=-100):
+        """**规则式**种子写（no_grad）：把本 batch 里最答不上来的 chunk 均值键写进库里。
 
         返回 `(n_written, info)`。
 
-        ## 「由模型自己决定写什么」体现在哪
+        ## 判据是**人类给的规则**，不是模型的决定
 
-        写入门槛**不是外部规则**，而是**模型自己的交叉熵**：对每个 chunk 算它在
-        有效 target 上的平均 CE（`ignore_index` 的位置不算），按 batch 内分位
-        `quantile` 取最惊讶的那批。答得顺的 chunk 不写，答不上来的才写 ——
-        这正是 PETL/错题本那条线的语义，也是本项目 NDB 方向既有代码
-        （`model/residual_neural_db.py::write_from_logits`）用的判据。
-        读的多少由**可学习的** `gate_proj`/`gate` 决定，写的位置由 surprise 决定。
+        对每个 chunk 算它在有效 target 上的平均 CE（`ignore_index` 的位置不算），
+        按 batch 内**人设的分位** `quantile` 取最惊讶的那批。信号（CE）是模型自己的，
+        **阈值是我们的** —— 而"谁的阈值"才是决定"写什么"的那一步。
+        所以本方法等价于**离线预热填表**的在线版本：它建起来的是**人灌的库**。
+        要用它当"种子"（先灌一点让读路径能点火）可以，别把它当成模型在学写。
 
-        ★ 与其他实现的关键差别：键用的是**读取时同一套 chunk 均值**
-        （`forward` 里 `q = hc.mean(dim=2)`），所以写进去的条目与检索空间同构，
-        不需要额外的 key 投影 —— 少一个会漂移的接口。
+        ★ **本项目采用的、由模型自己决定读写的 NDB 是 `model/ngram_ndb.py`**：
+        那里 `w_t = σ(W_w·h)` 带梯度并进 `read_gate` 的输入（`∂L/∂W_w ≠ 0`，
+        `tests/test_ngram_ndb.py:292` 钉着）。
+
+        ★ 键用的是**读取时同一套 chunk 均值**（`forward` 里 `q = hc.mean(dim=2)`），
+        所以写进去的条目与检索空间同构，不需要额外的 key 投影。
 
         ★ 用 `ignore_index` 过滤掉 loss 掩码外的位置：不该产生梯度的 token
         也不该被写进记忆（否则人格层会把对方的话记成"自己答不上来的东西"）。
@@ -166,15 +165,6 @@ class MemoryCrossAttention(nn.Module):
         cand = (n_valid.reshape(-1) > 0).nonzero(as_tuple=False).flatten()
         if cand.numel() == 0:
             return 0, {"skip": "no_valid_target"}
-        # ★ 可学习写门控（逐 chunk 一个标量）：这是"模型自己决定"的那一半。
-        gw = torch.sigmoid(self.write_gate(
-            hc.mean(dim=2).reshape(B * C, D).to(self.write_gate.weight.dtype)))
-        gw = gw.reshape(-1).float()
-        gate_mask = gw > float(write_gate_threshold)
-        cand = cand[gate_mask[cand]]
-        if cand.numel() == 0:
-            return 0, {"skip": "write_gate_closed",
-                       "gate_mean": float(gw.mean())}
         lv = flat[cand]
         if quantile > 0:
             thr = float(torch.quantile(lv, 1.0 - float(quantile)))
@@ -193,7 +183,7 @@ class MemoryCrossAttention(nn.Module):
         self.written_total += n
         return n, {"surprise_written": n, "mean_surprise": float(lv.mean()),
                    "thr": float(thr) if quantile > 0 else 0.0,
-                   "gate_mean": float(gw.mean()), "live": self._n_live()}
+                   "live": self._n_live()}
 
     def forward(self, h, q_pos=None):
         """h: (B,T,D) → delta (B,T,D)，加到 h 上。"""
