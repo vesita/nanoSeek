@@ -13,16 +13,25 @@
 （用户明确要求：NDB **可读可写**，且**由模型自己决定**怎么读写）。
 
 **当前主线（2026-09-13 起，用户拍板）**：
-1. **B 段对话专修正在跑** —— systemd 单元 `nanoseek-v3-dlg`，配置 `configs/base_v3_dlg.yaml`，
-   14k 步（`v3_dlg` 1 epoch ≈14.8h），warm start 自 `out/base_v2/last.pt`（step **61000**）。
-   ★ **A 段（`base_v3_know.yaml`）已被用户拍板跳过** —— 别照着旧方案等它先跑完
-   （理由见 `PROJECT_STATE §0.5.10`；配置保留，将来补知识段可再跑）。
-2. **验收只用 `scripts/per_source_ce_probe.py`** —— warm start 后 `v3_*` 的 val 基本失效
-   （v2 见过同批 block 的 99%）。B 段**起跑前基线**已存档：
-   `analysis/per_source_ce_before_B.txt`（real **3.0095** / real−shuffled **2.050**）。
+1. **B 段对话专修已跑完（2026-09-14 13:28）** —— 单元 `nanoseek-v3-dlg`（`Result=success`，
+   14000/14000 步，12:59:55，`NRestarts=0`），配置 `configs/base_v3_dlg.yaml`，
+   warm start 自 `out/base_v2/last.pt`（step **61000**）。产物在 `out/base_v3_dlg/`
+   （`last.pt` = 14000，另有 5000/10000/13000 归档）。
+   ★ **A 段（`base_v3_know.yaml`）已被用户拍板跳过** —— 理由见 `PROJECT_STATE §0.5.10`；
+   配置保留，将来补知识段可再跑。
+   ★★ **效果审查已落档：`analysis/B_stage_review.md`**（含结论与两把尺子的分歧）。
+2. **验收要看两把尺子，别只看一把**（2026-09-14 实测，详见 §5.12）：
+   - **stage 自己的 val**（B 段是 `val_char_v3_dlg.bin`）：real **2.7415 → 2.1875**（−0.554）、
+     上下文净利用 −1.998 → **−2.432**，8/8 非空源同向；污染率 **0/153**（不是背下来）。
+   - **v2 的 val**（`analysis/per_source_ce_before_B.txt` 那套）：real **3.0095 → 3.7458**
+     （**+0.736**），25 源全变差；污染率 **0/369**（也不是"见过"）。
+   ⇒ 两把尺子**符号相反**，量的是"自己的分布"与"离旧分布多远"两件事。
+   ★ 本节曾写"v2 见过 v3 val 的 99%"——**逐字 32-gram 口径实测是 0/153**，
+   该说法要么是别的口径、要么需更正，**别**再拿它当"v3 val 已被背下"的依据。
 3. **提速不再是核心** —— 用户明确"目前速度够了"。吞吐已实测到顶（`PROJECT_STATE §0.6`），
    **不要**再去调 batch/compile/dtype。
-4. 基座就绪后再回到 NDB。
+4. 基座就绪后再回到 NDB。**下一轮训练怎么调（混通用数据 / 降 lr / 补 A 段）尚无定论，
+   是一个训练 seed、无对照臂 ⇒ 不许把代价归因给单一原因**（见审查报告 §6.6）。
 
 ---
 
@@ -68,12 +77,15 @@ HSA_OVERRIDE_GFX_VERSION=10.3.0 HSA_ENABLE_SDMA=0    # gfx1030 必需
   `pyproject.toml` 另行解析/同步一套环境，可能跑在**不同的 torch/依赖**上，
   于是"测试全绿"证明的**不是本项目的环境**。命令统一写成：
   `.venv/bin/python -m pytest -q -m 'not slow'` / `.venv/bin/python -m ruff check .`
-- **训练跑在 systemd 用户单元里**（铁律 0），当前主线是 **B 段对话专修**，看它一眼用：
+- **训练跑在 systemd 用户单元里**（铁律 0），最新一站是 **B 段对话专修（已跑完）**，看它一眼用：
   ```bash
   systemctl --user is-active  nanoseek-v3-dlg.service
   systemctl --user status      nanoseek-v3-dlg.service --no-pager | head -14
   ```
-  单元名：`nanoseek-v3-dlg`（**当前**：B 段对话专修，跑 `configs/base_v3_dlg.yaml`）。
+  单元名：`nanoseek-v3-dlg`（**当前**：B 段对话专修，跑 `configs/base_v3_dlg.yaml`；
+  2026-09-14 13:28 **正常结束**，`Result=success`、14000/14000 步）。
+  ⇒ **它现在 `inactive` 是对的，不是"训练死了"**；要接着训是**新的一站**，
+  必须新起单元名（并同步改 `scripts/watch.sh:16-17` 与 `nanoseek-watch.timer` 的默认值）。
   ⚠ **旧单元 `nanoseek-base-v2` 已停**（2026-09-13 12:48 stop，终态 step **61776**，
   它的 `last.pt` = step 61000）；`nanoseek-pause-65000`（65000 步看守）**从未触发、已作废**，
   **别**再照抄它们的命令去判断"训练是不是死了"。
@@ -250,6 +262,40 @@ step > 22000   全 token 均匀采样、全部算 loss                 val ≈ 4
 
 ---
 
+### 5.12 ★ 分段训练的验收必须**同时报两把尺子** —— 只报一把会得出相反结论
+
+**2026-09-14 B 段实测（`analysis/B_stage_review.md`）**：同一个 14000 步的模型，
+
+| 尺子 | v2 基座 61000 | B 段 14000 | 读法 |
+|---|---:|---:|---|
+| `val_char_v2.bin`（v2 管线，25 源） | real 3.0095 | real **3.7458**（**+0.74 变差**） | "离旧分布远了" |
+| `val_char_v3_dlg.bin`（B 段自己的，9 源） | real 2.7415 | real **2.1875**（**−0.55 变好**） | "自己的分布学好了" |
+
+连**同一个源**都给出相反符号（`dailychat`：v2 val **+1.09** / v3 val **−0.49**）
+⇒ 两个 bin 来自两条数据管线（v2 的旧 `prepare.py` vs v3 清洗重建），**不是同一把尺子**。
+
+⇒ 纪律：
+- **禁止**只拿"旧 run 的 val"给分段训练打分，也**禁止**只拿"stage 自己的 val"宣布成功 ——
+  前者量的是**管线距离**，后者量的是**域内拟合**，两者符号可以相反。
+- **必须**同时报两个方向，并各自配**污染率**（见下）与**生成侧证据**（`eval_dialogue` /
+  `eval_multiturn --style=ab`，同一批 prompt 下比指标 + 读样本）。
+- **必须在结论里写清"代价"**：域内变好往往伴随旧分布 CE 上升，不写出来就是选择性汇报。
+
+**配套工具（都是为这件事写的）**：
+- `scripts/per_source_ce_probe.py --dump-windows <json>` —— 把**实际用到的窗口起点**落盘。
+  ★ 不要靠"照抄采样逻辑"来复现窗口：该函数的 rng 还被 shuffled 的 permutation 消耗，
+  抄错一个消耗就会拿到另一批窗口，污染率立刻不可比。
+- `scripts/val_train_contamination_probe.py` —— 用那批窗口查"是不是 train 的近重复"。
+  ★★ **必须流式扫、不要建全量索引**：9.4 亿 token 的 bin 建索引要 ≈7.5GB，
+  实测被 OOM 杀掉两次（子代理连着失败也栽在这里）。
+  ★ 必带三组对照：train 原样片段**必须命中**、同段打乱**必须不命中**、
+  v2 自己的 train 查 v2 自己的 val **应≈0**。
+- B 段实测污染率：**v2 val 0/369、v3_dlg val 0/153**（32-gram 逐字）⇒ 上面那两个相反的数字
+  **都不是"见过"造成的**。⚠ 覆盖面只有 48%/60%（含 `<eos>` 的窗口查不了），且只测逐字、
+  **近重复未测**。
+
+---
+
 ## 6. 数据侧的三个硬事实（2026-09-11 实测，别再重新发现）
 
 > **★ 2026-09-11 晚状态变更**：下面 1/2 两条描述的是 `use_loss_masking: true` 时的情形，
@@ -341,7 +387,9 @@ step > 22000   全 token 均匀采样、全部算 loss                 val ≈ 4
 | 巡检 | `scripts/watch.sh` |
 | **v3 分段训练配方（B 段对话 = 当前主线；A 段知识已跳过）** | ★ **B 段**：`configs/base_v3_dlg.yaml`（`extends: base_v2.yaml`），当前直接 `init_from: out/base_v2/last.pt`（step 61000）—— **A 段 `configs/base_v3_know.yaml` 已被用户 2026-09-13 拍板跳过**，配方保留备用。启动就是 `train.py configs/base_v3_*.yaml`，**不要再堆一长串命令行参数**（方案文档里那串参数已经全部写进配置）。★★ 铁律 **12**：warm start 的 `init_from=<路径>.pt` **不是** `resume`，照样触发 `_backup_old_run` ⇒ **每段必须有自己的 `out_dir`**。两条断言钉着：`test_project_layout.py::test_v3_stage_config_safety` / `::test_all_config_out_dirs_are_pairwise_distinct` |
 | 配对重评 / val 噪声 | `scripts/ckpt_paired_eval.py` |
-| **逐来源的语言能力（"会不会认字"）** | `scripts/per_source_ce_probe.py` —— 把 `val_char_v2.bin` 按 manifest 的 `val_blocks` 切回**来源**，报 `real / shuffled / unigram` 三级对照。`real − shuffled` = 真的在读上下文的净度量（`shuffled` 保住相邻对、毁掉长上下文）。★ **口径与 `use_loss_masking` 无关**，所以 **step 22000 那条断裂线在它的表里不存在**，可以跨全程比较；★ warm start 之后 **`v3_*` 的 val 基本失效**（v2 见过同批 block 的 99%），**这是唯一可信的验收尺子**。★ 加 `--control-random` 会再评一个**随机初始化**的模型当已知答案对照（实测 real−shuffled = **+0.001**，而 step 61000 是 **+2.08**，随机权重落在 log(8192)=9.01 ≈ 瞎猜）——**下结论前先看这一行** |
+| **逐来源的语言能力（"会不会认字"）** | `scripts/per_source_ce_probe.py` —— 按 manifest 的 `val_blocks` 把 val 切回**来源**，报 `real / shuffled / unigram` 三级对照。`real − shuffled` = 真的在读上下文的净度量（`shuffled` 保住相邻对、毁掉长上下文）。★ **口径与 `use_loss_masking` 无关**，所以 **step 22000 那条断裂线在它的表里不存在**，可以跨全程比较。★ **可以换 val**：`--data/--offsets/--manifest/--train-bin` 指到 `v3_*` 就能评 stage 自己的 val（§5.12 要求两把尺子都报）。★★ 曾经写在"源对齐对照"里的三个源名是 **v2 manifest 专属**，换 manifest 会 `KeyError`（2026-09-14 修，见 `align_control_names()` + 4 条测试）。★ `--dump-windows <json>` 把**实际用到的窗口起点**落盘，供污染率审计复用。★ 加 `--control-random` 会再评一个**随机初始化**的模型当已知答案对照（实测 real−shuffled = **+0.001**，B 终态是 **−1.65**，随机权重落在 log(8192)=9.01 ≈ 瞎猜）——**下结论前先看这一行**。⚠ 此前那句"v3 val 已被 v2 见过 99%"**在逐字 32-gram 口径下实测为 0/153**，别再引用它当理由 |
+| **val 是不是训练集的近重复（污染率）** | `scripts/val_train_contamination_probe.py` —— 拿 `per_source_ce_probe --dump-windows` 落盘的那批窗口，做 32-gram 定长哈希**流式**扫训练 bin。★★ **必须流式、别建全量索引**：9.4 亿 token 的 bin 建索引要 ≈7.5GB，实测被 OOM 杀过两次。★ 自带三组对照（train 原样片段必须命中 / 同段打乱必须不命中 / v2 自己的 train 查 v2 自己的 val 应≈0）。★ 2026-09-14 实测：B 段 v2 val **0/369**、v3_dlg val **0/153** |
+| **某一段训练到底训成什么样（效果审查报告）** | `analysis/B_stage_review.md`（B 段：两把尺子 + 污染率 + 生成侧指标 + 样本 + 结论与债）；原始输出在 `analysis/per_source_ce_{after_B,B_ownval,B_controlcheck}.txt`、`analysis/eval_{dialogue,multiturn}_B.txt`、`analysis/val_train_contamination_{v2val,v3dlgval}.md` |
 | 有效 token 密度 | `scripts/mask_density_probe.py` |
 | **量"`<eos>` 先验"（数据 bug 在权重里的残留）** | `scripts/eos_prior_probe.py` —— 在 `<think>\n` 之后 / 真·收尾处 / 换轮边界 / 随机中段四组位置上，量 P(`<eos>`) 与它的 **rank**。★ 自带**已知答案对照**（真·收尾组 rank 应为 0，实测通过），`--show` 会 dump 位置前文供人工核对（§5.9）。★★ **rank 和概率会给出相反读法**（实测：`<think>` 后 rank 28 但 P 仅 1.3e-4）—— 判"会不会真的截断"必须看**概率**，rank 只能说明"学到了" |
 | NDB 容量上限 | `scripts/ngram_capacity_probe.py` |

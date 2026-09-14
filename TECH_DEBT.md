@@ -295,6 +295,39 @@ v1 约定 —— **同一类缺陷有几个入口，就得逐个改**，改一�
 
 ## 2. 待还的债（按「代价 ÷ 修复成本」排序）
 
+### P1 — 分段训练的"验收尺子"是**两条数据管线**，只报一把会得出相反结论（2026-09-14）
+
+**位置**：`scripts/per_source_ce_probe.py` 的默认口径（`val_char_v2.bin`）vs
+分段训练自己那段的 val（`val_char_v3_dlg.bin`）。
+**代价**：B 段（14000 步，warm start 自 v2@61000）在这两把尺子上**符号相反** ——
+v2 val real **3.0095 → 3.7458**（+0.736，25 源全变差），
+v3_dlg val real **2.7415 → 2.1875**（−0.554，8/8 非空源变好）；
+连同一个源都相反（`dailychat`：+1.09 / −0.49）。
+两边的**污染率都是 0**（0/369、0/153，32-gram 逐字）⇒ 既不是"见过"也不是"背过"，
+而是**模型向 v3 管线那套分布迁移**。任何只引用其中一把的报告都是选择性汇报。
+**动作**：验收协议已写进 `AGENTS.md §5.12`（两把尺子 + 污染率 + 生成侧证据三者齐报）。
+**证据**：`analysis/B_stage_review.md`、`analysis/per_source_ce_{after_B,B_ownval}.txt`、
+`analysis/val_train_contamination_{v2val,v3dlgval}.md`。
+
+### P1 — `AGENTS.md` 里"v2 见过 v3 val 的 99%"与实测不符（待澄清口径）
+
+**位置**：`AGENTS.md §1`（原话用来论证"只能用 v2 val 验收"）。
+**代价**：2026-09-14 用 32-gram 逐字匹配实测：`val_char_v3_dlg` 在 `train_char_v2` 里
+命中 **0/153**。若那句话被当成实测依据，会推出"v3 val 完全不可用"的过强结论。
+**动作**：已在 `AGENTS.md §1/§9` 标注为"待更正或注明口径"。若原意是"同源/同分布"，
+请补上口径定义；否则删掉。
+**证据**：`analysis/val_train_contamination_v3dlgval.md`（含已知答案对照）。
+
+### P2 — `eval_dialogue.py` 的 `turns` 指标**恒为 0**（含历史 8 个模型）
+
+**位置**：`inference/scripts/eval_dialogue.py::dialogue_turn_structure`。
+**代价**：`out/_nat_{20000..61000}`、`nanoseek_100m`、`base_v2`、`_eval_last22000`
+共 8 个存档全是 `turns=0.0` + `style=none` ⇒ 它是**空指标**，
+但报告里和 d1/d2/repN 并列，容易被读成"轮次结构退化"（B 段当场就可能被误读）。
+**动作**：要么修到能真的区分（先 dump 被判定为"有轮次结构"的样本，§5.9），
+要么在输出里明确标"本指标在所有历史模型上恒 0，暂不可用"。
+**证据**：`analysis/eval_dialogue_B.txt`（B 与 v2 都是 0.0）+ 上列 8 个存档的 samples JSON。
+
 ### P0 — `DATASET_REPORT.md` 里"val CE 的标准误 1e-3 nats"是错的（差 70 倍）
 
 **位置**：`data/chinese/DATASET_REPORT.md` §"结论摘要"第 2 条 / §5。

@@ -9,14 +9,23 @@
 
 ## 🚀 速查（最常用的东西就在这一节，别往下翻）
 
-**当前状态**：🟢 **B 段对话专修运行中** —— 单元 `nanoseek-v3-dlg`，配置 `configs/base_v3_dlg.yaml`，
-14k 步（`v3_dlg` 1 epoch ≈14.8h），`init_from: out/base_v2/last.pt`（= step **61000**）。
+**当前状态**：✅ **B 段对话专修已跑完**（2026-09-14 13:28）—— 单元 `nanoseek-v3-dlg`，
+`Result=success`、**14000/14000** 步、12:59:55、`NRestarts=0`；配置 `configs/base_v3_dlg.yaml`，
+`init_from: out/base_v2/last.pt`（= step **61000**）。产物 `out/base_v3_dlg/`
+（`last.pt` = 14000；归档 5000/10000/13000/14000）。⚠ 该单元**现在 inactive 是正常的**。
 **A 段（`base_v3_know.yaml`）已被用户拍板跳过**（见 §0.5.10）。
 ⚪ 基座 `nanoseek-base-v2` **已停**（2026-09-13 12:48 stop，终态 step **61776**，其 `last.pt` = 61000）；
 `nanoseek-pause-65000` 看守**从未触发、已作废** —— 别照抄它们的命令判断"训练死了没"。
+**B 段效果审查**（完整版 `analysis/B_stage_review.md`）：
+- **自己那段的 val**（`val_char_v3_dlg.bin`）：real **2.7415 → 2.1875**（−0.554）、
+  上下文净利用 −1.998 → **−2.432**，8/8 非空源同向；污染率 **0/153**。
+- **v2 的 val**（`val_char_v2.bin`）：real **3.0095 → 3.7458**（**+0.736**），25 源全变差；污染率 **0/369**。
+- 生成侧同向变好：空白 1.09%→**0%**、distinct-2 0.83→**0.98**、自开轮次 0%→**17%**。
+⇒ 两条尺子**符号相反**（同一个源都相反）⇒ 读作"**向 v3 管线那套分布迁移，并付出 v2 分布的代价**"，
+**不要**只引用其中一条（纪律见 `AGENTS.md §5.12`）。
 **关键数字**：单点 val 噪声 **σ≈0.087** · 有效 token 密度 **100%**（Stage1 起）·
 B 段**起跑前基线**（`per_source_ce_probe` @61000）：real **3.0095** / real−shuffled **2.050**（`analysis/per_source_ce_before_B.txt`）。
-⚠ **val 口径已于 step 22000 断裂**，且 warm start 后 `v3_*` val 基本失效 ⇒ **B 段验收只看 `per_source_ce_probe`**（见 §0.5.10 末尾）。
+⚠ **val 口径已于 step 22000 断裂**；B 段验收**两把尺子都要报**（见 §0.5.10 末尾 + `AGENTS.md §5.12`）。
 
 ```bash
 cd /home/vesita/coding/my/nanoSeek
@@ -1031,11 +1040,15 @@ GPU **不是空闲**，是被大量低效 kernel 占满。按 6ND 估算：8192 
 ### 恢复上下文后先做这三件事
 ```bash
 cd /home/vesita/coding/my/nanoSeek
-tail -c 1500 out/base_v3_dlg_train.log                     # ① 训练还在跑吗（日志在 out_dir **之外**！见铁律 3）
-systemctl --user is-active nanoseek-v3-dlg.service    # ①′ 单元还活着吗（别用 pgrep，会匹配到自己）
+tail -40 analysis/B_stage_review.md                    # ① 最新一站的结论与"待办/债"（B 段已跑完，先看这个）
+tail -c 1500 out/base_v3_dlg_train.log                 # ①′ 上一站训练是怎么结束的（日志在 out_dir **之外**！铁律 3）
+systemctl --user is-active nanoseek-v3-dlg.service     # ①″ 应输出 inactive = **正常结束**，不是"训练死了"
 cat PROJECT_STATE.md TECH_DEBT.md                      # ② 恢复记忆
 .venv/bin/python -m pytest -q -m 'not slow'            # ③ 全绿（跳过 slow 时 <1 秒）
 ```
+⚠ **下一站训练尚未启动**（A 段已跳过、B 段已跑完）：要起新站必须
+①新配置 + ②新 `out_dir`（铁律 12）+ ③新单元名 + ④同步改 `scripts/watch.sh:16-17` 与
+`nanoseek-watch.timer`/`nanoseek-watch.service` 里的路径。**别直接复用旧单元名。**
 
 ### 0.1 🕐 看护节律（当前任务：低上下文定期巡检）
 
