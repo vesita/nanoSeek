@@ -32,6 +32,12 @@
    **不要**再去调 batch/compile/dtype。
 4. 基座就绪后再回到 NDB。**下一轮训练怎么调（混通用数据 / 降 lr / 补 A 段）尚无定论，
    是一个训练 seed、无对照臂 ⇒ 不许把代价归因给单一原因**（见审查报告 §6.6）。
+5. **★ B 段练出的是"对话的形状"，不是"对话的内容"**（2026-09-14 实测，`analysis/B_ood_prompts.txt`）：
+   OOD/身份类提示词全线失败 —— `你叫什么名字？` 答成 `你叫乔丹的，也叫马里兰卡`；
+   `1+1等于几？` 把问题抄回来；`介绍一下北京` 串成南京；`用 Python 写快排` 只吐语料碎片；
+   **连"失恋/压力"这种域内强项也只是模板级**（`你还有老师，也有老师关注你，安稳发展哦`）。
+   ⇒ 别拿"CE 变好了"推断"会答问题了"；身份/自我认知在单轮 QA 拼盘里**没有监督信号**，
+   而这正是被跳过的 A 段/新知识本该补的东西。
 
 ---
 
@@ -389,7 +395,7 @@ step > 22000   全 token 均匀采样、全部算 loss                 val ≈ 4
 | 配对重评 / val 噪声 | `scripts/ckpt_paired_eval.py` |
 | **逐来源的语言能力（"会不会认字"）** | `scripts/per_source_ce_probe.py` —— 按 manifest 的 `val_blocks` 把 val 切回**来源**，报 `real / shuffled / unigram` 三级对照。`real − shuffled` = 真的在读上下文的净度量（`shuffled` 保住相邻对、毁掉长上下文）。★ **口径与 `use_loss_masking` 无关**，所以 **step 22000 那条断裂线在它的表里不存在**，可以跨全程比较。★ **可以换 val**：`--data/--offsets/--manifest/--train-bin` 指到 `v3_*` 就能评 stage 自己的 val（§5.12 要求两把尺子都报）。★★ 曾经写在"源对齐对照"里的三个源名是 **v2 manifest 专属**，换 manifest 会 `KeyError`（2026-09-14 修，见 `align_control_names()` + 4 条测试）。★ `--dump-windows <json>` 把**实际用到的窗口起点**落盘，供污染率审计复用。★ 加 `--control-random` 会再评一个**随机初始化**的模型当已知答案对照（实测 real−shuffled = **+0.001**，B 终态是 **−1.65**，随机权重落在 log(8192)=9.01 ≈ 瞎猜）——**下结论前先看这一行**。⚠ 此前那句"v3 val 已被 v2 见过 99%"**在逐字 32-gram 口径下实测为 0/153**，别再引用它当理由 |
 | **val 是不是训练集的近重复（污染率）** | `scripts/val_train_contamination_probe.py` —— 拿 `per_source_ce_probe --dump-windows` 落盘的那批窗口，做 32-gram 定长哈希**流式**扫训练 bin。★★ **必须流式、别建全量索引**：9.4 亿 token 的 bin 建索引要 ≈7.5GB，实测被 OOM 杀过两次。★ 自带三组对照（train 原样片段必须命中 / 同段打乱必须不命中 / v2 自己的 train 查 v2 自己的 val 应≈0）。★ 2026-09-14 实测：B 段 v2 val **0/369**、v3_dlg val **0/153** |
-| **某一段训练到底训成什么样（效果审查报告）** | `analysis/B_stage_review.md`（B 段：两把尺子 + 污染率 + 生成侧指标 + 样本 + 结论与债）；原始输出在 `analysis/per_source_ce_{after_B,B_ownval,B_controlcheck}.txt`、`analysis/eval_{dialogue,multiturn}_B.txt`、`analysis/val_train_contamination_{v2val,v3dlgval}.md` |
+| **某一段训练到底训成什么样（效果审查报告）** | `analysis/B_stage_review.md`（B 段：两把尺子 + 污染率 + 生成侧指标 + OOD 提示词 + 结论与债）；原始输出在 `analysis/per_source_ce_{after_B,B_ownval,B_controlcheck}.txt`、`analysis/eval_{dialogue,multiturn}_B.txt`、`analysis/B_ood_prompts.txt`、`analysis/val_train_contamination_{v2val,v3dlgval}.md`。★ 采样入口是现成的 `inference/scripts/sample_py.py`（`--out_dir/--prompt/--temperature/--seed`），**不要另写采样脚本** |
 | 有效 token 密度 | `scripts/mask_density_probe.py` |
 | **量"`<eos>` 先验"（数据 bug 在权重里的残留）** | `scripts/eos_prior_probe.py` —— 在 `<think>\n` 之后 / 真·收尾处 / 换轮边界 / 随机中段四组位置上，量 P(`<eos>`) 与它的 **rank**。★ 自带**已知答案对照**（真·收尾组 rank 应为 0，实测通过），`--show` 会 dump 位置前文供人工核对（§5.9）。★★ **rank 和概率会给出相反读法**（实测：`<think>` 后 rank 28 但 P 仅 1.3e-4）—— 判"会不会真的截断"必须看**概率**，rank 只能说明"学到了" |
 | NDB 容量上限 | `scripts/ngram_capacity_probe.py` |
