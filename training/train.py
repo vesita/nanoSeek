@@ -764,15 +764,26 @@ if ndb_store:
                      'pos': _hd['pos'].to(device, dtype=torch.int32),
                      'vals': (_hd['vals'].to(device) if _hd.get('vals') is not None else None)}
 
+    # ★ 形状口径必须与 `model/gpt.py` 对 mHC 的处理**逐字一致**（:`if self.config.use_mhc`）：
+    #   use_mhc=True  → Block 输出 (B,T,R,D)（R = hc_mult 条残差流），要先均值回 (B,T,D)；
+    #   use_mhc=False → Block 输出径直是 (B,T,D)。
+    #   2026-09-15 实测：原先无条件 `out.mean(dim=2)` 在 use_mhc=False（base_v2/base_v3 全系列）
+    #   下把 (B,T,D) 压成 (B,T) ⇒ NDB forward 第一行就
+    #   `ValueError: not enough values to unpack (expected 3, got 2)` 崩掉。
+    #   ⚠ 本 bug 一直没暴露，是因为 `ndb_store` 指的文件此前不存在 ⇒ NDB 根本没被启用过。
+    _ndb_mhc = bool(model.config.use_mhc)
+
     @torch._dynamo.disable  # 检索/交叉注意力保持 eager：不进编译图，避开编译期显存尖峰
     def _ndb_hook(m, inp, out):
         if not _ndb_state['on']:
             return out
-        delta = ndb(out.mean(dim=2), q_pos=_ndb_state['q_pos'])
+        h = out.mean(dim=2) if _ndb_mhc else out
+        delta = ndb(h, q_pos=_ndb_state['q_pos'])
         if _ndb_state['drop']:
             delta = torch.zeros_like(delta)
         _ndb_state['delta_norm'] = delta.float().norm(dim=-1).mean().item()
-        return out + delta.unsqueeze(2)  # 广播到 mHC 各残差流
+        # mHC 时广播到各残差流；否则与单流同形
+        return out + (delta.unsqueeze(2) if _ndb_mhc else delta)
 
     model.transformer.h[ndb_layer].register_forward_hook(_ndb_hook)
     if _ndb_resume is not None:
