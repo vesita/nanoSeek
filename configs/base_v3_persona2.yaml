@@ -47,19 +47,7 @@ lr_decay_iters: 900
 # --- 7) 评估节律 ------------------------------------------------------------
 eval_interval: 100
 
-# --- 8) NDB（外挂，**默认启用**；模块见 AGENTS §1 的门面表）------------------
-# ★ 库按**本段起点的基座**重建（键 = chunk 均值，基座漂移了空间就对不上）：
-#     local/build_chunk_store.py --ckpt_dir out/base_v3_know2 \
-#         --store out/mem_store/store_base_v3_know2_gen10m.pt \
-#         --mode mean --layer -6 --chunk 64 --limit_m 10
-# ★ 只开读；写侧 `write_online` 是规则式的（人给的惊讶分位），不是模型决定（TECH_DEBT §2 P1）。
-ndb_store: out/mem_store/store_base_v3_know2_gen10m.pt
-ndb_layer: -6
-ndb_chunk: 64
-ndb_top_k: 8
-ndb_exclude_radius: 512
-ndb_dropout: 0.1
-ndb_retr_noise: 0.0
-ndb_att_sim: 2.0
-ndb_lr: 0.0003
-ndb_eval_iters: 64
+# --- 8) NDB ------------------------------------------------------------------
+# ★ NDB 由 `base_v2.yaml` 提供并**默认启用**（`ndb_slots` 非 0），本段不覆盖。
+#   采用的方案是 `model/ngram_ndb.py`：读与写都由模型门控决定，表在训练中**在线**累积。
+#   本段是最后一段 ⇒ 最终人设由它决定；监控在 `out/<run>/ndb.csv`。

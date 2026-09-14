@@ -43,7 +43,7 @@ SESSION_JUNK_PREFIXES = ('_smoke', '_foc_', '_bench_', '_knob_')
 FAMILY_PREFIXES = [
     'nanoseek_100m_neural_db', 'nanoseek_100m_ndb', 'nanoseek_100m_clean',
     'nanoseek_100m_db', 'nanoseek_100m_speedtest', 'nanoseek_100m',
-    'neuron_db', 'residual_db', 'ndb_', 'db_', 'ngram_full', 'mem_store',
+    'neuron_db', 'residual_db', 'ndb_', 'db_', 'ngram_full',
     'curriculum', 'pilot_', 'rl_', 'ab_char_', 'char_fact', 'eos_fix',
     'nano_arith', 'arith_sft', 'smoke', 'test_', 'cont_v1', 'base_probe', 'bench',
 ]

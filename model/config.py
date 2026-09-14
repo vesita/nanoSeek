@@ -97,8 +97,8 @@ class GPTConfig:
     factorized_emb_dim: int = 0  # 因式分解嵌入维度：>0 时启用低秩嵌入（ALBERT 思想），wte 降至 E 维 + 升降维投影，省参数加深网络
     # Attention Sinks：每头一个可学习标量偏置，作为 softmax 的"垃圾桶"吸收无关注意力。
     use_attn_sink: bool = False
-    # NDB 不进 GPTConfig：本项目的 NDB 是**外挂**（forward hook + `ndb_store`），
-    # 由 `training/train.py` 的 `ndb_*` 一族键控制。实现在 `model/ngram_ndb.py`。
+    # NDB 不进 GPTConfig：本项目的 NDB 是**外挂**，由 `training/train.py` 的
+    # `ndb_*` 一族键控制（`model/ngram_ndb.py`：读与写都由模型门控，表在线累积）。
     # mHC 超连接：4 流并行残差（X_{l+1} = B·X_l + C·F(A·X_l)，A/C sigmoid 有界、B 双重随机）。
     use_mhc: bool = False
     hc_mult: int = 4            # 残差流数（V4 原版 = 4）

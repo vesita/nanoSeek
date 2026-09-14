@@ -36,8 +36,8 @@ class Block(nn.Module):
         self.mlp = MoE(config, use_hash=layer_idx < config.num_hash_layers) \
             if config.use_moe else SwiGLU(config)
 
-        # NDB 不在这里：本项目的 NDB 是**外挂**（forward hook + `ndb_store`），不是模型子模块。
-        # 实现在 `model/ngram_ndb.py`；神经元级读接口在 `model/memory_cross_attn.py`。
+        # NDB 不在这里：本项目的 NDB 是**外挂**（`training/train.py` 里的 ln_f pre-hook +
+        # `ndb_*` 一族键），不是模型子模块。实现在 `model/ngram_ndb.py`。
 
         if self.use_mhc:
             # mHC 超连接：4 流并行残差。每流宽度仍为 n_embd，子层 F 只跑 1 次。

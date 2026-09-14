@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
@@ -194,19 +195,20 @@ num_hash_layers = 0          # 前 N 层用 hash 路由（0 = 禁用）
 block_order = "attn_ffn"     # 计算图重排：块内子层顺序（attn_ffn | ffn_attn）
 no_attn_layers = []          # 稀疏注意力布线：跳过注意力的层索引（0-based，空=所有层都有）
 n_memory_tokens = 0          # 显式记忆 token：序列前插入 K 个可学习嵌入（0=关闭，实验性）
-# --- NDB（神经元数据库 / RETRO-lite 记忆）共训（dev-notes/79）---
-# ndb_store 为空 = 完全不启用，训练流程与本文件原行为逐位一致。
-ndb_store = ''               # 记忆库路径（out/mem_store/store*.pt）；非空即启用
-ndb_heldout = ''             # 可选「未见」库：仅用于监控 Δ_held（读策略可迁移性）
-ndb_layer = -6               # 挂载层（支持负数）
-ndb_chunk = 64               # chunk 大小（需与建库一致）
-ndb_top_k = 4                # 检索 top-k
-ndb_exclude_radius = 512     # 屏蔽与查询位置过近的库条目（防自匹配）
-ndb_gate_init = 0.1
-ndb_dropout = 0.1            # 记忆 dropout：以概率把 Δ 整批置零，逼基座「有无记忆都能跑」
-ndb_retr_noise = 0.0         # 训练期检索噪声：每个槽以该概率换成随机条目（0 = 关闭，旧行为）
-ndb_att_sim = 0.0            # 检索相关性加进注意力 logit 的初始增益 λ（0 = 旧行为）
-ndb_lr = 3e-4                # 读取接口学习率（固定，不随基座调度衰减）
+# --- NDB（后缀 n-gram 神经数据库，见 model/ngram_ndb.py）共训 ---
+# ★ 采用的方案：**读与写都由模型自己的门控决定**，表在训练中在线累积。
+#   `ndb_slots = 0` = 完全不启用，训练流程与本文件原行为逐位一致。
+#   表是 no_grad 的 token 计数（numpy），**不进 state_dict / 不进 checkpoint**，
+#   也**不需要任何离线建库**：每个 run 从空表开始，由本 run 的训练流在线写出来
+#   ⇒ 没有库文件要在阶段之间重建，也就没有「基座漂移导致 query/key 空间失配」的问题。
+#   梯度路径：读门控从 `read()` 拿（`w_t = sigmoid(write_gate(h))` 是它的输入之一）；
+#   `observe()` 自身是 `@torch.no_grad()`，所以「写门控有没有在学」要看**读路径**的梯度。
+ndb_slots = 0                # 每级槽位数（0 = 关闭 NDB）；2**26 = 67M
+ndb_levels = '8'             # 后缀长度列表，逗号分隔（如 '8' 或 '8,6'）
+ndb_top_k = 4                # 每槽保留的续写个数（1 = 只存 top-1，退化为硬检索）
+ndb_max_table_gb = 6.0       # 表内存上限，超过直接报错（别跑到一半 OOM）
+ndb_lr = 3e-4                # 读/写门控学习率（独立 AdamW，固定，不随基座调度衰减）
+ndb_flush_every = 50         # 每多少训练步把热缓冲落进表；每次 NDB 监控前也落一次
 ndb_eval_iters = 64          # NDB 监控 eval 的 batch 数
 ndb_debug_mem = False        # 诊断：每步打印显存（allocated/peak/reserved/OOM 计数）
 mem_snapshot_gb = 0.0        # 诊断：峰值显存超过该值(GB)时 dump 一次显存分配历史快照（0=关）
@@ -307,6 +309,9 @@ pack_align = False        # ★★ 2026-09-13 由 True 翻成 False：块对齐�
                           # True 仅保留用于复现旧实验 / A-B 对照。
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 load_config(globals()) # 从 YAML 配置文件或命令行覆盖
+# ★ 派生开关必须**在这里**算：`load_config` 之前 `ndb_slots` 还是默认值 0，
+#   写在键定义处会永远算出 False ⇒ NDB 静默不启用（2026-09-15 冒烟实测踩到）。
+use_ndb = int(ndb_slots) > 0     # 启用 NDB 的唯一判据
 config = {k: globals()[k] for k in config_keys} # 对日志记录很有用
 # 字级模式联动（--char-level=true）：汉字=1 token → block 256（≈BPE 上下文）、
 # CSA 默认参数（16 字/块、64 字/窗）、MTP 可开；mask 标记按字级 id。
@@ -532,10 +537,6 @@ def get_batch(split):
         sid = sid_ext[:, :block_size]        # ★ 模型侧仍必须是 (B,T)：attention 的 tril 是 T×T
     else:
         ix = _sample_nonempty_ix(data) if _pack_terms else torch.randint(len(data) - block_size, (batch_size,))
-    if ndb_store:
-        # NDB：记录本 batch 每个窗口的 chunk 起始位置，供 hook 做「排除自匹配」检索
-        _cs = torch.arange(0, block_size, ndb_chunk)
-        _ndb_state['q_pos'] = (ix[:, None] + _cs[None, :]).to(torch.int32).to(device)
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if sid_ext is not None:
@@ -746,52 +747,63 @@ def print_summary():
 if master_process:
     print_summary()
 
-# --- NDB 挂载（ndb_store='' 时完全跳过；基座与接口联合训练）---
+# --- NDB 挂载（ndb_slots=0 时完全跳过；基座与读写门控联合训练）---
 ndb = None
-_ndb_state = {"on": True, "q_pos": None, "delta_norm": 0.0, "drop": False}
-_ndb_held = None
-if ndb_store:
-    from model.memory_cross_attn import MemoryCrossAttention
-    _nd = torch.load(ndb_store, map_location='cpu', weights_only=False)
-    ndb = MemoryCrossAttention(
-        model.config.n_embd, _nd['keys'], _nd['pos'], store_vals=_nd.get('vals'),
-        chunk=ndb_chunk, top_k=ndb_top_k, n_head=model.config.n_head,
-        gate_init=ndb_gate_init, exclude_radius=ndb_exclude_radius,
-        retr_noise=ndb_retr_noise, att_sim_gain=ndb_att_sim).to(device)
-    if ndb_heldout:
-        _hd = torch.load(ndb_heldout, map_location='cpu', weights_only=False)
-        _ndb_held = {'keys': _hd['keys'].to(device),
-                     'pos': _hd['pos'].to(device, dtype=torch.int32),
-                     'vals': (_hd['vals'].to(device) if _hd.get('vals') is not None else None)}
+ndb_opt = None
+_ndb_params = []
+_ndb_state = {"on": True, "h": None, "coverage": 0.0}
 
-    # ★ 形状口径必须与 `model/gpt.py` 对 mHC 的处理**逐字一致**（:`if self.config.use_mhc`）：
-    #   use_mhc=True  → Block 输出 (B,T,R,D)（R = hc_mult 条残差流），要先均值回 (B,T,D)；
-    #   use_mhc=False → Block 输出径直是 (B,T,D)。
-    #   2026-09-15 实测：原先无条件 `out.mean(dim=2)` 在 use_mhc=False（base_v2/base_v3 全系列）
-    #   下把 (B,T,D) 压成 (B,T) ⇒ NDB forward 第一行就
-    #   `ValueError: not enough values to unpack (expected 3, got 2)` 崩掉。
-    #   ⚠ 本 bug 一直没暴露，是因为 `ndb_store` 指的文件此前不存在 ⇒ NDB 根本没被启用过。
-    _ndb_mhc = bool(model.config.use_mhc)
 
-    @torch._dynamo.disable  # 检索/交叉注意力保持 eager：不进编译图，避开编译期显存尖峰
-    def _ndb_hook(m, inp, out):
-        if not _ndb_state['on']:
-            return out
-        h = out.mean(dim=2) if _ndb_mhc else out
-        delta = ndb(h, q_pos=_ndb_state['q_pos'])
-        if _ndb_state['drop']:
-            delta = torch.zeros_like(delta)
-        _ndb_state['delta_norm'] = delta.float().norm(dim=-1).mean().item()
-        # mHC 时广播到各残差流；否则与单流同形
-        return out + (delta.unsqueeze(2) if _ndb_mhc else delta)
+def _ndb_blend(logits, loss, X, Y):
+    """把 loss 里的 CE 项换成「NDB 混合分布」口径，其余附加项（MoE 等）原样保留。
 
-    model.transformer.h[ndb_layer].register_forward_hook(_ndb_hook)
+    `p_new = (1-g)·p_model + g·p_ng`（g 与多级混合 α 都由模型门控决定），所以
+    `loss = CE(p_model) + 附加项` → `CE(p_new) + 附加项`：先扣掉原 CE 再加新的 CE。
+    NDB 未启用、或 `_ndb_state['on']=False`（对照臂）时原样返回。
+    """
+    if ndb is None or not _ndb_state['on']:
+        return loss
+    h = _ndb_state.get('h')
+    if h is None:      # 还没跑过前向（理论上不会走到）
+        return loss
+    V = logits.size(-1)
+    with torch.no_grad():   # 只用来扣掉原 CE 项，不需要它的梯度
+        ce_base = F.cross_entropy(logits.reshape(-1, V), Y.reshape(-1),
+                                  ignore_index=-100)
+    p_model = F.softmax(logits.float(), dim=-1)
+    p_new, st = ndb.read(h, X, p_model, targets=Y)
+    # ⚠ 必须 clamp：p_new 是凸组合，理论上 >0，但 fp32 下极小项取 log 会 -inf
+    ce_ndb = F.cross_entropy(torch.log(p_new.clamp_min(1e-9)).reshape(-1, V),
+                             Y.reshape(-1), ignore_index=-100)
+    _ndb_state['coverage'] = float(st.covered)
+    return loss - ce_base + ce_ndb
+
+
+if use_ndb:
+    from model.ngram_ndb import NgramNDB
+    _ndb_levels = tuple(int(s) for s in str(ndb_levels).strip('()').split(',') if s.strip())
+    ndb = NgramNDB(
+        n_embd=model.config.n_embd, levels=_ndb_levels, slots=ndb_slots,
+        top_k=ndb_top_k, vocab_size=model.config.vocab_size,
+        max_table_gb=ndb_max_table_gb).to(device)
+
+    # ★ h = **ln_f 的输入**（走完所有 block、最终 LayerNorm 之前），与探针
+    #   `scripts/ndb_online_ab.py:99` 的口径一致；读门控与写门控都吃它。
+    #   pre-hook 只做一次张量赋值，用 `_dynamo.disable` 拦住编译图。
+    @torch._dynamo.disable
+    def _ndb_capture(m, args):
+        _ndb_state['h'] = args[0]
+        return None
+
+    model.transformer.ln_f.register_forward_pre_hook(_ndb_capture)
+
     if _ndb_resume is not None:
+        # 只恢复门控参数；表**不持久化**（每次 run 从空表在线重建）
         ndb.load_state_dict(_ndb_resume, strict=False)
         if master_process:
-            print("  NDB        从 checkpoint 恢复接口参数")
+            print("  NDB        从 checkpoint 恢复门控参数（表从空开始，在线重建）")
     _ndb_params = [p for p in ndb.parameters() if p.requires_grad]
-    # 独立 AdamW：MuonAdamW 不支持 add_param_group；独立优化器还能把接口 lr 固定住
+    # 独立 AdamW：MuonAdamW 不支持 add_param_group；独立优化器还能把门控 lr 固定住
     ndb_opt = torch.optim.AdamW(_ndb_params, lr=ndb_lr, weight_decay=0.0)
     if _ndb_opt_resume is not None:
         try:
@@ -801,7 +813,6 @@ if ndb_store:
                 print(f"  NDB        优化器状态载入失败（{_e}）→ 重建（丢弃旧动量）")
             ndb_opt = torch.optim.AdamW(_ndb_params, lr=ndb_lr, weight_decay=0.0)
         else:
-            # 新增参数（如 sim_gain）可能不在旧状态里而被挤出去 → 显式校验并补回
             _in_opt = {id(p) for g in ndb_opt.param_groups for p in g['params']}
             _miss = [n for n, p in ndb.named_parameters()
                      if p.requires_grad and id(p) not in _in_opt]
@@ -810,11 +821,10 @@ if ndb_store:
                     print(f"  NDB        优化器状态缺 {_miss} → 重建（丢弃旧动量）")
                 ndb_opt = torch.optim.AdamW(_ndb_params, lr=ndb_lr, weight_decay=0.0)
     if master_process:
-        print(f"  NDB        {os.path.basename(ndb_store)} · "
-              f"{'token' if ndb.per_token else 'mean'} rank={ndb.rank} · 层 {ndb_layer} · "
-              f"top_k {ndb_top_k} · {_nd['keys'].shape[0]} chunks · "
-              f"接口 {sum(p.numel() for p in _ndb_params) / 1e3:.0f}K 参数 @ lr {ndb_lr:g} · "
-              f"dropout {ndb_dropout} · 检索噪声 {ndb_retr_noise}")
+        print(f"  NDB        levels={_ndb_levels} · 每级 {ndb_slots/1e6:.0f}M 槽 · "
+              f"top_k {ndb_top_k} · 表 {ndb.table_gb():.2f}GB · "
+              f"门控 {sum(p.numel() for p in _ndb_params)} 参数 @ lr {ndb_lr:g} · "
+              f"每 {ndb_flush_every} 步落表 · 表不持久化（每个 run 在线重建）")
 
 # 编译模型
 if compile:
@@ -839,12 +849,9 @@ if ddp:
 # 通过许多 batch 帮助估算任一划分上任意精度的损失
 @torch.no_grad()
 def estimate_loss(splits=('train', 'val')):
+    """train/val loss 口径 = **带 NDB**（与部署形态一致）；NDB 的净贡献看 ndb.csv 的配对 Δ。"""
     out = {}
     model.eval()
-    # 监控口径必须干净：检索噪声只在训练步生效，否则 val loss 不可与历史对比
-    _rn = ndb.retr_noise if ndb is not None else 0.0
-    if ndb is not None:
-        ndb.retr_noise = 0.0
     for split in splits:
         tot, n = 0.0, 0
         for k in range(eval_iters):
@@ -854,6 +861,7 @@ def estimate_loss(splits=('train', 'val')):
                 continue  # 全 mask 窗口：无有效 token，跳过（否则 loss 为 nan）
             with ctx:
                 logits, loss = model(X, Y, sample_id=SID)
+            loss = _ndb_blend(logits, loss, X, Y)
             # NaN 防护：train 数据某些窗口无 <eos>/<cont> → mask 全 -100 → loss 为 nan。
             # 跳过这些无效 batch，只对有限 loss 求均值（与训练循环的 step_nan 防护对齐）。
             if torch.isfinite(loss):
@@ -862,60 +870,44 @@ def estimate_loss(splits=('train', 'val')):
                 n += n_i
         out[split] = torch.tensor(tot / n) if n else float('nan')
     model.train()
-    if ndb is not None:
-        ndb.retr_noise = _rn
+    _ndb_state['h'] = None   # 别把验证集前向的图留着（下个训练前向会重新写）
     return out
 
 
 @torch.no_grad()
 def ndb_eval():
-    """NDB 监控：mem-on / base-off / 随机检索 / 未见库 四个 val loss。
+    """NDB 监控：mem-on / base-off 两个 val loss（**同一批 val batch 配对**）。
 
-    Δ       = mem − base_off      记忆有没有用
-    Δ_rand  = rand − base_off     选择性（≈0 = 学会「无关就不注入」）
-    Δ_held  = held − base_off     换成没训过的库是否照样有用（读策略可迁移性）
+    Δ = mem − base_off     NDB 有没有用（负 = 有用）
+    coverage               读的时候有槽命中的位置占比；表冷的时候 Δ 自然 ≈ 0
     """
     if ndb is None:
         return None
     was_training = model.training
     model.eval()
-    _ndb_state['drop'] = False
-    _rn = ndb.retr_noise          # 监控口径干净：噪声只在训练步生效
-    ndb.retr_noise = 0.0
 
-    # 配对评估：四个条件用同一批 val batch。否则各条件抽到不同窗口，
+    # 配对评估：两个条件用同一批 val batch。否则各条件抽到不同窗口，
     # 采样噪声（±0.1）会淹没 Δ（±0.03），Δ 变成纯噪声（2026-09-10 实测教训）。
     batches = [get_batch('val') for _ in range(ndb_eval_iters)]
 
-    def _run(which='train', random=False, on=True):
+    def _run(on=True):
         _ndb_state['on'] = on
-        ndb.random_retrieve = random
-        cur = (ndb.store, ndb.store_pos, getattr(ndb, 'vals', None))
-        if which == 'held' and _ndb_held is not None:
-            ndb.store, ndb.store_pos = _ndb_held['keys'], _ndb_held['pos']
-            if ndb.per_token:
-                ndb.vals = _ndb_held['vals']
         tot, n = 0.0, 0
         for X, Y, SID in batches:
             n_i = int((Y != -100).sum().item())
             if n_i == 0:
                 continue
             with ctx:
-                _, loss = model(X, Y, sample_id=SID)
+                logits, loss = model(X, Y, sample_id=SID)
+            loss = _ndb_blend(logits, loss, X, Y)
             if torch.isfinite(loss):
                 tot += loss.item() * n_i  # token 级加权，与训练损失同口径
                 n += n_i
-        ndb.store, ndb.store_pos = cur[0], cur[1]
-        if ndb.per_token:
-            ndb.vals = cur[2]
-        ndb.random_retrieve = False
         return tot / max(n, 1)
 
-    res = {'mem': _run('train', False, True), 'off': _run('train', False, False),
-           'rand': _run('train', True, True)}
-    res['held'] = _run('held', False, True) if _ndb_held is not None else None
+    res = {'mem': _run(True), 'off': _run(False)}
     _ndb_state['on'] = True
-    ndb.retr_noise = _rn
+    _ndb_state['h'] = None      # ★ 绝不能让 val 的隐藏态漏进训练侧写入门控
     if was_training:
         model.train()
     return res
@@ -1085,11 +1077,10 @@ if master_process:
 # NDB 监控 CSV（启用 NDB 时；每评估点一行）—— 同样的续写策略
 ndb_csv = None
 ndb_csv_writer = None
-if master_process and ndb_store:
+if master_process and use_ndb:
     ndb_csv, ndb_csv_writer, _ = open_run_csv(
         os.path.join(out_dir, 'ndb.csv'),
-        ['iter', 'base_off', 'mem', 'delta', 'rand', 'delta_rand',
-         'held', 'delta_held', 'gate', 'delta_norm'],
+        ['iter', 'base_off', 'mem', 'delta', 'write_gate_bias', 'coverage'],
         resuming=(init_from == 'resume'))
 
 # 健康体检初始化（health_enabled 时加载分词器 + 打开 health.csv；失败则本次跳过体检）
@@ -1266,26 +1257,22 @@ while True:
             losses['train'] = running_train_loss if running_train_loss is not None else 0.0
         # 用 pbar.write 打印到进度条上方，不打断进度条
         pbar.write(f"step {iter_num}: train 损失 {losses['train']:.4f}, val 损失 {losses['val']:.4f}")
-        # --- NDB 监控：Δ / Δ_rand / Δ_held / 门控 / 注入幅度 ---
+        # --- NDB 监控：配对 Δ / 门控 / 覆盖率 ---
         if ndb is not None:
+            ndb.flush()   # 监控前先落表，保证 Δ 量的是最新表
             _nr = ndb_eval()
             _d = _nr['mem'] - _nr['off']
-            _dr = _nr['rand'] - _nr['off']
-            _dh = (_nr['held'] - _nr['off']) if _nr['held'] is not None else None
-            _msg = (f"[ndb {iter_num}] base_off={_nr['off']:.4f} mem={_nr['mem']:.4f} "
-                    f"Δ={_d:+.4f} rand={_nr['rand']:.4f} Δ_rand={_dr:+.4f} "
-                    f"gate={ndb.gate.item():+.4f} |Δ|={_ndb_state['delta_norm']:.3f}")
-            if _dh is not None:
-                _r = (_dh / _d) if abs(_d) > 1e-9 else float('nan')
-                _msg += f" held={_nr['held']:.4f} Δ_held={_dh:+.4f} Δ_held/Δ={_r:.2f}"
-            pbar.write(_msg)
+            _gs = ndb.gate_summary()
+            _cov = _ndb_state.get('coverage', 0.0)
+            _fill = ndb.n_filled_slots()[0]
+            pbar.write(f"[ndb {iter_num}] base_off={_nr['off']:.4f} mem={_nr['mem']:.4f} "
+                       f"Δ={_d:+.4f} 槽已填={_fill/1e6:.1f}M 覆盖={_cov*100:.1f}% "
+                       f"w_b={_gs['write_gate_bias']:+.3f} r_b={_gs['read_gate_bias']:+.3f} "
+                       f"α={[round(a, 2) for a in _gs['level_alpha']]}")
             if ndb_csv_writer is not None:
                 ndb_csv_writer.writerow([
                     iter_num, f"{_nr['off']:.4f}", f"{_nr['mem']:.4f}", f"{_d:+.4f}",
-                    f"{_nr['rand']:.4f}", f"{_dr:+.4f}",
-                    (f"{_nr['held']:.4f}" if _dh is not None else ''),
-                    (f"{_dh:+.4f}" if _dh is not None else ''),
-                    f"{ndb.gate.item():+.4f}", f"{_ndb_state['delta_norm']:.3f}"])
+                    f"{_gs['write_gate_bias']:+.4f}", f"{_cov*100:.2f}"])
                 ndb_csv.flush()
         if wandb_log:
             wandb.log({
@@ -1439,11 +1426,9 @@ while True:
     # microbatch 被过度加权；全 mask 的 microbatch 还会返回 NaN 让整步作废。
     # （2026-09-10：本数据集 ~80% 的 256 窗口全 mask，只有 8% 的 token 参与 loss。）
     micro_batches = []
-    micro_qpos = []  # 每个 microbatch 自己的 q_pos：NDB 的 exclude_radius 靠它排除自匹配
     for _ in range(gradient_accumulation_steps):
         _mx, _my, _msid = get_batch('train')
         micro_batches.append((_mx, _my, _msid))
-        micro_qpos.append(_ndb_state.get('q_pos') if ndb is not None else None)
     micro_counts = [float((Y != -100).sum().item()) for _, Y, _ in micro_batches]
     n_valid_total = sum(micro_counts)
     last_valid_idx = max((i for i, n in enumerate(micro_counts) if n > 0), default=-1)
@@ -1458,18 +1443,15 @@ while True:
             # 我很不喜欢它让代码膨胀并迫使我们重复代码。
             # 看了那个上下文管理器的源码，它只是切换这个变量。
             model.require_backward_grad_sync = (micro_step == last_valid_idx)
-        if ndb is not None:
-            # 必须逐 microbatch 复位 q_pos：get_batch 每次都覆盖它，
-            # 一次性预取 4 个 batch 后若不复位，四个 microbatch 会全用最后一个 batch 的位置，
-            # exclude_radius 形同虚设 → 可能检索到与查询重叠的 chunk（答案泄漏，Δ 虚高）。
-            _ndb_state['q_pos'] = micro_qpos[micro_step]
-            _ndb_state['drop'] = (random.random() < ndb_dropout)
-            # 检索噪声的按步种子：同一步（含梯度检查点的反向重算）拿到同一张掩码
-            ndb.noise_seed = iter_num * 1000 + micro_step
         try:
             with ctx:
                 logits, loss = model(X, Y, sample_id=SID)
+                loss = _ndb_blend(logits, loss, X, Y)
                 loss = loss * (n_i / n_valid_total)  # token 级加权 → 全步等价于 token 均值
+            # ★ 本微步的隐藏态：必须在 backward **之前**取进本地变量。
+            #   开了梯度检查点时 backward 会重算前向，pre-hook 会再写一次
+            #   `_ndb_state['h']`（值等价但是另一张张量）；我们要的是这一次那一份。
+            _h_micro = _ndb_state.get('h') if ndb is not None else None
             # NaN 防护：loss 非有限值（nan/inf）时跳过该微步的反向，
             # 避免 NaN 梯度污染参数（一旦参数变 NaN 就永远救不回来）。
             if not torch.isfinite(loss):
@@ -1478,6 +1460,12 @@ while True:
             # 反向传播，如果以 fp16 训练则进行梯度缩放
             scaler.scale(loss).backward()
             step_loss_val += loss.item()
+            if ndb is not None and _h_micro is not None:
+                # ★ 只在**训练微步**、且**反向之后**写：eval/val 绝不进这个上下文
+                #   （`ngram_ndb.py:191` 明确警告：写进验证集 = val 泄漏）。
+                with ndb.write_enabled():
+                    ndb.observe(_h_micro.detach(), X, Y)
+                _ndb_state['h'] = None
         except torch.OutOfMemoryError:
             # 显存尖峰防护（2026-09-10）：少数 batch 会在基座前向里触发一次性 ~3GB
             # 尖峰（NDB 无关，NDB-off 对照同样发生）。把致命崩溃降级成「跳过该步」，
@@ -1548,6 +1536,9 @@ while True:
                 torch.nn.utils.clip_grad_norm_(_ndb_params, grad_clip)
             ndb_opt.step()
             ndb_opt.zero_grad(set_to_none=True)
+            # 定期把热缓冲落进表：observe 按 (level, slot, token) 一直往缓冲里累加
+            if ndb_flush_every > 0 and (iter_num + 1) % ndb_flush_every == 0:
+                ndb.flush()
 
     # 计入窗口统计（NaN/OOM 跳过的步不算，避免把残缺值拉进来）
     if not step_nan:

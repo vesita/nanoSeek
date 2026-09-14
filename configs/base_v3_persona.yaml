@@ -75,22 +75,7 @@ lr_decay_iters: 900
 # 900 步 / 100 = 9 个评估点（`always_save_checkpoint: false` 下要够密才能选出 best.pt）。
 eval_interval: 100
 
-# --- 8) NDB（外挂：forward hook + `ndb_store`；模块见 AGENTS §1 的门面表）-----
-# ★ 本段**只开读**：库由 `local/build_chunk_store.py` 离线建成（`--mode mean`），
-#   训练只学「怎么用记忆」。写侧 `MemoryCrossAttention.write_online` 是**规则式**的
-#   （人给的惊讶分位），不是"模型自己决定写"，所以本轮不开（见 TECH_DEBT §2 P1）。
-# ★ `ndb_att_sim` 是本项目最该被验证的一个旋钮：免训练探针（step 19000）实测 λ=2
-#   能用 11% 的干净增益换到「检索出错时记忆仍然有益」
-#   （25% 错误：λ=2 是 +0.24，λ=0 是 −0.36）。
-#   两条 400 步短臂的头对头见 `configs/pilot_persona_lam{0,2}.yaml`。
-# ★ 必须与建库时的 `--chunk` / `--layer` 一致，否则检索空间对不上（键 = chunk 均值）。
-ndb_store: out/mem_store/store_base_v3_dlg_gen10m.pt
-ndb_layer: -6
-ndb_chunk: 64
-ndb_top_k: 8             # 探针实测读取深度在 k≈8 饱和（P1），再大反而变差
-ndb_exclude_radius: 512  # 屏蔽与查询过近的条目，防自匹配（答案泄漏）
-ndb_dropout: 0.1         # 逼基座「有无记忆都能跑」
-ndb_retr_noise: 0.0      # 训练期检索噪声：0 = 关（监控口径干净）
-ndb_att_sim: 2.0         # ★ 把检索相似度的跨槽 z 分数加进注意力 logit（探针验证过的鲁棒性修法）
-ndb_lr: 0.0003
-ndb_eval_iters: 64
+# --- 8) NDB ------------------------------------------------------------------
+# ★ NDB 由 `base_v2.yaml` 提供并**默认启用**（`ndb_slots` 非 0），本段不覆盖。
+#   采用的方案是 `model/ngram_ndb.py`：读与写都由模型门控决定，表在训练中**在线**累积
+#   ⇒ 本段开跑即开始长表，随训练变准。监控在 `out/<run>/ndb.csv`（配对 Δ + 覆盖率）。

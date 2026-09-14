@@ -70,15 +70,17 @@ n_layer: 12
 n_memory_tokens: 0
 n_mtp: 1
 n_top_k: 2
-ndb_chunk: 64
-ndb_dropout: 0.1
-ndb_eval_iters: 64
-ndb_exclude_radius: 512
-ndb_heldout: ""
-ndb_layer: -6
-ndb_lr: 0.0003
-ndb_store: ""
-ndb_top_k: 4
+# ★ NDB 是训练的**默认组件**（2026-09-15 用户定）。采用的方案是 `model/ngram_ndb.py`：
+#   读与写都由模型门控决定，表在训练中**在线**累积。超参取自离线 A/B 探针验过的那套
+#   （`scripts/ndb_online_ab.py` 的默认值：L=8、slots=2**28、top_k=1、lr=1e-3）。
+#   `ndb_slots: 0` 即关闭 NDB，训练流程与本文件原行为逐位一致。
+ndb_eval_iters: 64                 # NDB 监控 eval 的 batch 数
+ndb_flush_every: 50                # 每多少训练步把热缓冲落进表（每次监控前也落一次）
+ndb_levels: "8"                    # 后缀长度，逗号分隔（如 "8" 或 "8,6"）
+ndb_lr: 0.001                      # 读/写门控 lr（独立 AdamW，固定不衰减）
+ndb_max_table_gb: 6.0              # 表内存上限，超过直接报错
+ndb_slots: 268435456               # 每级槽位数（2**28 ⇒ 表约 3.2GB）；0 = 关闭 NDB
+ndb_top_k: 1                       # 每槽保留的续写个数（1 = 硬检索，与探针口径一致）
 num_hash_layers: 2
 out_dir: out/base_v2
 p_distill: 0.0
