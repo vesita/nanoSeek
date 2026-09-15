@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
 from training.segmentation import (  # noqa: E402
     SPECIAL_RE,
     ContextWindow,
+    SentenceQueue,
     StreamSegmenter,
     is_special_only,
     iter_sentences,
@@ -480,3 +481,20 @@ def test_dialogue_stream_delegates_context_management():
 def test_run_cli_rejects_missing_file(capsys):
     assert run_cli(['--file', '/nonexistent/zzz.txt']) == 1
     assert '❌' in capsys.readouterr().out
+
+
+def test_single_core_streamer_and_window_share_sentence_queue():
+    # ★ StreamSegmenter 与 ContextWindow 必须都是 SentenceQueue 的薄 facade：
+    # 窗口与切分共用同一个核心类，是'以后加增量 token 计数 / KV 感知弹出'的唯一落点。
+    # 若有人把它们拆回两个独立类，这条会红，提醒先想清楚为什么。
+    assert issubclass(StreamSegmenter, SentenceQueue)
+    assert issubclass(ContextWindow, SentenceQueue)
+    # 流式与窗口只是同一核心的两个用法：状态都在 SentenceQueue 上
+    st = StreamSegmenter(hold_last=False)
+    assert isinstance(st, SentenceQueue)
+    assert st.feed('你好。') == ['你好。']
+    w = ContextWindow(measure=lambda us: sum(len(u) for u in us), budget=4)
+    assert isinstance(w, SentenceQueue)
+    w.extend(['a', 'bbbb', 'c'])
+    # 预算 4：弹出 'a'(1)→剩 5、再弹 'bbbb'(4)→剩 1（len==keep_min 停）
+    assert w.dropped == 2 and w.units == ['c']

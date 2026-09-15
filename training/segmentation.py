@@ -20,9 +20,17 @@
 于是模型看到一条没有终止符的回复。本模块用两条规则修掉：
 
 - **规则一（不切进去）**：`<...>` 形式的机制符内部绝不作为句边界
-  （`<think>第一步。</think>` 里的 `。` 不会把 token 切开）；
+  （` thinking第一步。 response` 里的 `。` 不会把 token 切开）；
 - **规则二（不单独成句）**：只由机制符与空白构成的片段，**并入前一句**
   （`<eos>` / `<resp>` 这类是"后缀标记"，天然属于它终止的那一句）。
+
+## 核心：一个"句队列"（2026-09-15 重构）
+本模块的核心只有一个类 `SentenceQueue` —— **字符流 → 有界句子队列**。
+它把原 `StreamSegmenter`（字符→句子的切分）与 `ContextWindow`（有界窗口）合并成
+**一套状态、两个用法**。`StreamSegmenter` / `ContextWindow` 现在只是它的**薄 facade**
+（公开 API 逐字不变，`DialogueStream` / `iter_sentences` / `prepare.py` 都不用改）。
+合并的意义：窗口的"弹出/溢出/测量"与切分的"压尾巴/机制符归属"规则集中在**一处**，
+以后要加"增量 token 计数 / KV 感知弹出 / 超长句索引"都只改这一个类。
 
 ## 与旧实现的行为等价性
 对**不含机制符**的输入，本模块与旧 `split_sentences.split_line` **逐字等价**
@@ -35,9 +43,9 @@ from __future__ import annotations
 import re
 from typing import List
 
-__all__ = ['SENT_PAT', 'SUB_SEP', 'SPECIAL_RE', 'ContextWindow', 'StreamSegmenter',
-           'is_special_only', 'iter_sentences', 'normalize_text', 'prepare_natural_text',
-           'process_file', 'run_cli', 'split_line', 'split_text']
+__all__ = ['SENT_PAT', 'SUB_SEP', 'SPECIAL_RE', 'ContextWindow', 'SentenceQueue',
+           'StreamSegmenter', 'is_special_only', 'iter_sentences', 'normalize_text',
+           'prepare_natural_text', 'process_file', 'run_cli', 'split_line', 'split_text']
 
 # 句末标点：全角句号/问号/叹号/省略号 + 半角 ?!，以及**不在数字之间**的半角 `.`
 # （保护 3.14 / U.S. 这类）。★ 与旧实现逐字相同，别改。
@@ -47,7 +55,7 @@ SENT_PAT = re.compile(r'[。！？…?!]|(?<!\d)\.(?!\d)')
 SUB_SEP = '，,；;、'
 
 # 机制符 / 特殊 token：`<` + 字母数字下划线**或半角点**或汉字 + `>`。
-# - 覆盖 `<eos>` `<unk>` `<cont>` `<pad>` `<bos>` `<sep>` `<think>` `<answer>` `<resp>` 等；
+# - 覆盖 `<eos>` `<unk>` `<cont>` `<pad>` `<bos>` `<sep>` ` thinking` `<answer>` `<resp>` 等；
 # - 也覆盖中文机制符（如早期的 `<你该说话了>`）；
 # - ★ 允许 `.` 是**规则一存在的理由**：`<stdio.h>` 这种名字里的 `.` 不该当句边界
 #   （不含 `.` 时规则一是空规则 —— token 里不可能出现 `。`，那字符不在字符类里）；
@@ -147,26 +155,49 @@ def _tail_is_open_token(s: str) -> bool:
     return re.fullmatch(r'<[A-Za-z0-9_.\u4e00-\u9fff]*', s[i:]) is not None
 
 
-class StreamSegmenter:
-    """增量（流式）分句器：喂任意大小的块，吐出**已经确定完整**的句子。
+# ============================================================================
+# 句队列（唯一核心）：字符流 → 有界句子队列
+# ============================================================================
 
-    三种用法都覆盖：
 
-    - **用户输入自动分句**：`feed(用户输入)` + `flush()`；
-    - **长文本（书籍等）**：`feed(整本书)` + `flush()`，或直接用 `split_text()`；
-    - **真流式**：循环 `feed(chunk)`，边界一确定就吐出来（`pending` 是压着没吐的尾巴）。
+class SentenceQueue:
+    """句队列 —— **全项目统一的"字符流 → 有界句子队列"单核**。
 
-    边界 ＝ 句末标点 **或** 换行（`newline_is_boundary=True`）。
-    换行同时充当**轮次/段落分隔**：空行产出一个空串（保持结构，与 `split_text` 一致）。
+    它把原 `StreamSegmenter`（字符→句子的切分）与 `ContextWindow`（有界窗口）
+    合并成**一套状态、两个用法**：
 
-    ★ **为什么默认会"压一段"（`hold_last=True`）**：`<eos>` / `<resp>` 这类机制符要
-      **粘在它终止/开启的那一句**上，而流式里你无法预知某句后面还会不会来一个 `<eos>`。
-      所以最后一段总是留到**下一次 `feed()` 或 `flush()`** 才吐。
-      要低延迟、且确定输入里不会有机制符时，设 `hold_last=False`（`split_text` 用的就是它）。
+    - **窗口用法**（原 `ContextWindow`）：调用方喂**已切好的单元**（`push`/`extend`），
+      它维护有界窗口 —— 超预算从头部**弹出整单元**、至少保留 `keep_min` 个、
+      单个超长单元置 `overflow`（软上限）、`budget >= NO_LIMIT` 时**完全不测量**
+      （否则解析整份语料是 **O(n²)**，2026-09-14 实测：10 万字符把验证脚本跑到
+      60s 超时被杀；修好后 0.01s）。
+    - **流式用法**（原 `StreamSegmenter`）：调用方喂**原始字符流**（`feed`/`flush`），
+      它切分并逐句吐出；`pending` 是压着没吐的尾巴（机制符要粘在它终止的那一句上，
+      所以最后一段总是留到下一次 `feed()` 或 `flush()` 才吐）。
+
+    两个公开入口类 `StreamSegmenter` / `ContextWindow` 只是本类的**薄 facade**
+    （公开 API 与旧版逐字相同，`DialogueStream` / `iter_sentences` 不用改）。
+
+    **合并的意义**：窗口的"弹出/溢出/测量"与切分的"压尾巴/机制符归属"规则集中在
+    **一处** —— 以后要加"增量 token 计数 / KV 感知弹出 / 超长句索引"都只改这一个类。
     """
 
-    def __init__(self, max_len: int = 80, *, newline_is_boundary: bool = True,
+    #: 预算 ≥ 此值 ⇒ 视为"不裁剪"，完全跳过测量（窗口用法）
+    NO_LIMIT = 10 ** 8
+
+    def __init__(self, *, measure=None, budget: int = NO_LIMIT, keep_min: int = 1,
+                 max_len: int = 80, newline_is_boundary: bool = True,
                  hold_last: bool = True, keep_empty_lines: bool = True) -> None:
+        if keep_min < 1:
+            raise ValueError('keep_min 至少为 1，否则会把窗口弹空')
+        # --- 窗口状态（原 ContextWindow）---
+        self._measure = measure
+        self.budget = int(budget)
+        self.keep_min = int(keep_min)
+        self._units: List = []
+        self.dropped = 0        # 累计弹出的**单元**数
+        self.overflow = False   # 单个单元本身就超预算 ⇒ 软上限放行
+        # --- 切分状态（原 StreamSegmenter）---
         self.max_len = int(max_len)
         self.newline_is_boundary = newline_is_boundary
         self.hold_last = hold_last
@@ -174,7 +205,42 @@ class StreamSegmenter:
         self._buf = ''
         self._after_newline = False
 
-    # ---------- 内部 ----------
+    # ---------- 窗口：访问 ----------
+
+    @property
+    def units(self) -> List:
+        """★ 返回**活的**列表：调用方会就地改最后一个单元（例如给最后一句贴 `<eos>`）。"""
+        return self._units
+
+    def size(self) -> int:
+        """当前长度（`budget >= NO_LIMIT` 时返回 0 —— 不裁剪就不必量）。"""
+        return 0 if self.budget >= self.NO_LIMIT else self._measure(self._units)
+
+    # ---------- 窗口：维护 ----------
+
+    def enforce(self) -> int:
+        """弹出首部整单元直到放得下；返回本次弹出的单元数。"""
+        if self.budget >= self.NO_LIMIT:
+            self.overflow = False
+            return 0
+        n = 0
+        while len(self._units) > self.keep_min and self._measure(self._units) > self.budget:
+            self._units.pop(0)
+            self.dropped += 1
+            n += 1
+        self.overflow = self._measure(self._units) > self.budget
+        return n
+
+    def push(self, unit) -> int:
+        self._units.append(unit)
+        return self.enforce()
+
+    def extend(self, units) -> int:
+        self._units.extend(units)
+        return self.enforce()
+
+    # ---------- 切分：内部 ----------
+
     def _drain_line(self, final: bool) -> List[str]:
         """吐出当前行**能确定**的部分。`final=True` 表示这一行已经结束（换行或流结束）。
 
@@ -210,7 +276,8 @@ class StreamSegmenter:
         self._buf = tail
         return complete
 
-    # ---------- 公开 ----------
+    # ---------- 切分：公开 ----------
+
     def feed(self, chunk: str) -> List[str]:
         """喂一块文本，返回本次**已经确定**的句子。"""
         out: List[str] = []
@@ -242,9 +309,73 @@ class StreamSegmenter:
         """还压在缓冲区里、没吐出来的尾巴。"""
         return self._buf
 
+    # ---------- 共享 ----------
+
     def reset(self) -> None:
+        """清空全部状态（窗口 + 切分尾巴）。"""
         self._buf = ''
         self._after_newline = False
+        self._units.clear()
+        self.dropped = 0
+        self.overflow = False
+
+    def __len__(self) -> int:
+        return len(self._units)
+
+    def __repr__(self) -> str:
+        return (f'SentenceQueue(单元={len(self._units)}, 预算={self.budget}, '
+                f'已弹出={self.dropped}, 溢出={self.overflow}, 待定={len(self._buf)})')
+
+
+class StreamSegmenter(SentenceQueue):
+    """增量（流式）分句器：喂任意大小的块，吐出**已经确定完整**的句子。
+
+    ★ 这是 `SentenceQueue` 的**薄 facade**（流式用法），行为与旧版逐字相同。
+
+    三种用法都覆盖：
+
+    - **用户输入自动分句**：`feed(用户输入)` + `flush()`；
+    - **长文本（书籍等）**：`feed(整本书)` + `flush()`，或直接用 `split_text()`；
+    - **真流式**：循环 `feed(chunk)`，边界一确定就吐出来（`pending` 是压着没吐的尾巴）。
+
+    边界 ＝ 句末标点 **或** 换行（`newline_is_boundary=True`）。
+    换行同时充当**轮次/段落分隔**：空行产出一个空串（保持结构，与 `split_text` 一致）。
+
+    ★ **为什么默认会"压一段"（`hold_last=True`）**：`<eos>` / `<resp>` 这类机制符要
+      **粘在它终止/开启的那一句**上，而流式里你无法预知某句后面还会不会来一个 `<eos>`。
+      所以最后一段总是留到**下一次 `feed()` 或 `flush()`** 才吐。
+      要低延迟、且确定输入里不会有机制符时，设 `hold_last=False`（`split_text` 用的就是它）。
+    """
+
+    def __init__(self, max_len: int = 80, *, newline_is_boundary: bool = True,
+                 hold_last: bool = True, keep_empty_lines: bool = True) -> None:
+        super().__init__(max_len=max_len, newline_is_boundary=newline_is_boundary,
+                         hold_last=hold_last, keep_empty_lines=keep_empty_lines)
+
+
+class ContextWindow(SentenceQueue):
+    """按单元（通常就是"句"）滑动的上下文窗口 —— 本项目**统一**的上下文管理。
+
+    ★ 这是 `SentenceQueue` 的**薄 facade**（窗口用法），行为与旧版逐字相同。
+
+    规则（用户原话）：**总长超过上下文窗口后，弹出首部的句子，直到能够放进新句子。**
+
+    - **与"怎么算长度"解耦**：`measure(units) -> int` 由调用方给。对
+      `DialogueStream` 来说，长度是"把当前记录渲染成文本 + 末尾 `<resp>` 再编码"的
+      token 数（所以标签、换行都算进去）。
+    - **只在单元边界弹出** ⇒ 永远不会留下半句。
+    - **至少保留 `keep_min` 个单元** ⇒ 单个超长单元时不死循环，改为置
+      `overflow=True`（软上限；调用方据此决定要不要硬截）。
+    - **`budget >= NO_LIMIT` 时完全不做测量**（见 `SentenceQueue.NO_LIMIT`）。
+
+    用法：
+        win = ContextWindow(measure=len, budget=256)
+        win.extend(['a。', 'b。', 'c。'])
+        win.units        # 只保留放得下的那几段
+    """
+
+    def __init__(self, measure, budget: int, *, keep_min: int = 1) -> None:
+        super().__init__(measure=measure, budget=budget, keep_min=keep_min)
 
 
 def split_text(text: str, max_len: int = 80) -> str:
@@ -255,92 +386,6 @@ def split_text(text: str, max_len: int = 80) -> str:
     """
     seg = StreamSegmenter(max_len, hold_last=False)
     return '\n'.join(seg.feed(text) + seg.flush())
-
-
-# ============================================================================
-# 上下文管理（按句滑窗）—— 用户 2026-09-14 定的规则
-# ============================================================================
-
-
-class ContextWindow:
-    """按单元（通常就是"句"）滑动的上下文窗口 —— 本项目**统一**的上下文管理。
-
-    规则（用户原话）：**总长超过上下文窗口后，弹出首部的句子，直到能够放进新句子。**
-
-    设计要点：
-
-    - **与"怎么算长度"解耦**：`measure(units) -> int` 由调用方给。对
-      `DialogueStream` 来说，长度是"把当前记录渲染成文本 + 末尾 `<resp>` 再编码"的
-      token 数（所以标签、换行都算进去）。
-    - **只在单元边界弹出** ⇒ 永远不会留下半句。
-    - **至少保留 `keep_min` 个单元** ⇒ 单个超长单元时不死循环，改为置
-      `overflow=True`（软上限；调用方据此决定要不要硬截）。
-    - **`budget >= NO_LIMIT` 时完全不做测量**。★ 这条不是微优化：不裁剪时若仍逐次
-      量长度，解析整份语料是 **O(n²)**（2026-09-14 实测：10 万字符的语料把验证脚本
-      跑到 60s 超时被杀；修好后 0.01s）。
-
-    用法：
-        win = ContextWindow(measure=len, budget=256)
-        win.extend(['a。', 'b。', 'c。'])
-        win.units        # 只保留放得下的那几段
-    """
-
-    #: 预算 ≥ 此值 ⇒ 视为"不裁剪"，完全跳过测量
-    NO_LIMIT = 10 ** 8
-
-    def __init__(self, measure, budget: int, *, keep_min: int = 1) -> None:
-        if keep_min < 1:
-            raise ValueError('keep_min 至少为 1，否则会把窗口弹空')
-        self._measure = measure
-        self.budget = int(budget)
-        self.keep_min = int(keep_min)
-        self._units: List = []
-        self.dropped = 0        # 累计弹出的**单元**数
-        self.overflow = False   # 单个单元本身就超预算 ⇒ 软上限放行
-
-    # ---------- 访问 ----------
-    @property
-    def units(self) -> List:
-        """★ 返回**活的**列表：调用方会就地改最后一个单元（例如给最后一句贴 `<eos>`）。"""
-        return self._units
-
-    def size(self) -> int:
-        """当前长度（`budget >= NO_LIMIT` 时返回 0 —— 不裁剪就不必量）。"""
-        return 0 if self.budget >= self.NO_LIMIT else self._measure(self._units)
-
-    # ---------- 维护 ----------
-    def enforce(self) -> int:
-        """弹出首部整单元直到放得下；返回本次弹出的单元数。"""
-        if self.budget >= self.NO_LIMIT:
-            self.overflow = False
-            return 0
-        n = 0
-        while len(self._units) > self.keep_min and self._measure(self._units) > self.budget:
-            self._units.pop(0)
-            self.dropped += 1
-            n += 1
-        self.overflow = self._measure(self._units) > self.budget
-        return n
-
-    def push(self, unit) -> int:
-        self._units.append(unit)
-        return self.enforce()
-
-    def extend(self, units) -> int:
-        self._units.extend(units)
-        return self.enforce()
-
-    def reset(self) -> None:
-        self._units.clear()
-        self.dropped = 0
-        self.overflow = False
-
-    def __len__(self) -> int:
-        return len(self._units)
-
-    def __repr__(self) -> str:
-        return (f'ContextWindow(单元={len(self._units)}, 预算={self.budget}, '
-                f'已弹出={self.dropped}, 溢出={self.overflow})')
 
 
 def iter_sentences(chunks, max_len: int = 80, **kwargs):
