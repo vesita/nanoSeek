@@ -1,0 +1,47 @@
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+val=data/chinese/val_char_v3_know.bin (4,950,588 tok)  源=14  窗口/源=32  block=256  特殊id=2075
+  [对齐对照] deepseek_r1_distill_dialogue.txt   token/raw_chars = 0.9987
+参数量：75.15M
+
+=== step 900  (out/base_v3_persona/last.pt) ===
+来源                                  组          real CE   top1%  shuf CE  unigram  real-uni   n_tok
+code_alpaca_dialogue.txt            代码          5.1793   26.35   7.0829   6.2955   -1.1162   8,069
+coig_code_dialogue.txt              代码          4.8522   28.42   6.7505   6.1746   -1.3225   8,125
+coig_cqia_dialogue.txt              代码          5.4123   25.40   7.3165   6.3796   -0.9672   8,100
+coig_logic_dialogue.txt             数学/推理       5.3938   25.49   7.1838   6.2739   -0.8801   8,116
+coig_math_dialogue.txt              数学/推理       4.9092   27.93   6.8917   6.2143   -1.3051   8,135
+coig_other_dialogue.txt             对话          5.1900   26.55   7.1383   6.2060   -1.0160   8,114
+coig_wiki_dialogue.txt              知识/长文       5.0957   26.43   7.0332   6.2752   -1.1795   8,126
+deepseek_r1_distill_dialogue.txt    对话          5.2316   26.70   7.1067   6.2758   -1.0443   8,123
+gsm8k_cot_dialogue.txt              数学/推理       5.3721   24.21   7.0971   6.3888   -1.0167   8,125
+muice_dialogue.txt                  对话          5.1787   25.24   7.0497   6.3486   -1.1699   8,107
+qa_knowledge.txt                    对话          5.5340   24.11   7.2392   6.4530   -0.9190   8,107
+qwen3_235b_distill_dialogue.txt     对话          5.4448   24.76   7.2254   6.3494   -0.9046   8,087
+zhihu_kol_dialogue.txt              知识/长文       6.3922   18.99   7.6284   6.7733   -0.3811   8,180
+已落盘窗口起点 → analysis/windows_v3know.json（13 源）
+参数量：75.15M
+
+=== step 18000  (out/base_v3_know2/last.pt) ===
+来源                                  组          real CE   top1%  shuf CE  unigram  real-uni   n_tok
+code_alpaca_dialogue.txt            代码          2.3438   52.76   4.7431   6.2955   -3.9517   8,069
+coig_code_dialogue.txt              代码          2.1484   56.21   4.5844   6.1746   -4.0262   8,125
+coig_cqia_dialogue.txt              代码          2.3783   52.02   4.7960   6.3796   -4.0013   8,100
+coig_logic_dialogue.txt             数学/推理       2.5431   49.64   4.7708   6.2739   -3.7307   8,116
+coig_math_dialogue.txt              数学/推理       2.1635   54.53   4.5787   6.2143   -4.0508   8,135
+coig_other_dialogue.txt             对话          2.2480   53.60   4.7168   6.2060   -3.9581   8,114
+coig_wiki_dialogue.txt              知识/长文       2.2801   52.74   4.6468   6.2752   -3.9952   8,126
+deepseek_r1_distill_dialogue.txt    对话          2.2967   53.44   4.6879   6.2758   -3.9791   8,123
+gsm8k_cot_dialogue.txt              数学/推理       2.6821   47.32   4.7734   6.3888   -3.7067   8,125
+muice_dialogue.txt                  对话          2.3604   52.51   4.7209   6.3486   -3.9882   8,107
+qa_knowledge.txt                    对话          2.7117   48.11   4.8866   6.4530   -3.7413   8,107
+qwen3_235b_distill_dialogue.txt     对话          2.5760   49.13   4.7879   6.3494   -3.7734   8,087
+zhihu_kol_dialogue.txt              知识/长文       3.5521   35.05   5.0152   6.7733   -3.2212   8,180
+
+=== 分组汇总（token 加权）===
+   step         散文/语言        知识/长文           代码        数学/推理           对话
+    900             -       5.7461       5.1476       5.2248       5.3157
+  18000             -       2.9182       2.2899       2.4628       2.4384
+
+=== 全库 token 加权（= 逐源明细的加权和，可与训练日志交叉核对）===
+  step    900  real 5.3225   shuffled 7.1341   unigram 6.3393   n_tok 105,514
+  step  18000  real 2.4840   shuffled 4.7468   unigram 6.3393   n_tok 105,514

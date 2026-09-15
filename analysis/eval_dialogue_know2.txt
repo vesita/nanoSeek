@@ -1,0 +1,19 @@
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+参数量：75.15M
+
+=== 评估 out/_eval_know2 ===
+  avg_len=39.5 rep2=0.0289 rep3=0.0123 rep4=0.0083 ws=0.0022 d1=0.9132 d2=0.9856 turns=0.0 样式=none(给了 ab)
+  模型配置: mhc=False lse=False no_attn_layers=[] block_order=attn_ffn
+  [代表样本] prompt='A：你好\nB：'
+    → 你好!面对您的感受非常棒！有没有什么情况是你觉得哪些特别专业或者有趣的事尝试？
+当然,我很乐意提供帮助:定期进行健康饮食、心理咨询以及全身健康脂肪推荐。
+
+
+======== 智能度对比汇总 ========
+模型                           |   len |   rep2 |   rep3 |   rep4 |    ws% |     d1 |     d2 | turns
+----------------------------------------------------------------------------------------------------
+out/_eval_know2              |  39.5 | 0.0289 | 0.0123 | 0.0083 |     0% | 0.9132 | 0.9856 |   0.0
+
+指标说明：repN=字符 n-gram 重复率(越低越好·重复坍缩) | ws%=空白占比(越低越好·loss骗低) | d1/d2=多样性(越高越好) | turns=对话轮次结构(越高越好·碎片拼贴反面)
+
+完整样本已写入 dev-notes/eval_dialogue_samples.json

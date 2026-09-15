@@ -15,18 +15,26 @@
 （用户明确要求：NDB **可读可写**，且**由模型自己决定**怎么读写）。
 
 **当前主线（2026-09-14 起，用户拍板：陪聊人格）**：
- 0. **★ 人格层 `v3_persona` 是当前站** —— 配置 `configs/base_v3_persona.yaml`，
-    单元 `nanoseek-persona-smoke`（**跑完自己消失**，`inactive` 不代表训练"死了"），
-    接 `out/base_v3_dlg/last.pt`，**单流 `<resp>` 格式 + `mask_mode: resp_span`**。
-    ★★ 语料是 **86k token 的冒烟量 / 300 步 ≈ 28 epoch** ⇒ 它只证明**链路**，
+ 0. **★ 三站接力：`persona`(站1) → `know2`(站2) 已跑完；站 3 `persona2` 用户 2026-09-15 明确
+    「后面的阶段先不训练了」⇒ 未启动。当前权重 = `out/base_v3_know2/last.pt`。**
+    **效果审查见 `analysis/know2_stage_review.md`**（两把尺子 + 污染率 + 生成侧指标 +
+    OOD 原文逐条对照 + NDB 第一次真实 Δ）。
+    ★★★ **站 1 人格段的配方是本项目最贵的灾难性遗忘现场，再跑人格段必须先改配方**：
+    语料仅 ~86k token、900 步 ≈ **85 遍**、lr 2e-4 ⇒ v2 val 从 B 段的 3.7458 抬到 **5.8594**；
+    **单源**（`水浒传.txt`）才看得见真相：`real − unigram` **由负转正**（比 unigram 基线还差）、
+    top-1 从 17.8% 塌到 **9.9%**。⇒ 人格段必须**低 lr（≤5e-5）+ 少 epoch（≤3）+ 混通用数据 replay**，
+    否则每个后续阶段都得替它还债（站 2 就把 5.8594 修回了 3.4371）。
+    人格段配置 `configs/base_v3_persona.yaml`，接 `out/base_v3_dlg/last.pt`，
+    **单流 `<resp>` 格式 + `mask_mode: resp_span`**。
+    ★★ 人格语料是**冒烟量级**（~86k token）⇒ 它只证明**链路**，
     **别**拿它的 loss 或样本当人格质量结论。
     ★★ **人格的具体设定（性格/语气/措辞）不许写进仓库**（用户：「这些句话除了在上下文中，
     其他地方不要留下任何记录」）—— 语料与规格都在 `~/datasets/persona/`（仓库外），
     仓库里只放格式/掩码/配置/验收工具。**不要**把对话正文或人设描述粘进文档、提交信息、测试。
     ★ 验收工具 `scripts/resp_bin_probe.py`（查 `<resp>`/`<eos>` 配平、**有效 token 占比**、
     两条 loss 口径逐位一致、编解码往返）；实测 2,313/2,313 配平、**64.87% 有效**。
-    ✅ **Step A 冒烟已跑完**（`Result=success`、300 步、19.8 min、异常 0；
-    val 3.50 → 0.128 —— 28 epoch ⇒ **背下来了**，只证明链路）。
+    ✅ **Step A 冒烟（300 步）与站 1 正式段（900 步）都已跑完**；冒烟 `Result=success`、
+    val 3.50 → 0.128 —— 28 epoch ⇒ **背下来了**，只证明链路（⚠ 上面那条灾难性遗忘就是它的代价）。
     端到端验收 `scripts/single_stream_e2e.py` 四条全过：**收尾 6/6**、
     `parse_log(render())` 往返一致、`<resp>` 不进 loss、渲染行级无相邻同说话人。
     ⚠ 报告含生成正文 ⇒ 放仓库外 `~/datasets/persona/reports/`，**别写进 `analysis/`**。
@@ -47,7 +55,12 @@
     "`observe` 只能出现在 `write_enabled()` 里"（否则 val 泄漏）。
     ★ 实测（`base_v3_persona.yaml`，40 步配对，只差 `ndb_slots`）：代价 **+7.8% 墙钟 / +0.2G 显存**；
     6 步冒烟：`write_gate.weight`（初始化全零）训后 |sum|=**0.684**、覆盖率 **0→40.6%**。
-    ⚠ **本方案自己的 Δ 尚无实测** —— `ndb.csv` 的 `base_off`/`mem`/`delta`/`coverage` 就是为它记的。
+    ★★ **Δ 已实测（2026-09-15，站 2 通识段，`analysis/know2_stage_review.md` §7）**：
+    9 个配对评估点，**均值 −0.00029、SE 0.00017（t=1.75）、最小 −0.0013、最大 +0.0004**
+    ⇒ **只能说"上界 ≤ 0.0013 nats（≤0.061%）"，不能说"NDB 有效"**（§5.5）。
+    同期 `write_gate_bias` 1.0000→3.8225 **严格单调**（σ=0.979）、覆盖率 0%→**52.25%**、
+    表填 82.0M 槽 ⇒ **"可读可写、由模型自己决定"在行为上成立，但收益是记忆性的、不迁移到 val**。
+    站 1（人格段）是同机制的另一端：表饱和时 Δ 稳定**为正**（+0.0011~+0.0092，略有害）。
     历史笔记里的 **Δ=−0.0738** 属于**已退役的另一套载具**（离线建库 + 只读 cross-attn），不可搬用；
     全过程见 `dev-notes/82`，旧载具的记录在 `analysis/NDB_cotrain_STATE_2026-09-10.md`。
     ★ **一手证据一律放被 git 跟踪的路径**（`analysis/` / `dev-notes/`）——
@@ -123,20 +136,21 @@ HSA_OVERRIDE_GFX_VERSION=10.3.0 HSA_ENABLE_SDMA=0    # gfx1030 必需
   `pyproject.toml` 另行解析/同步一套环境，可能跑在**不同的 torch/依赖**上，
   于是"测试全绿"证明的**不是本项目的环境**。命令统一写成：
   `.venv/bin/python -m pytest -q -m 'not slow'` / `.venv/bin/python -m ruff check .`
-- **训练跑在 systemd 用户单元里**（铁律 0），最新一站是 **人格层 `v3_persona`（Step A 冒烟）**，看它一眼用：
+- **训练跑在 systemd 用户单元里**（铁律 0）。已跑完的接力：`persona`(站1) → `know2`(站2)；
+  **站 3 `persona2` 用户明确"先不训练了"** ⇒ **当前没有任何训练单元在跑**，
+  找不到 `training/train.py` 进程是**正常的**（别当成"训练死了"）。
+  ★ 单元名 / 日志名 / `scripts/watch.sh:22-23` 的默认值**三者必须跟着当前站一起改**（铁律 12/13）。
+  ★ 看单元：`--collect` 起的单元**跑完自己消失**，`is-active` 返回 `inactive`、
+  `systemctl status` 报 "could not be found" **都是正常的** —— 成败要看日志里的
+  `最终 best_val_loss` 与异常关键字，**别只看 `is-active`**。
   ```bash
-  systemctl --user is-active  nanoseek-persona-smoke.service
-  systemctl --user status      nanoseek-persona-smoke.service --no-pager | head -14
+  systemctl --user is-active  <单元名>.service
+  systemctl --user status      <单元名>.service --no-pager | head -14
   ```
-  单元名：`nanoseek-persona-smoke`（**当前**：人格层，跑 `configs/base_v3_persona.yaml`。
-  ★ 它用 `--collect` 起的 ⇒ **跑完单元自己消失**，`is-active` 返回 `inactive` 且
-  `systemctl status` 报 "could not be found" **都是正常的**，要看日志判断是成功还是失败）。
-  ⇒ 要接着训是**新的一站**，必须新起单元名（并同步改 `scripts/watch.sh:20-21`）。
-  ✅ **上一站 `nanoseek-v3-dlg`（B 段对话专修）2026-09-14 13:28 正常结束**
-  （`Result=success`、14000/14000 步；⚠ 它跑在修 off-by-one **之前**，优化器步实际 14001）；
-  ⚠ **旧单元 `nanoseek-base-v2` 已停**
-  （2026-09-13 12:48 stop，终态 step **61776**，它的 `last.pt` = step 61000）；
-  `nanoseek-pause-65000`（65000 步看守）**从未触发、已作废**，
+  ✅ 历史单元：`nanoseek-v3-dlg`（B 段对话专修）、`nanoseek-persona1`（站1 人格）、
+  `nanoseek-know2`（站2 通识）。
+  ⚠ 旧单元 `nanoseek-base-v2` 已停（终态 step **61776**，它的 `last.pt` = step 61000）；
+  `nanoseek-pause-65000`（65000 步看守）**从未触发、已作废** ——
   **别**再照抄它们的命令去判断"训练是不是死了"。
   ⚠ `systemctl --user` 的单元**不随会话重启而死**，但**随手用 `setsid nohup` 起的会死**。
 
@@ -209,9 +223,9 @@ AI 会话的 `sleep N` 链**是单点故障** —— 半夜 bash 定时器到点
 `sleep` 链只用来让我自己醒来后看一眼**；醒来先读 `out/watch_heartbeat.log` 补盲区，
 再跑一次 `watch.sh` 做即时确认。定时器本身用
 `systemctl --user list-timers nanoseek-watch.timer` 验证。
-⚠★ **换 run 必须同步改 `scripts/watch.sh:20-21` 的默认 `OUT_DIR`/`LOG`** ——
+⚠★ **换 run 必须同步改 `scripts/watch.sh:22-23` 的默认 `OUT_DIR`/`LOG`** ——
 它俩是写死的默认值。不同步的后果不是"少看日志"：**新目录的 ckpt 不会被 prune，磁盘会被写满**，
-而且日志/异常关键字扫的是旧 run（2026-09-14 起默认已指向 `out/base_v3_persona`）。
+而且日志/异常关键字扫的是旧 run（2026-09-15 已切到 `out/base_v3_know2`；**换站时必须再改**）。
 
 ---
 
@@ -385,6 +399,17 @@ step > 22000   全 token 均匀采样、全部算 loss                 val ≈ 4
   **都不是"见过"造成的**。⚠ 覆盖面只有 48%/60%（含 `<eos>` 的窗口查不了），且只测逐字、
   **近重复未测**。
 
+★★ **2026-09-15 追加（站 2 审查实测，`analysis/know2_stage_review.md`）：光有"两把尺子"仍然不够 ——
+两把都只看汇总，还是会漏掉灾难。** 站 1（人格段）在**自己**的 val 上是 0.33（低得漂亮），
+同时把 v2 val 从 3.7458 抬到 **5.8594**；**读了单源**才看见真相：`水浒传.txt` 上
+`real − unigram` **由负转正**（比 unigram 基线还差）、top-1 17.8%→**9.9%**。⇒ 追加三条：
+- **"自己的 val 变好"推不出"模型没变坏"** —— 小语料多遍（本例 ≈85 遍）+ 高 lr
+  会同时把域内 loss 打到很低、把通用能力打到不如 unigram。
+- 分段验收**必须带一个与本站语料无关的通用尺子**（v2 val + `per_source_ce_probe`），
+  并且**至少读完一个单源**（汇总会把"某类文本整体崩掉"平均掉）。
+- **上游打坏的，下游要花步数还**：站 2 把 5.8594 修回 3.4371（比 B 段还好 0.31）⇒
+  "每段独立验收"是省时间的做法，不是形式主义。
+
 ---
 
 ## 6. 数据侧的三个硬事实（2026-09-11 实测，别再重新发现）
@@ -478,7 +503,7 @@ step > 22000   全 token 均匀采样、全部算 loss                 val ≈ 4
 | 多轮对话评估 | `inference/scripts/eval_multiturn.py`（**也必带 `--style`**：收尾率/自开轮次率/收不住率；2026-09-13 前它写死 v1 标签，评 v2 会喂 OOD，见 `TECH_DEBT` §1.13）|
 | 采样 / 对话 | `inference/sample.py`、`inference/scripts/chat.py`（或 `cli.py sample` / `cli.py chat`）|
 | 巡检 | `scripts/watch.sh` |
-| **v3 分段训练配方（当前主线 = 人格层 `v3_persona`）** | ★ **人格层（当前）**：`configs/base_v3_persona.yaml`（`extends: base_v2.yaml`），`init_from: out/base_v3_dlg/last.pt`，`data_prefix: v3_persona`，**`use_loss_masking: true` + `mask_mode: resp_span`**（单流格式必需，见下一条）。★ **B 段**：`configs/base_v3_dlg.yaml`，`init_from: out/base_v2/last.pt`（step 61000）—— **A 段 `configs/base_v3_know.yaml` 已被用户 2026-09-13 拍板跳过**，配方保留备用。启动就是 `train.py configs/base_v3_*.yaml`，**不要再堆一长串命令行参数**（方案文档里那串参数已经全部写进配置）。★★ 铁律 **12**：warm start 的 `init_from=<路径>.pt` **不是** `resume`，照样触发 `_backup_old_run` ⇒ **每段必须有自己的 `out_dir`**。三条断言钉着：`test_project_layout.py::test_v3_stage_config_safety`（第 (4) 条按 `mask_mode` 分支）/ `::test_all_config_out_dirs_are_pairwise_distinct` / `V3_STAGE_STEPS` |
+| **v3 分段训练配方（接力 `persona` → `know2` → `persona2`）** | ★ **已跑完站 1+2**：`configs/base_v3_persona.yaml`（站1，`init_from: out/base_v3_dlg/last.pt`，`data_prefix: v3_persona`，**`use_loss_masking: true` + `mask_mode: resp_span`**，单流格式必需，见下一条；⚠ **该配方会造成灾难性遗忘，再跑必须先改**，见 §1 第 0 条）→ `configs/base_v3_know2.yaml`（站2，`init_from: out/base_v3_persona/last.pt`，`data_prefix: v3_know`，masking off）。★ **未跑站 3**：`configs/base_v3_persona2.yaml`（`init_from: out/base_v3_know2/last.pt`）。★ **B 段**：`configs/base_v3_dlg.yaml`，`init_from: out/base_v2/last.pt`（step 61000）—— **A 段 `configs/base_v3_know.yaml` 已被用户 2026-09-13 拍板跳过**，配方保留备用。启动就是 `train.py configs/base_v3_*.yaml`，**不要再堆一长串命令行参数**（方案文档里那串参数已经全部写进配置）。★★ 铁律 **12**：warm start 的 `init_from=<路径>.pt` **不是** `resume`，照样触发 `_backup_old_run` ⇒ **每段必须有自己的 `out_dir`**。三条断言钉着：`test_project_layout.py::test_v3_stage_config_safety`（第 (4) 条按 `mask_mode` 分支）/ `::test_all_config_out_dirs_are_pairwise_distinct` / `V3_STAGE_STEPS` |
 | **单流 `<resp>` 语料的 loss 掩码 / 产物验收** | ★ 掩码：`training/masking.py::build_resp_span_mask`（`<resp>` 之后 → 对应 `<eos>` 含，**不含 `<resp>`**）；权威定义是 `training/dialogue_stream.py::loss_token_spans`，**两者必须对所有输入逐位一致**（相邻 `<resp>` 这种退化输入曾让它们分叉 —— 那次是**实现**错）。`train.py` 用 `--mask_mode=resp_span` 选它（未知值**断言退出**，不静默退回）。★ bin 验收：`scripts/resp_bin_probe.py` —— `build_stages.py` 的 `check_terminators` **看不见 `<resp>`**，本脚本补上：`<resp>`/`<eos>` 配平、孤儿计数、**有效 token 占比**、两条口径逐位一致、编解码往返（★ `decode` 必须 `skip_special_tokens=False`）。`--selftest` 带已知答案对照 |
 | 配对重评 / val 噪声 | `scripts/ckpt_paired_eval.py` |
 | **逐来源的语言能力（"会不会认字"）** | `scripts/per_source_ce_probe.py` —— 按 manifest 的 `val_blocks` 把 val 切回**来源**，报 `real / shuffled / unigram` 三级对照。`real − shuffled` = 真的在读上下文的净度量（`shuffled` 保住相邻对、毁掉长上下文）。★ **口径与 `use_loss_masking` 无关**，所以 **step 22000 那条断裂线在它的表里不存在**，可以跨全程比较。★ **可以换 val**：`--data/--offsets/--manifest/--train-bin` 指到 `v3_*` 就能评 stage 自己的 val（§5.12 要求两把尺子都报）。★★ 曾经写在"源对齐对照"里的三个源名是 **v2 manifest 专属**，换 manifest 会 `KeyError`（2026-09-14 修，见 `align_control_names()` + 4 条测试）。★ `--dump-windows <json>` 把**实际用到的窗口起点**落盘，供污染率审计复用。★ 加 `--control-random` 会再评一个**随机初始化**的模型当已知答案对照（实测 real−shuffled = **+0.001**，B 终态是 **−1.65**，随机权重落在 log(8192)=9.01 ≈ 瞎猜）——**下结论前先看这一行**。⚠ 此前那句"v3 val 已被 v2 见过 99%"**在逐字 32-gram 口径下实测为 0/153**，别再引用它当理由 |
@@ -521,7 +546,7 @@ CE 只吃 token，不受标签格式影响，是更硬的证据。
 ## 10. 目录导航
 
 ```
-configs/            训练配置（base_v2.yaml = 基座；base_v3_persona.yaml = **当前站**；base_v3_{know,dlg}.yaml = 前两站；★ 必须放在 out_dir 之外）
+configs/            训练配置（base_v2.yaml = 基座；base_v3_{persona,know2,persona2,dlg,know}.yaml = v3 分段配方；★ 必须放在 out_dir 之外）
 training/train.py   ★ 1473 行的模块级脚本 —— import 它就等于开始训练，不能单测
 training/           已抽出的纯函数模块（schedules / masking / checkpoints / run_logs / diag）
 model/              模型与组件（NDB 只有一个载具 ngram_ndb.py：读写都由模型门控、表在线累积）
@@ -571,7 +596,7 @@ dev-notes/83-PROJECT_STATE最终快照.md  ⚠ 旧状态文档的**冻结快照*
 
 **维护本页的两条约束**：
 - **预算 65536 字节**（harness 的 `maxBytes`），超了会**从宽泛的文件开始省略**。
-  ★ **2026-09-15 实测：本页约 50 KB ≈ 预算的 77%**，余量 ~15 KB
+  ★ **2026-09-15 实测：本页约 54 KB ≈ 预算的 82%**，余量 ~11 KB
   ⇒ 新增内容先想"能不能并进已有条目"。
   **状态与数字**（step 数、val、磁盘）**一律不写进任何文档** —— 它们过期得比谁都快；
   需要时现场读（本页 §4 第 ⑧ 条）。
