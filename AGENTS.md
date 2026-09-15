@@ -200,7 +200,8 @@ git log --oneline -10                # 刚发生了什么
 ★★ **巡检已由 systemd 定时器兜底：`nanoseek-watch.timer`（每 30 分钟跑一次 `watch.sh`，
 输出追加进 `out/watch_heartbeat.log`）**。2026-09-14 实测的教训：
 AI 会话的 `sleep N` 链**是单点故障** —— 半夜 bash 定时器到点结束后，harness 的完成通知
-**迟了 6 小时**才送到我手里（会话被挂起/休眠时通知不推进），于是那 6 小时里**没有任何巡检**，
+**迟了 6 小时**才送到我手里（★ 2026-09-15 查明根因：**API 用量限制打满**，
+通知要等额度恢复才推进 —— 不是会话休眠），于是那 6 小时里**没有任何巡检**，
 而我（和读文档的人）会以为在监控。训练没受影响（systemd 单元独立于会话，
 `NRestarts=0`、进度条时长与墙钟逐秒吻合），但"以为在监控"本身就是本项目最忌讳的失败模式
 （同铁律 6/11 的根因）。
@@ -445,7 +446,7 @@ step > 22000   全 token 均匀采样、全部算 loss                 val ≈ 4
 | 10 | **重启训练 ⇒ 监控节律重置回 300s** | 问题一般发生在早期 |
 | 11 | **保留/清理策略不许只活在外部进程里** —— 外部看守会随会话重启一起死（见铁律 0）| `results.csv` 续训被截成 0 字节；归档清理依赖看守 |
 | **12** | **★ warm start（`init_from=<路径>.pt`）必须配独立 `out_dir`** —— 判据是 `init_from != 'resume'`，而 `<路径>.pt` **不是** `resume` ⇒ `_backup_old_run` 照样触发 | 2026-09-13 拟三阶段方案时命令块里写了 `--init_from=out/base_v2/last.pt` 却**漏了 `--out_dir`**；照抄 + `configs/base_v2.yaml`（`out_dir: out/base_v2`）会把基座 61000 步的**全部 ckpt（含 `last.pt` 自己）静默挪进 `old/`**。⚠ 模型**先加载、后归档**，所以**不会当场崩** —— 这正是它阴险的地方。已建 `configs/base_v3_{know,dlg}.yaml` 并加两条断言（`test_v3_stage_config_safety` / `test_all_config_out_dirs_are_pairwise_distinct`）。与铁律 3、9 **同一个根因**（`out_dir` 会被整体归档）|
-| **13** | **★「定期要发生」的运维动作必须落在 systemd 用户 `*.timer` 里，不许只活在 AI 会话的 `sleep` 链里** | 2026-09-14：`sleep 1800` 巡检链 02:05 到点后，harness 的**完成通知迟了 6 小时**才送达（会话挂起时通知不推进）⇒ 6 小时内**零巡检**，而所有人都以为在监控。训练没受影响（`NRestarts=0`），但"以为在监控"是铁律 6/11 同族失败模式。已建 `nanoseek-watch.timer` → `out/watch_heartbeat.log`；`sleep` 链只用来让自己醒来。详见本页 §4 |
+| **13** | **★「定期要发生」的运维动作必须落在 systemd 用户 `*.timer` 里，不许只活在 AI 会话的 `sleep` 链里** | 2026-09-14：`sleep 1800` 巡检链 02:05 到点后，harness 的**完成通知迟了 6 小时**才送达；★ 2026-09-15 **查明根因 = API 用量限制打满**（通知要等额度恢复才推进，**不是**会话休眠），且同日**再次复现一次**（这次迟 5.5h）⇒ 那段时间**零巡检**，而所有人都以为在监控。训练没受影响（`NRestarts=0`），但"以为在监控"是铁律 6/11 同族失败模式。已建 `nanoseek-watch.timer` → `out/watch_heartbeat.log`；`sleep` 链只用来让自己醒来。详见本页 §4 |
 | **14** | **★ 别用 `cmd \| tail` 串 `&&`** —— 管道会把退出码换成 `tail` 的 **0**，**失败被静默吞掉** | 2026-09-14：`pytest ... \| tail -3 && git commit` 把**跑红的测试**当成通过提交了（`42ebe2f` 就是坏状态）。修法：命令前加 **`set -o pipefail`**（或分开写、取 `$?`）。★ 同族的还有"**验证脚本自己用错 `decode` 默认值**"（`Tokenizer.decode` 默认 `skip_special_tokens=True`，会吞掉 `<eos>`）——**测量脚本要当代码审**，我在这上面连栽三次 |
 
 ---
