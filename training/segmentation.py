@@ -185,13 +185,18 @@ class SentenceQueue:
     #: 预算 ≥ 此值 ⇒ 视为"不裁剪"，完全跳过测量（窗口用法）
     NO_LIMIT = 10 ** 8
 
-    def __init__(self, *, measure=None, budget: int = NO_LIMIT, keep_min: int = 1,
+    def __init__(self, *, measure=None, unit_size=None, sep_size: int = 0,
+                 budget: int = NO_LIMIT, keep_min: int = 1,
                  max_len: int = 80, newline_is_boundary: bool = True,
                  hold_last: bool = True, keep_empty_lines: bool = True) -> None:
         if keep_min < 1:
             raise ValueError('keep_min 至少为 1，否则会把窗口弹空')
         # --- 窗口状态（原 ContextWindow）---
-        self._measure = measure
+        self._measure = measure          # 整窗重算的测量回调（`DialogueStream` 的合并轮次用它）
+        self._unit_size = unit_size      # 增量模式：每个单元的单独大小（**可分解**测量）
+        self._sep_size = int(sep_size)   # 增量模式：单元间统一分隔符的大小
+        self._incremental = unit_size is not None  # 可分解 ⇒ 用 O(1) 运行计数，不整窗重算
+        self._size = 0                   # 增量模式的运行长度
         self.budget = int(budget)
         self.keep_min = int(keep_min)
         self._units: List = []
@@ -207,14 +212,33 @@ class SentenceQueue:
 
     # ---------- 窗口：访问 ----------
 
+    def _add_size(self, units) -> None:
+        """增量模式：把 `units` 追加进窗口时同步累计长度（O(len)，不重算整窗）。
+
+        规则：总长 = Σ unit_size(u) + sep_size × 单元间分隔数。
+        空窗 加 n 个 ⇒ 分隔数 n−1；非空窗 加 n 个 ⇒ 分隔数 n。"""
+        if not self._incremental:
+            return
+        n_new = len(units)
+        seps = (n_new - 1) if not self._units else n_new
+        self._size += sum(self._unit_size(u) for u in units) + self._sep_size * seps
+
+    def _sub_size(self) -> None:
+        """增量模式：从**首部**弹出一个单元时同步扣长度（单元大小 + 一个分隔符）。"""
+        if not self._incremental:
+            return
+        self._size -= self._unit_size(self._units[0]) + self._sep_size
+
     @property
     def units(self) -> List:
         """★ 返回**活的**列表：调用方会就地改最后一个单元（例如给最后一句贴 `<eos>`）。"""
         return self._units
 
     def size(self) -> int:
-        """当前长度（`budget >= NO_LIMIT` 时返回 0 —— 不裁剪就不必量）。"""
-        return 0 if self.budget >= self.NO_LIMIT else self._measure(self._units)
+        """当前长度（`budget >= NO_LIMIT` 时返回 0；增量模式返回 O(1) 运行计数）。"""
+        if self.budget >= self.NO_LIMIT:
+            return 0
+        return self._size if self._incremental else self._measure(self._units)
 
     # ---------- 窗口：维护 ----------
 
@@ -224,18 +248,24 @@ class SentenceQueue:
             self.overflow = False
             return 0
         n = 0
-        while len(self._units) > self.keep_min and self._measure(self._units) > self.budget:
+        while len(self._units) > self.keep_min and self._over_budget():
+            self._sub_size()
             self._units.pop(0)
             self.dropped += 1
             n += 1
-        self.overflow = self._measure(self._units) > self.budget
+        self.overflow = self._over_budget()
         return n
 
+    def _over_budget(self) -> bool:
+        return self.size() > self.budget
+
     def push(self, unit) -> int:
+        self._add_size([unit])
         self._units.append(unit)
         return self.enforce()
 
     def extend(self, units) -> int:
+        self._add_size(units)
         self._units.extend(units)
         return self.enforce()
 
@@ -318,6 +348,7 @@ class SentenceQueue:
         self._units.clear()
         self.dropped = 0
         self.overflow = False
+        self._size = 0
 
     def __len__(self) -> int:
         return len(self._units)

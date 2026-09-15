@@ -498,3 +498,22 @@ def test_single_core_streamer_and_window_share_sentence_queue():
     w.extend(['a', 'bbbb', 'c'])
     # 预算 4：弹出 'a'(1)→剩 5、再弹 'bbbb'(4)→剩 1（len==keep_min 停）
     assert w.dropped == 2 and w.units == ['c']
+
+
+def test_incremental_size_mode_matches_bruteforce():
+    # ★ 增量模式（unit_size + sep_size）的 O(1) 运行计数，必须与暴力重算逐点一致。
+    # 这是给'长上下文 + KV cache'预留的可分解测量路径：append/evict 只更新增量，不整窗重算。
+    # 判据：任意 push/extend 后，size() 恒等于 Σ len(u) + sep×(n−1)。
+    def brute(q):
+        return sum(len(u) for u in q.units) + 1 * max(len(q.units) - 1, 0)
+    q = SentenceQueue(unit_size=len, sep_size=1, budget=10)
+    q.push('aaa')                       # n=1, size=3（首个单元无分隔符）
+    assert q.size() == 3 == brute(q)
+    q.push('bb')                        # n=2, size=3+1+2=6
+    assert q.size() == 6 == brute(q)
+    q.extend(['cc', 'd', 'ee'])         # 加 3 个 → 5 个、size 14 > 10 ⇒ extend 的 enforce 已弹 'aaa'
+    assert q.dropped == 1 and q.size() == 10 == brute(q)   # 剩 4 个：bb cc d ee
+    q.extend(['fffff'])                 # size 16 > 10 ⇒ 弹 'bb'(2+1) → 13 > 10 ⇒ 弹 'cc'(2+1) → 10 停
+    assert q.dropped == 3 and q.size() == 10 == brute(q)   # 剩 3 个：d ee fffff
+    q.reset()
+    assert q.size() == 0 == brute(q)

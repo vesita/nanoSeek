@@ -93,9 +93,6 @@ TOPIC_ID = 141
 EOS = '<eos>'            # 轮末终止符（保留；`<cont>` 已退休）
 EOS_ID = 128
 
-# 「不裁剪」阈值与其 O(n²) 的来龙去脉，现在住在 `segmentation.ContextWindow.NO_LIMIT`
-# （上下文管理已归分句器模块）。这里留个别名，方便沿用旧名字的调用方/文档。
-_NO_WINDOW_LIMIT = ContextWindow.NO_LIMIT
 
 Entry = Tuple[str, str]  # (speaker, sentence)
 
