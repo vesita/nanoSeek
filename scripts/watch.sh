@@ -13,15 +13,15 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-# ★ 默认值必须跟**当前正在跑的 run** 走。2026-09-15 起主线是**通识段**
-#   （`configs/base_v3_know2.yaml` → `out/base_v3_know2`，`data_prefix: v3_know`，
-#   `use_loss_masking: false`）；上一站人格层 `out/base_v3_persona` 已跑完（900/900），
-#   下一站人格层 `configs/base_v3_persona2.yaml` 接在它后面。
+# ★ 默认值必须跟**当前正在跑的 run** 走。2026-09-15 起是**答案段掩码实验**
+#   （`configs/base_v3_mask.yaml` → `out/base_v3_mask`，`data_prefix: v3_dlg`，
+#   `use_loss_masking: true` + `mask_mode: eos_line`，3k 步）；
+#   上一站通识段 `out/base_v3_know2` 已跑完（18000/18000）。
 #   默认值写死旧 run 的后果不是"少看几行日志"：
 #   新目录的归档 ckpt 不会被 prune（见第 49 行），**磁盘会被写满**。
 #   换 run 时**必须**同步改这两行；要巡检别的 run 就显式传参。
-OUT_DIR="${1:-out/base_v3_know2}"
-LOG="${2:-out/base_v3_know2_train.log}"
+OUT_DIR="${1:-out/base_v3_mask}"
+LOG="${2:-out/base_v3_mask_train.log}"
 SPARSE_EVERY="${3:-5000}"
 NEWEST_KEEP="${4:-2}"
 CONFIG_PAT="training/train.py"
