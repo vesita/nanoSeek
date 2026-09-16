@@ -312,6 +312,7 @@ V3_STAGE_STEPS = {
     'base_v3_know2.yaml': 18000,
     'base_v3_persona2.yaml': 900,
     'base_v3_mask.yaml': 3000,          # 答案段掩码实验（v3_dlg + eos_line + masking 开）
+    'base_v3_mask_off.yaml': 3000,      # ★ 上者的**配对对照臂**（同起点/同语料/同步数，masking 关）
 }
 
 
