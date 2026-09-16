@@ -311,6 +311,7 @@ V3_STAGE_STEPS = {
     'base_v3_persona.yaml': 900,
     'base_v3_know2.yaml': 18000,
     'base_v3_persona2.yaml': 900,
+    'base_v3_mask.yaml': 3000,          # 答案段掩码实验（v3_dlg + eos_line + masking 开）
 }
 
 
@@ -394,12 +395,17 @@ def test_v3_stage_config_safety(cfg_path):
         f"{name}: pack_align 必须 False —— True 时 v3_know 有 72.91% 的 train token "
         f"永远进不了任何窗口（dev-notes/83 §0.5.12）")
 
-    # (4) loss masking：默认**必须关**（v3_lang 一个终止符都没有；v3_dlg 全 token 等权）。
-    #     ★★ 例外（2026-09-14，人格层）：单流 `<resp>` 语料的**全部**监督信号都在
-    #        `<resp>…<eos>` 区间里，关掉 masking = 零梯度 ⇒ 必须开。但例外**绑在
-    #        `mask_mode` 上、不绑在文件名上**，并且要求语料前缀就是人格层 ——
-    #        别的阶段写 `resp_span` 会在这里被拦下（那说明配错了语料：resp_span 只对
-    #        单流格式成立，对 `A：/B：` 语料会给出全 False 的 mask ⇒ loss NaN）。
+    # (4) loss masking：默认**必须关**；两处**窄例外**，都绑 `mask_mode`/`data_prefix`
+    #     而不绑文件名：
+    #       ★ 例外一（2026-09-14，人格层）：单流 `<resp>` 语料的**全部**监督信号都在
+    #         `<resp>…<eos>` 区间里，关掉 masking = 零梯度 ⇒ 必须开；且只许 `v3_persona`
+    #         （`resp_span` 对 `A：/B：` 语料会给出全 False 的 mask ⇒ loss NaN）。
+    #       ★ 例外二（2026-09-15，**答案段掩码实验**）：`eos_line` 的规则是"token 所在**行**
+    #         内含终止符 ⇒ 该行算 loss"。在 `A：…\nB：…<eos>` 里问题行不含终止符 ⇒
+    #         **天然只算回答行** = 答案段掩码。只许 `v3_dlg`（B 段/站 2 都是 false，
+    #         这个配置**从没被跑过**，是本次实验的唯一自变量）。
+    #     ⚠ 例外**必须窄**：别的语料前缀仍不许开 —— `v3_lang` 一个终止符都没有，
+    #       开了就是零梯度（与 §6 那两条"语料在无声地不产生梯度"是同一类失败）。
     mask_mode = cfg.get('mask_mode', 'eos_line')
     assert mask_mode in ('eos_line', 'resp_span'), (
         f"{name}: mask_mode={mask_mode!r} 不是已知模式（train.py 只认 eos_line/resp_span）")
@@ -409,6 +415,11 @@ def test_v3_stage_config_safety(cfg_path):
             f"但 data_prefix={cfg['data_prefix']!r} —— 配错语料会让 mask 全 False ⇒ loss NaN")
         assert cfg['use_loss_masking'] is True, (
             f"{name}: resp_span 必须配 use_loss_masking=True（否则零梯度）")
+    elif cfg['use_loss_masking'] is True:
+        assert cfg['data_prefix'] == 'v3_dlg', (
+            f"{name}: 开 use_loss_masking 只允许两种组合：resp_span+v3_persona，"
+            f"或 eos_line+v3_dlg（答案段掩码实验）。data_prefix={cfg['data_prefix']!r} 不在其中 —— "
+            f"v3_lang 之类语料一个终止符都没有，开 masking 会变成零梯度")
     else:
         assert cfg['use_loss_masking'] is False, f"{name}: use_loss_masking 必须 False"
 

@@ -1,0 +1,23 @@
+val=data/chinese/val_char_v3_lang.bin (2,754,290 tok)  源=7  窗口/源=32  block=256  特殊id=2075
+  [对齐对照] c4_zh.txt                          token/raw_chars = 1.0027
+  [对齐对照] classical_poetry.txt               token/raw_chars = 1.0240
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+参数量：75.15M
+
+=== step 18000  (out/base_v3_know2/last.pt) ===
+来源                                  组          real CE   top1%  shuf CE  unigram  real-uni   n_tok
+c4_zh.txt                           散文/语言       3.6865   35.53   5.4726   6.7309   -3.0443   8,116
+classical_poetry.txt                散文/语言       3.5455   35.64   5.4184   6.6962   -3.1507   8,150
+wikipedia_cn.txt                    散文/语言       3.4866   35.89   5.3910   6.6155   -3.1288   8,049
+三国演义.txt                            散文/语言       5.5712   16.20   6.2747   7.5190   -1.9478   7,915
+水浒传.txt                             散文/语言       5.4001   16.47   6.0640   7.4749   -2.0748   7,905
+红楼梦.txt                             散文/语言       5.7006   15.08   6.3187   7.6339   -1.9333   7,870
+西游记.txt                             散文/语言       5.9775   11.44   6.5026   7.5572   -1.5796   7,923
+已落盘窗口起点 → analysis/windows_v3lang.json（7 源）
+
+=== 分组汇总（token 加权）===
+   step         散文/语言        知识/长文           代码        数学/推理           对话
+  18000        4.7541            -            -            -            -
+
+=== 全库 token 加权（= 逐源明细的加权和，可与训练日志交叉核对）===
+  step  18000  real 4.7541   shuffled 5.9203   unigram 7.1701   n_tok 55,928

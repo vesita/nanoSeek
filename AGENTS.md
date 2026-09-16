@@ -410,6 +410,14 @@ step > 22000   全 token 均匀采样、全部算 loss                 val ≈ 4
 - **上游打坏的，下游要花步数还**：站 2 把 5.8594 修回 3.4371（比 B 段还好 0.31）⇒
   "每段独立验收"是省时间的做法，不是形式主义。
 
+★★ **2026-09-15 用户拍板：第二把尺子从 `val_char_v2.bin` 换成 `val_char_v3_lang.bin`。**
+理由：v2 bin 来自**旧管线**，它量到的是"管线距离 + 能力距离"的**混合**（正是 §5.11 那种口径混淆）；
+`v3_lang`（v3 管线，**实测评测 7 源**：c4_zh / wikipedia_cn / classical_poetry / 三国演义 /
+**水浒传** / 红楼梦 / 西游记）与其它 v3 数据同源，且**保留 `水浒传` 这个单源** ⇒
+"读单源抓灾难性遗忘"的能力**没有丢**。代价：与**全部历史 v2 数字不可比**，
+所以每个新实验都必须在 `v3_lang` 上**重新立起点基线**（起点 know2：全库 real **4.7541**、
+水浒传 real **5.4001**）。★ 本文上面那些 v2 数字**只作历史**，别再拿它们做前后对比。
+
 ---
 
 ## 6. 数据侧的三个硬事实（2026-09-11 实测，别再重新发现）
@@ -490,8 +498,10 @@ step > 22000   全 token 均匀采样、全部算 loss                 val ≈ 4
 用 `extends: base_v2.yaml` 继承架构与优化器，只覆盖"这一段训练的配方"。
 它们的步数在 `tests/test_project_layout.py::V3_STAGE_STEPS` 里又写了一遍，
 改步数必须同时改**配置与那个 dict**。
-★★ 人格层是**唯一**开着 `use_loss_masking` 的阶段（`mask_mode: resp_span`）——
-`test_v3_stage_config_safety` 第 (4) 条**按 `mask_mode` 分支**，不是按文件名白名单。
+★★ 开 `use_loss_masking` 的只有两处**窄例外**，都绑 `mask_mode`/`data_prefix`、**不绑文件名**：
+人格层（`resp_span` + `v3_persona`）与**答案段掩码实验**（`eos_line` + `v3_dlg`，
+见 `configs/base_v3_mask.yaml`）。`test_v3_stage_config_safety` 第 (4) 条按这个分支；
+**别的语料前缀开 masking 会被拦下**（`v3_lang` 一个终止符都没有 ⇒ 零梯度）。
 
 ---
 
@@ -547,7 +557,7 @@ CE 只吃 token，不受标签格式影响，是更硬的证据。
 ## 10. 目录导航
 
 ```
-configs/            训练配置（base_v2.yaml = 基座；base_v3_{persona,know2,persona2,dlg,know}.yaml = v3 分段配方；★ 必须放在 out_dir 之外）
+configs/            训练配置（base_v2.yaml = 基座；base_v3_{persona,know2,persona2,mask,dlg,know}.yaml = v3 分段配方；★ 必须放在 out_dir 之外）
 training/train.py   ★ 1473 行的模块级脚本 —— import 它就等于开始训练，不能单测
 training/           已抽出的纯函数模块（schedules / masking / checkpoints / run_logs / diag）
 model/              模型与组件（NDB 只有一个载具 ngram_ndb.py：读写都由模型门控、表在线累积）
