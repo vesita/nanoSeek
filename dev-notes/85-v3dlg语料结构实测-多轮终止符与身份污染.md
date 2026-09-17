@@ -121,37 +121,71 @@ PY
 
 ---
 
-## 3. ★★ 身份污染**集中在最大的那个源里** —— 模型自称 ChatGPT 是**训出来的**
+## 3. ★★ 身份污染在最大的那个源里 —— 是真的，但**比我先前说的小得多**
 
-`sharegpt_zh_38k.txt` 是 v3_dlg 里**最大的源**（143.7 MB / 全部 ≈228 MB），
-而它**几乎全是**围绕「你是不是 ChatGPT / 你是 OpenAI 训练的模型」的对话：
+> ★★★ **本节 2026-09-17 自我更正过一次，请读完整节。**
+> 我 2026-09-16 夜里的原话是「身份污染**集中在**最大的那个源 ⇒ 人格段 900 步打不过是**必然**」。
+> **那个论断是从文件开头几段 + 出现次数（没有分母）推出来的 —— 正是 §5.11 禁止的做法。**
+> 补量分母后（见下表）：**自称 OpenAI/ChatGPT 的只占该源 3.4% 的字符**（≈`v3_dlg` 的 2%）。
+> ⇒ 「打不过是必然」这句**已作废**；真正的解释更可能是**步数太少**（900 步），
+> 而不是语料里存在压倒性的反向陈述。
+
+`sharegpt_zh_38k.txt` 是 v3_dlg 里**最大的源**（143.7 MB），它里面确实有大量身份相关对话 ——
+**但按字符算，占比不大**（2026-09-17 全量计数，块级分类，分母 = 该源 38,247 块 / 60,727,621 字符）：
+
+| 类别 | 块数 | 字符数 | **占该源字符** |
+|---|---:|---:|---:|
+| ① 自称 OpenAI/ChatGPT 训练的模型 | 921（2.4%） | 2,047,136 | **3.4%** |
+| ② 能力否认 / 推诿（不含①） | 2,617（6.8%） | 7,298,739 | **12.0%** |
+| ③ 仅讨论第三方 ChatGPT/OpenAI（不含①②） | 989（2.6%） | 1,757,856 | 2.9% |
+
+★ **② 的数不能用**：我把判据收紧成"模型行的**开头**就是（作为AI/语言模型 + 我无法/不能）"后得到
+**1,519 块 / 4,650,566 字符 = 7.7%**，但**抽 8 条读原文发现至少 2~3 条是假阳性**：
+- 一条俄语词源的正常回答被命中 —— 因为块内**后面还有轮次**，而我的判据用了 `any(模型行)`；
+- 一条 `我是Chatgpt，世界上最先进的聊天机器人…` 是**用户明确要求的角色扮演**
+  （`用户：用第一人称写本书的第一章，讲述一个名为Chatgpt的真正邪恶的聊天机器人…`），
+  它**不是模型的自称**，但**确实仍会让权重学会"我是ChatGPT"这个串**。
+
+⇒ 所以 7.7% 只能当**上界**；去假阳性后的真值**本次没有测出来**（见 §6）。
+**正确的读法是**：这是一个**真实但中等**的数据缺陷，**不是**"压倒性反向陈述"。
+
+**出现次数（旧表，无分母，仅供定位）**：
 
 | 源 | 大小 | `openai`/`chatgpt` | `语言模型` |
 |---|---:|---:|---:|
 | `sharegpt_zh_38k.txt` | **143.7 MB** | **15,863** | **9,592** |
 | `belle_multiturn.txt` | 71.4 MB | 0 | 1,283 |
 | `wildchat_zh.txt` | 28.8 MB | 720 | 0 |
-| `lccc_dialogue.txt` | 22.7 MB | 0 | 0 |
-| 其余 5 源 | ~5 MB | 0 | 15 |
+| 其余 6 源 | ~28 MB | 0 | 15 |
 
-块首那段原文就是教科书例子（`用户：你不是ChatGPT吗？` / `模型：不，我不是Chatgpt。
-我是由OpenAI培训的一种大型语言模型…`），且夹杂**俄语**（`свинья`）与长篇越狱角色扮演。
+⇒ 「模型自称 ChatGPT」**确实是训出来的**（这条仍然成立，`analysis/B_ood_prompts.txt` 里
+身份类提示词全线失败与之一致），但**它不足以解释意图跟随的失败**，
+修它也不会顺带修好意图跟随。**优先级需要下调**（原写"最该动的就是它"，已作废）。
 
-⇒ **"模型说自己叫 ChatGPT / 是 OpenAI 训练的"不是幻觉，是语料里 ~2.5 万条直接陈述训出来的。**
-这解释了 `analysis/B_ood_prompts.txt` 里身份类提示词全线失败的现象，
-也意味着：**人格段（小寻）在跟 2.5 万条反向陈述对抗** ——
-人格段 900 步打不过它是**必然**，不是配方（lr/epoch）的锅。
+★ 改这个源要重建 bin 并重跑污染率 / 有效 token 验收（§5.10、§9 `build_stages`）。
 
-⇒ 这是一个**便宜且高杠杆**的修法（比"扩语料"便宜得多）：
-清洗或改写 `sharegpt_zh_38k.txt` 的身份陈述，或整源降权/剔除。
-★ **改这个源要重建 bin 并重跑污染率/有效 token 验收**（§5.10、§9 `build_stages`）。
-
-复现：
+复现（字符占比，块级分类）：
 ```bash
-cd data/chinese/stages/v3_dlg
-for f in *.txt; do o=$(grep -o -i -E "openai|chatgpt" "$f" | wc -l); \
-  l=$(grep -o "语言模型" "$f" | wc -l); echo "$f $o $l"; done
-```
+.venv/bin/python - <<'PY'
+import re
+P='data/chinese/stages/v3_dlg/sharegpt_zh_38k.txt'
+SELF=re.compile(r'(openai|chatgpt)',re.I); SELFREF=re.compile(r'我(是|由|被|作为|就是)|作为一个|身为一个')
+DENY=re.compile(r'我(没有|无法|不能|只是|仅仅|不会)'); LMT=re.compile(r'(语言模型|机器学习模型|人工智能|AI|聊天机器人|程序)')
+tot_b=tot_c=c1_b=c1_c=c2_b=c2_c=c3_b=c3_c=0
+for block in open(P,encoding='utf-8',errors='replace').read().split('\n\n'):
+    if not block.strip(): continue
+    tot_b+=1; n=len(block); tot_c+=n
+    reps=[l for l in block.split('\n') if l.startswith('模型：')]
+    h1=any(SELF.search(l) and SELFREF.search(l) for l in reps)
+    h2=any(DENY.search(l) and LMT.search(l) for l in reps)
+    h3=any(SELF.search(l) for l in reps)
+    if h1: c1_b+=1;c1_c+=n
+    elif h2: c2_b+=1;c2_c+=n
+    elif h3: c3_b+=1;c3_c+=n
+print(f'总 {tot_b} 块 / {tot_c:,} 字符')
+for nm,b,c in (('①自称',c1_b,c1_c),('②否认',c2_b,c2_c),('③第三方',c3_b,c3_c)):
+    print(f'  {nm} 块 {b} ({100*b/tot_b:.1f}%) 字符 {c:,} ({100*c/tot_c:.1f}%)')
+PY
 
 ---
 
@@ -162,6 +196,37 @@ bin 里 `<topic>`(141) = **0**，`<resp>`(140) = **0**。
 在 **v3_dlg 上完全没有训练信号** —— 它是**为陪聊语料准备的，而陪聊语料没接上它**。
 「自主对话」里的**自开话题**这一维，在当前语料下**不可能**被学到，
 判据（`eval_multiturn` 的自开轮次率）因此也只会读到语料的先验。
+
+### ★ 4.1 好消息：注入 `<topic>` **不需要改任何代码**（2026-09-17 实测）
+
+我原来**从读代码推断**：`data/chinese/prepare.py:265` 的 `_marker_ids()` 只认
+`("<eos>", "<cont>")`，所以往 `.txt` 里写 `<topic>` 会被**逐字符**编码成 7 个 token。
+**跑一遍发现这个推断是错的** —— tokenizer 是 WordLevel，直接就把 `<topic>` 认成一个 token：
+
+| 输入 | 裸 `tokenizer.encode` | 走 `_iter_token_pieces`（= `build_stages` 的实际路径） |
+|---|---|---|
+| `'<topic>'` | `[141]` | `[[141]]` |
+| `'<eos>'` | `[128]` | `[[128]]` |
+| `'你好<topic>世界'` | `[389, 434, 141, 902, 874]` | 同左（141 在中间，**没被拆**） |
+
+⇒ **`<topic>` 可以直接写进 `stages/v3_dlg/*.txt`，就会变成单个 id 141。**
+`_marker_ids` 那条特殊符分割路径**对正确性不是必需的**（它主要服务 `--emit-offsets` 的
+字符↔token 对齐）。**注入点就在 `.txt` 层，是最便宜的那种改动。**
+
+复现：
+```bash
+.venv/bin/python - <<'PY'
+import sys; sys.path.insert(0,'data/chinese')
+from tokenizers import Tokenizer
+from prepare import _marker_ids, _iter_token_pieces
+tok = Tokenizer.from_file('data/chinese/char_tokenizer.json')
+print('_marker_ids =', _marker_ids(tok))          # {'<eos>':128,'<cont>':130} —— 不含 <topic>
+for s in ('<topic>', '<eos>', '你好<topic>世界'):
+    print(repr(s), '裸encode=', tok.encode(s).ids, '  走管线=', [p[2] for p in _iter_token_pieces(s, tok)])
+PY
+```
+★ **教训（AGENTS §5.4）**：这一条我"读代码"得到的结论和"跑一遍"得到的**相反**。
+凡是要动数据管线的判断，**先跑一个已知答案的输入**再下结论。
 
 ---
 
