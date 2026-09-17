@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -260,19 +261,43 @@ def parse_samples(path: str) -> Dict[str, List[str]]:
 
 # ---------------------------------------------------------------- 现场采样（可选）
 
+# ★★ 2026-09-16 实盘踩到：本探针用**子进程**调 `sample_py.py`，而 gfx1030 需要
+#    `HSA_OVERRIDE_GFX_VERSION=10.3.0 HSA_ENABLE_SDMA=0`。调用者没 export 时，
+#    子进程直接 HIP 崩溃（rc=1），28 条样本**全部**变成 `<采样失败 …>`，
+#    然后被当作"模型答错"计成 `ok: false` ⇒ **报告会显示 0/28 这个假结果**。
+#    这是本项目最忌讳的失败模式（基础设施失败伪装成能力结论，同 §5.5 / §5.9）。
+#    两道防线：①这里在调用者没设时补上默认值；②`main()` 见到任何一条采样失败
+#    **直接拒绝打分并非零退出** —— 绝不让"采样挂了"进到分数里。
+_GPU_ENV_DEFAULTS = {
+    'HSA_OVERRIDE_GFX_VERSION': '10.3.0',   # 本项目唯一目标卡 gfx1030
+    'HSA_ENABLE_SDMA': '0',
+}
+
+SAMPLE_FAIL_PREFIX = '<采样失败'
+
+
+def is_sample_failure(text: str) -> bool:
+    """采样失败哨兵 —— `main()` 靠它拒绝打分（测试钉着，别改成静默）。"""
+    return text.startswith(SAMPLE_FAIL_PREFIX)
+
+
 def sample_with_existing_entry(out_dir: str, prompt: str, seed: int,
                                max_new_tokens: int = 120, temperature: float = 0.8) -> str:
     """用**现成的** `inference/scripts/sample_py.py` 采一条（不另写采样器）。
 
-    返回生成正文（已剥掉 prompt 回显与工具横幅）。
+    返回生成正文（已剥掉 prompt 回显与工具横幅）；失败时返回 `SAMPLE_FAIL_PREFIX` 开头的
+    哨兵串，**调用者必须用 `is_sample_failure()` 拦住它，不许当成模型输出打分**。
     """
     cmd = [sys.executable, 'inference/scripts/sample_py.py', '--out_dir', out_dir,
            '--prompt', f'A：{prompt}\nB：', '--max-new-tokens', str(max_new_tokens),
            '--temperature', str(temperature), '--top-k', '200',
            '--repeat-penalty', '1.2', '--seed', str(seed)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    env = dict(os.environ)
+    for k, v in _GPU_ENV_DEFAULTS.items():
+        env.setdefault(k, v)          # 只在调用者没设时兜底，不覆盖显式设置
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if r.returncode != 0:
-        return f'<采样失败 rc={r.returncode}：{r.stderr.strip()[-200:]}>'
+        return f'{SAMPLE_FAIL_PREFIX} rc={r.returncode}：{r.stderr.strip()[-200:]}>'
     body = r.stdout
     if '--- 生成 ---' in body:
         body = body.split('--- 生成 ---', 1)[1]
@@ -334,15 +359,27 @@ def main(argv=None) -> int:
 
     named: List[Tuple[str, Dict[str, List[str]]]] = []
     for path in a.from_file:
-        import os
         named.append((os.path.basename(path), parse_samples(path)))
     if a.out_dir:
         seeds = [int(s) for s in a.seeds.split(',') if s.strip()]
         gen: Dict[str, List[str]] = {}
+        fails: List[str] = []
         for it in INTENTS:
             for sd in seeds:
-                gen.setdefault(it.prompt, []).append(
-                    sample_with_existing_entry(a.out_dir, it.prompt, sd))
+                t = sample_with_existing_entry(a.out_dir, it.prompt, sd)
+                if is_sample_failure(t):
+                    fails.append(f'{it.label} / seed={sd}：{t[:200]}')
+                gen.setdefault(it.prompt, []).append(t)
+        # ★★ 基础设施失败 ≠ 模型失败：宁可不出报告，也不出一份把 rc=1 记成"答错"的 0/N。
+        if fails:
+            print(f'✗ {len(fails)}/{len(INTENTS) * len(seeds)} 条采样失败 —— **拒绝打分**。'
+                  f'{SAMPLE_FAIL_PREFIX}…> 是采样器崩溃的哨兵，不是模型输出。',
+                  file=sys.stderr)
+            for f in fails[:5]:
+                print('   ' + f, file=sys.stderr)
+            print('   排查：确认 GPU 环境变量已生效（本脚本已兜底补 HSA_* 默认值）、'
+                  '`out_dir/best.pt` 存在、显存没被别的进程占。', file=sys.stderr)
+            return 3
         named.append((a.out_dir, gen))
 
     if not named:
