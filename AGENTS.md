@@ -16,9 +16,18 @@
 
 **当前主线（2026-09-14 起，用户拍板：陪聊人格）**：
  0. **★ 三站接力：`persona`(站1) → `know2`(站2) 已跑完；站 3 `persona2` 用户 2026-09-15 明确
-    「后面的阶段先不训练了」⇒ 未启动。当前权重 = `out/base_v3_know2/last.pt`。**
+    「后面的阶段先不训练了」⇒ 未启动。**
     **效果审查见 `analysis/know2_stage_review.md`**（两把尺子 + 污染率 + 生成侧指标 +
     OOD 原文逐条对照 + NDB 第一次真实 Δ）。
+    ★ 2026-09-16/17 用户又在站 2 之后加了一条**实验支线**（**不是**第 3 站）：
+    **答案段掩码短跑** `configs/base_v3_mask.yaml`（`v3_dlg` + `mask_mode: eos_line`）+
+    它的**配对对照臂** `configs/base_v3_mask_off.yaml`（同起点/同语料/同步数，masking off）。
+    **读这两者之前必须先读 `analysis/mask_stage_review.md`**（5 条启动前写死的判据 + 结果：
+    **判据 3 与 4 不合格**；以及"掩码是**用自开话题能力换意图跟随能力**"这条待对照臂确认的机制假设）。
+    ★★ **并且先读 `dev-notes/85`**（本次实测的语料事实，会改写对"模型为什么不会自主对话"的读法）：
+    `v3_dlg` 是**真多轮**（多轮占块数与字符数的多数）、终止符**逐轮覆盖**（掩码前提成立，
+    ★ 但必须在 **bin** 上量 —— `stages/v3_*/*.txt` 是**标注之前**的文本，grep 终止符得 0）、
+    **身份污染集中在最大的那个源**、`<topic>`(141) 在 `v3_dlg` 里**数量为 0**。
     ★★★ **站 1 人格段的配方是本项目最贵的灾难性遗忘现场，再跑人格段必须先改配方**：
     语料仅 ~86k token、900 步 ≈ **85 遍**、lr 2e-4 ⇒ v2 val 从 B 段的 3.7458 抬到 **5.8594**；
     **单源**（`水浒传.txt`）才看得见真相：`real − unigram` **由负转正**（比 unigram 基线还差）、
@@ -136,9 +145,11 @@ HSA_OVERRIDE_GFX_VERSION=10.3.0 HSA_ENABLE_SDMA=0    # gfx1030 必需
   `pyproject.toml` 另行解析/同步一套环境，可能跑在**不同的 torch/依赖**上，
   于是"测试全绿"证明的**不是本项目的环境**。命令统一写成：
   `.venv/bin/python -m pytest -q -m 'not slow'` / `.venv/bin/python -m ruff check .`
-- **训练跑在 systemd 用户单元里**（铁律 0）。已跑完的接力：`persona`(站1) → `know2`(站2)；
-  **站 3 `persona2` 用户明确"先不训练了"** ⇒ **当前没有任何训练单元在跑**，
-  找不到 `training/train.py` 进程是**正常的**（别当成"训练死了"）。
+- **训练跑在 systemd 用户单元里**（铁律 0）。已跑完的接力：`persona`(站1) → `know2`(站2)
+  → 掩码实验支线（见 §1 第 0 条）；**站 3 `persona2` 用户明确"先不训练了" ⇒ 至今未启动**。
+  ★ 是否**此刻**有单元在跑一律现场读 `systemctl --user is-active <单元名>.service` 或
+  `systemctl --user list-units 'nanoseek-*' --no-pager` —— **别照抄本页的判断**
+  （本页写"在跑"或"没跑"都会过期）。
   ★ 单元名 / 日志名 / `scripts/watch.sh:22-23` 的默认值**三者必须跟着当前站一起改**（铁律 12/13）。
   ★ 看单元：`--collect` 起的单元**跑完自己消失**，`is-active` 返回 `inactive`、
   `systemctl status` 报 "could not be found" **都是正常的** —— 成败要看日志里的
@@ -513,7 +524,7 @@ val_blocks 多"的现代中文源**：`wikipedia_cn`（2365 块，起点 real **
 |---|---|
 | 对话质量 / 生成质量评估 | `inference/scripts/eval_dialogue.py`（rep2/3/4、空白占比、distinct-n、轮次结构；**必带 `--style`**，见下）|
 | 多轮对话评估 | `inference/scripts/eval_multiturn.py`（**也必带 `--style`**：收尾率/自开轮次率/收不住率；2026-09-13 前它写死 v1 标签，评 v2 会喂 OOD，见 `TECH_DEBT` §1.13）|
-| **★ 意图跟随（"有没有接住对方那句话"）** | `scripts/intent_probe.py` —— 前两个入口都**不量**这一维（"对方问首都、你答湖南省"在它们那里可以满分）。14 组「提示词 → 期望的言语行为」，判据是关键词粗筛，所以**强制**两条：①`--selftest` 验**已知答案对照**（每组参考好回复必须 pass、坏回复必须 fail，14/14 才算判据可用）；②报告**逐条落原文 + 命中/失格原因**（§5.9：关键词判据只能粗筛，判读必须读原文）。`--from-file` 给**已有样本**打分（零 GPU，支持 `analysis/*_ood_prompts.txt` 格式）；`--out-dir` 用现成的 `sample_py.py` 现场采样。★ 建它时靠"读被翻转的样本"抓到两个假阳性（裸 `[二两]` 命中"两种因素"、裸 `难受` 命中**提示词回显**），都已钉成回归测试。基线（2026-09-15，同一版判据）：**B 段 3/19、know2 0/28** ⇒ 见 `dev-notes/84` |
+| **★ 意图跟随（"有没有接住对方那句话"）** | `scripts/intent_probe.py` —— 前两个入口都**不量**这一维（"对方问首都、你答湖南省"在它们那里可以满分）。14 组「提示词 → 期望的言语行为」，判据是关键词粗筛，所以**强制**两条：①`--selftest` 验**已知答案对照**（每组参考好回复必须 pass、坏回复必须 fail，14/14 才算判据可用）；②报告**逐条落原文 + 命中/失格原因**（§5.9：关键词判据只能粗筛，判读必须读原文）。`--from-file` 给**已有样本**打分（零 GPU，支持 `analysis/*_ood_prompts.txt` 格式）；`--out-dir` 用现成的 `sample_py.py` 现场采样。★ 建它时靠"读被翻转的样本"抓到两个假阳性（裸 `[二两]` 命中"两种因素"、裸 `难受` 命中**提示词回显**），都已钉成回归测试。基线（2026-09-15，同一版判据）：**B 段 3/19、know2 0/28** ⇒ 见 `dev-notes/84`。★★ **2026-09-16 用它做验收时又栽了两次，两条都已修并钉住 —— 每次读它的分数前先确认这两条还在**：①**子进程采样必须带 gfx1030 的 `HSA_*` 环境变量**（调用者 shell 没 export 时 28/28 条会 HIP 崩溃，而崩溃串**被当成模型输出打分** ⇒ 会静默产出 `0/N` 这个假结论）。现在的硬拦：`sample()` 兜底补默认值，且 **`main()` 见到任何一条采样失败就拒绝打分、`rc=3`、不写报告**；②**`--out-dir` 路径必须先剥提示词回显**（`sample_py.py` 在 `--- 生成 ---` 之后会先回显一行提示词，而**提示词自己就能命中期望词** —— 实测 `makers` 的期望词是「研发」、提示词是「你是谁**研发**的？」）⇒ 两条入口口径现已拉齐。**教训：这两个 bug 都不是"判据写错"，是"测量管线出错被读成能力结论"**（同 §5.5 / §5.10 家族）|
 | 采样 / 对话 | `inference/sample.py`、`inference/scripts/chat.py`（或 `cli.py sample` / `cli.py chat`）|
 | 巡检 | `scripts/watch.sh` |
 | **v3 分段训练配方（接力 `persona` → `know2` → `persona2`）** | ★ **已跑完站 1+2**：`configs/base_v3_persona.yaml`（站1，`init_from: out/base_v3_dlg/last.pt`，`data_prefix: v3_persona`，**`use_loss_masking: true` + `mask_mode: resp_span`**，单流格式必需，见下一条；⚠ **该配方会造成灾难性遗忘，再跑必须先改**，见 §1 第 0 条）→ `configs/base_v3_know2.yaml`（站2，`init_from: out/base_v3_persona/last.pt`，`data_prefix: v3_know`，masking off）。★ **未跑站 3**：`configs/base_v3_persona2.yaml`（`init_from: out/base_v3_know2/last.pt`）。★ **B 段**：`configs/base_v3_dlg.yaml`，`init_from: out/base_v2/last.pt`（step 61000）—— **A 段 `configs/base_v3_know.yaml` 已被用户 2026-09-13 拍板跳过**，配方保留备用。启动就是 `train.py configs/base_v3_*.yaml`，**不要再堆一长串命令行参数**（方案文档里那串参数已经全部写进配置）。★★ 铁律 **12**：warm start 的 `init_from=<路径>.pt` **不是** `resume`，照样触发 `_backup_old_run` ⇒ **每段必须有自己的 `out_dir`**。三条断言钉着：`test_project_layout.py::test_v3_stage_config_safety`（第 (4) 条按 `mask_mode` 分支）/ `::test_all_config_out_dirs_are_pairwise_distinct` / `V3_STAGE_STEPS` |
@@ -521,7 +532,7 @@ val_blocks 多"的现代中文源**：`wikipedia_cn`（2365 块，起点 real **
 | 配对重评 / val 噪声 | `scripts/ckpt_paired_eval.py` |
 | **逐来源的语言能力（"会不会认字"）** | `scripts/per_source_ce_probe.py` —— 按 manifest 的 `val_blocks` 把 val 切回**来源**，报 `real / shuffled / unigram` 三级对照。`real − shuffled` = 真的在读上下文的净度量（`shuffled` 保住相邻对、毁掉长上下文）。★ **口径与 `use_loss_masking` 无关**，所以 **step 22000 那条断裂线在它的表里不存在**，可以跨全程比较。★ **可以换 val**：`--data/--offsets/--manifest/--train-bin` 指到 `v3_*` 就能评 stage 自己的 val（§5.12 要求两把尺子都报）。★★ 曾经写在"源对齐对照"里的三个源名是 **v2 manifest 专属**，换 manifest 会 `KeyError`（2026-09-14 修，见 `align_control_names()` + 4 条测试）。★ `--dump-windows <json>` 把**实际用到的窗口起点**落盘，供污染率审计复用。★ 加 `--control-random` 会再评一个**随机初始化**的模型当已知答案对照（实测 real−shuffled = **+0.001**，B 终态是 **−1.65**，随机权重落在 log(8192)=9.01 ≈ 瞎猜）——**下结论前先看这一行**。⚠ 此前那句"v3 val 已被 v2 见过 99%"**在逐字 32-gram 口径下实测为 0/153**，别再引用它当理由 |
 | **val 是不是训练集的近重复（污染率）** | `scripts/val_train_contamination_probe.py` —— 拿 `per_source_ce_probe --dump-windows` 落盘的那批窗口，做 32-gram 定长哈希**流式**扫训练 bin。★★ **必须流式、别建全量索引**：9.4 亿 token 的 bin 建索引要 ≈7.5GB，实测被 OOM 杀过两次。★ 自带三组对照（train 原样片段必须命中 / 同段打乱必须不命中 / v2 自己的 train 查 v2 自己的 val 应≈0）。★ 2026-09-14 实测：B 段 v2 val **0/369**、v3_dlg val **0/153** |
-| **某一段训练到底训成什么样（效果审查报告）** | `analysis/B_stage_review.md`（B 段：两把尺子 + 污染率 + 生成侧指标 + OOD 提示词 + 结论与债）；原始输出在 `analysis/per_source_ce_{after_B,B_ownval,B_controlcheck}.txt`、`analysis/eval_{dialogue,multiturn}_B.txt`、`analysis/B_ood_prompts.txt`、`analysis/val_train_contamination_{v2val,v3dlgval}.md`。★ 采样入口是现成的 `inference/scripts/sample_py.py`（`--out_dir/--prompt/--temperature/--seed`），**不要另写采样脚本** |
+| **某一段训练到底训成什么样（效果审查报告）** | `analysis/B_stage_review.md`（B 段：两把尺子 + 污染率 + 生成侧指标 + OOD 提示词 + 结论与债）；原始输出在 `analysis/per_source_ce_{after_B,B_ownval,B_controlcheck}.txt`、`analysis/eval_{dialogue,multiturn}_B.txt`、`analysis/B_ood_prompts.txt`、`analysis/val_train_contamination_{v2val,v3dlgval}.md`。★ 采样入口是现成的 `inference/scripts/sample_py.py`（`--out_dir/--prompt/--temperature/--seed`），**不要另写采样脚本**。★★ **答案段掩码实验的审查在 `analysis/mask_stage_review.md`**（5 条启动前写死的判据 + 结果 + 两个验收工具 bug + "掩码用自开话题能力换意图跟随能力"的机制假设）|
 | **★ 分句 / 流式输入 / 上下文管理 / 自然文本入口（全项目统一）** | ★★ `training/segmentation.py` —— **canonical，别再自己写分句或滑窗**。★ 2026-09-15 重构：核心收成**一个 `SentenceQueue`**（字符流→有界句子队列），`StreamSegmenter`（流式）与 `ContextWindow`（有界窗口）是它的两个**薄 facade**，公开 API 不变，测试补了"单核不变量"钉住。① `split_line()` / `split_text()`：分句；**机制符原子**（不切进 `<...>`）、且 `<eos>` 这类后缀**不单独成句**（否则滑窗会把 `<eos>` 单独弹掉 = 坏数据）。② `StreamSegmenter`：**流式**（用户输入 / 长文本 / 分块到达）；**跨块的 `<eos>` 也粘得住**（`hold_last=True`，逐字喂也对）；`pending` 是压着的尾巴，`flush()` 收尾。③ `ContextWindow`：**上下文管理** —— 超预算从头部**整句**弹出（用户 2026-09-14 定的规则）；`budget >= NO_LIMIT` 时**不做任何测量**（否则解析整份语料 O(n²)，实测 60s+ 超时 → 0.01s）。④ `prepare_natural_text()` / `process_file()` / `python -m training.segmentation --file X`：**自然文本 → 训练可用**（规整 → 一句一行 → 空行仍是块分隔）。★ `data/chinese/split_sentences.py` 只是它的**薄壳转发**（`prepare.py` 一行没改）；测试见 `tests/test_segmentation.py`（含与旧实现逐字对拍 + 负向对照） |
 | **对话流（单流 + `<resp>` + loss 区间）** | `training/dialogue_stream.py` —— `DialogueStream`（`append/commit/prompt/render/rename/loss_token_spans`）、`iter_training_samples`、**`parse_log`**（把日志读回来）、**`read_corpus`/`write_corpus`**（语料统一读写，别再手写 `split('\n\n')`）。★ **上下文管理已委托**给 `segmentation.ContextWindow`，**别在 `DialogueStream` 里再加一套滑窗**。★ 模型自己轮次的标记是 **`<resp>`**（单 token，id 140），不是 `自己：`。★ **换话题标记 `<topic>`**（单 token，id 141）插在**开启新话题那一段的开头**（`append/commit(..., new_topic=True)`，或剧本三元组 `(speaker, text, True)`）；放在**模型自己**那段时它**落在 loss 区间内**，所以模型能学会**主动换话题** |
 | **单流语料的端到端验收（采样 → `parse_log` 回读）** | `scripts/single_stream_e2e.py` —— 拿 `best.pt` 按部署形状（`对象X：…\n<resp>`）采样，再喂 `training.dialogue_stream.parse_log`：查 ①模型自己吐 `<eos>` 的比例 ②`render` 往返 ③`<resp>` 是否进了 loss 区间 ④渲染行级相邻同说话人。★ 它**临时绕过**了 `sample_py` 的两个机制符缺口（把采样器删掉的尾部 `<eos>` 补回去 + `skip_special_tokens=False`），缺口本身在 `TECH_DEBT §2` P1。★ `--out` 的报告含生成正文 ⇒ **只写仓库外**（`~/datasets/persona/reports/`）|
@@ -559,7 +570,7 @@ CE 只吃 token，不受标签格式影响，是更硬的证据。
 ## 10. 目录导航
 
 ```
-configs/            训练配置（base_v2.yaml = 基座；base_v3_{persona,know2,persona2,mask,dlg,know}.yaml = v3 分段配方；★ 必须放在 out_dir 之外）
+configs/            训练配置（base_v2.yaml = 基座；base_v3_{persona,know2,persona2,mask,mask_off,dlg,know}.yaml = v3 分段配方；★ 必须放在 out_dir 之外）
 training/train.py   ★ 1473 行的模块级脚本 —— import 它就等于开始训练，不能单测
 training/           已抽出的纯函数模块（schedules / masking / checkpoints / run_logs / diag）
 model/              模型与组件（NDB 只有一个载具 ngram_ndb.py：读写都由模型门控、表在线累积）
@@ -609,7 +620,8 @@ dev-notes/83-PROJECT_STATE最终快照.md  ⚠ 旧状态文档的**冻结快照*
 
 **维护本页的两条约束**：
 - **预算 65536 字节**（harness 的 `maxBytes`），超了会**从宽泛的文件开始省略**。
-  ★ **2026-09-15 实测：本页约 54 KB ≈ 预算的 82%**，余量 ~11 KB
-  ⇒ 新增内容先想"能不能并进已有条目"。
+  ★★ **2026-09-17 实测：本页约 60 KB ≈ 预算的 91%，余量只剩 ~5.6 KB。**
+  ⇒ **再往里加东西之前，先把已有条目合并或删减**（同一天我为了记录掩码实验的结论加了两次，
+  一次涨了 ~2.3 KB）—— 不要再假设"还有 11 KB 可以追加"。
   **状态与数字**（step 数、val、磁盘）**一律不写进任何文档** —— 它们过期得比谁都快；
   需要时现场读（本页 §4 第 ⑧ 条）。

@@ -369,6 +369,15 @@ def main(argv=None) -> int:
                 t = sample_with_existing_entry(a.out_dir, it.prompt, sd)
                 if is_sample_failure(t):
                     fails.append(f'{it.label} / seed={sd}：{t[:200]}')
+                else:
+                    # ★★ 2026-09-16 实盘踩到（本探针第二次同类假阳性）：
+                    #    `sample_py.py` 在 `--- 生成 ---` 之后**先把提示词回显一行**再吐正文，
+                    #    所以 `--out-dir` 拿到的文本自带 `A：<提示词>`。
+                    #    不剥掉，**提示词自己就会命中期望词** —— 实测 6/28 里有 2 条是
+                    #    `makers`（期望 `研发`）命中提示词「你是谁**研发**的？」造出来的。
+                    #    2026-09-15 那次修的是 `--from-file`（`parse_samples` 里剥），
+                    #    **`--out-dir` 这条路漏了** ⇒ 两条入口口径不一致，这次拉齐。
+                    t = _strip_echo(t, it.prompt)
                 gen.setdefault(it.prompt, []).append(t)
         # ★★ 基础设施失败 ≠ 模型失败：宁可不出报告，也不出一份把 rc=1 记成"答错"的 0/N。
         if fails:

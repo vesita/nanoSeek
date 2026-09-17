@@ -13,15 +13,16 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-# ★ 默认值必须跟**当前正在跑的 run** 走。2026-09-15 起是**答案段掩码实验**
-#   （`configs/base_v3_mask.yaml` → `out/base_v3_mask`，`data_prefix: v3_dlg`，
-#   `use_loss_masking: true` + `mask_mode: eos_line`，3k 步）；
-#   上一站通识段 `out/base_v3_know2` 已跑完（18000/18000）。
+# ★ 默认值必须跟**当前正在跑的 run** 走。2026-09-17 起是**答案段掩码实验的对照臂**
+#   （`configs/base_v3_mask_off.yaml` → `out/base_v3_mask_off`，`data_prefix: v3_dlg`，
+#   `use_loss_masking: false`，3k 步 —— 与 `out/base_v3_mask` 同起点/同语料/同步数，
+#   唯一差别是掩码开关）；
+#   掩码臂 `out/base_v3_mask` 与通识段 `out/base_v3_know2` 都已跑完。
 #   默认值写死旧 run 的后果不是"少看几行日志"：
 #   新目录的归档 ckpt 不会被 prune（见第 49 行），**磁盘会被写满**。
 #   换 run 时**必须**同步改这两行；要巡检别的 run 就显式传参。
-OUT_DIR="${1:-out/base_v3_mask}"
-LOG="${2:-out/base_v3_mask_train.log}"
+OUT_DIR="${1:-out/base_v3_mask_off}"
+LOG="${2:-out/base_v3_mask_off_train.log}"
 SPARSE_EVERY="${3:-5000}"
 NEWEST_KEEP="${4:-2}"
 CONFIG_PAT="training/train.py"

@@ -11,6 +11,7 @@
 3. **样本文件覆盖** —— 探针的 14 组意图必须能覆盖 `analysis/*_ood_prompts.txt` 里的提示词，
    否则 `--from-file` 会静默漏掉整组（那样报告会"看起来正常"但其实少了行）。
 """
+import json
 import pathlib
 import sys
 
@@ -108,3 +109,29 @@ def test_sample_failure_is_never_scored_as_a_wrong_answer(monkeypatch):
     rc = main(['--out-dir', 'out/_eval_nonexistent', '--out', str(out_md)])
     assert rc == 3, f'采样全失败时必须非零退出（拿到 rc={rc}）—— 否则会静默出 0/N 假报告'
     assert not out_md.exists(), '采样失败时**不许**写出报告文件（写了就会被当成结论读）'
+
+
+def test_out_dir_mode_strips_prompt_echo_before_scoring(monkeypatch, tmp_path):
+    """★★ 回归钉（2026-09-16 实盘踩到）：`--out-dir` 路径也必须先剥提示词回显。
+
+    现场：`sample_py.py` 在 `--- 生成 ---` 之后会**先把提示词回显一行**。于是
+    `makers` 的期望词是 `研发`，而提示词正是「你是谁**研发**的？」⇒ 模型什么都不用答对，
+    只要回显就"达标"。实测把 6/28 抬成了假成绩（去回显后 4/28）。
+    2026-09-15 只修了 `--from-file`（`parse_samples` 里剥），`--out-dir` 漏了。
+
+    判据（能区分好坏实现）：让采样器**回显提示词 + 一句不含任何期望词的废话**，
+    修复后该组必须判 **fail**；未修复则会因回显里的 `研发` 判 pass。
+    """
+    def echoing_sampler(out_dir, prompt, seed, **kw):
+        return f'A：{prompt}\nB：今天天气不错。'
+
+    monkeypatch.setattr('scripts.intent_probe.sample_with_existing_entry', echoing_sampler)
+    jf = tmp_path / 'echo.json'
+    rc = main(['--out-dir', 'out/_eval_nonexistent', '--json', str(jf)])
+    assert rc == 0, f'正常采样路径应成功（rc={rc}）'
+    per = json.loads(jf.read_text(encoding='utf-8'))['out/_eval_nonexistent']
+    assert per['makers'][0]['ok'] is False, (
+        '提示词回显未被剥掉：makers 的期望词「研发」命中了提示词本身（假阳性复现）')
+    assert '你是谁研发的' not in per['makers'][0]['text'], '存档文本里仍带提示词回显'
+    total = sum(1 for v in per.values() for s in v if s['ok'])
+    assert total == 0, f'回显型废话不该有任何一个达标，却拿到 {total}'
