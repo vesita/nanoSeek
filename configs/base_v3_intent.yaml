@@ -1,0 +1,54 @@
+# ============================================================================
+# v3 分段训练 · 意图跟随密集监督段（v3_intent，3.5k 步，masking OFF + 通用 replay）
+# ============================================================================
+# 用法：
+#     .venv/bin/python training/train.py configs/base_v3_intent.yaml
+#
+# 依据：analysis/next_phase_options.md 选项 1 + 选项 3。
+#   ★ 前提事实（已实测落档）：B 段 8 倍算力 = 对照臂 5/28（analysis/mask_stage_review.md
+#     §10）⇒ 预算不是瓶颈，意图跟随缺的是**密集监督**（语料里信号被稀释在 80 万轮次里）。
+#   ★ masking off：对照臂 5/28 ≥ 掩码臂 4/28，掩码无增益还多付工程与口径代价。
+#
+# 数据（data/chinese/build_intent_stage.py --apply --stage 产出，可复现）：
+#   - intent_mined.txt  598 块：提问侧+回复侧双侧正则命中（code 500 / comfort 62 / stress 36）
+#   - intent_synth.txt  177 块：零供给意图的模板合成（身份/常识/算术/安全等 11 组）
+#     ★ 14 条探针原句一律不进训练数据（留出，保住 intent_probe 验收口径）
+#   - replay_lang/dlg ≈ 1:6 混入，防 persona 段式灾难性遗忘（85 epoch 无 replay 的教训）
+#
+# 判据（启动前写死，事后不改）：
+#   1. 主判据：intent_probe 通过率 > 5/28（对照臂/B 段现值），目标 ≥ 8/28
+#   2. 通用尺子：v3_lang real 不劣于 4.7541 + 0.10（与掩码臂判据 3a 同一条线）
+#   3. 烟感器：wikipedia_cn / c4_zh 各自 +0.15 以内
+#   4. 自身 val：val_char_v3_intent 相比起点应改善
+#   5. eval_multiturn 自开率不恶化（起点 0%，B 段 17%）
+#   证据强度预期：单 seed、单臂；判读必须两把尺子 + 读原文（§5.12 / §5.9）。
+extends: base_v2.yaml
+
+# --- 1) 产物隔离（★ 铁律 12：warm start 会触发 _backup_old_run）-------------
+out_dir: out/base_v3_intent
+
+# --- 2) 权重来源：链路当前末端（与 mask 两臂同起点，可直接比 28 条尺子）------
+init_from: out/base_v3_know2/last.pt
+
+# --- 3) 语料 + 打包（★ §5.10：pack_align 必须关）----------------------------
+data_prefix: v3_intent
+
+use_doc_packing: true
+pack_align: false
+use_loss_masking: false
+
+# --- 4) 学习率配方：与 mask 两臂同族（wsd 1e-4），结果可与它们并排读 ---------
+schedule: wsd
+stage: full
+learning_rate: 0.0001
+min_lr: 0.00001
+warmup_iters: 100
+stable_frac: 0.8
+
+# --- 5) 步数：bin ≈ 0.83M token，3500 步 ≈ 34 epoch（intent 部分约 14 遍）----
+# persona 灾难是 85 epoch @2e-4 无 replay；本段 1e-4 + 6:1 replay，保守一档。
+max_iters: 3500
+lr_decay_iters: 3500
+
+# --- 6) 评估节律 -------------------------------------------------------------
+eval_interval: 500
