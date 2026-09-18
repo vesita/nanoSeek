@@ -13,8 +13,10 @@
 在单张 8G 的 AMD gfx1030 上训一个 **75M char-level 中文模型（nanoSeek）**，
 外加一个 no_grad 外部神经数据库（NDB，可读可写、由模型自己决定读写）。
 
-**当前主线：意图跟随密集监督段**（`configs/base_v3_intent.yaml`，2026-09-18 夜启动）。
-依据链：`analysis/next_phase_options.md`（决策文档）+ `analysis/mask_stage_review.md` §10
+**最近一段：意图跟随密集监督段**（`configs/base_v3_intent.yaml`，已跑完并验收，
+审查见 `dev-notes/86`：intent_probe 0/28 → 17/28（语义 ≈9~10），代价 = 文言源 −0.6 级；
+下一轮修法也写在 86 §5）。
+依据链：`analysis/next_phase_options.md` + `analysis/mask_stage_review.md` §10
 （B 段 8 倍算力 = 对照臂 5/28 ⇒ **预算不是瓶颈，缺的是密集监督**；掩码无增益已定案）。
 
 分段接力已跑完：`base_v2`（61000）→ `v3_dlg`（B 段）→ `v3_persona`（站1）→ `v3_know2`（站2）
