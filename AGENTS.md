@@ -22,9 +22,10 @@ intent 线验收基线：v3_lang 起点 **4.5521**；intent_probe 对照 know2 0
 intent 17 / intent2 20（关键词口径）。
 
 分段接力已跑完：`base_v2`（61000）→ `v3_dlg`（B 段）→ `v3_persona`（站1）→ `v3_know2`（站2）
-→ 掩码实验两臂（空结果）。**链路末端 = `out/base_v3_intent2/last.pt`**（用户拍板 intent 线为新基点后续训的第二段，
-验收见 `dev-notes/86` §6：v3_lang **4.5521 创链路新低**、intent_probe 20/28；
-遗留：NexTalk 语料级污染、code 意图语义错、自身 val 背化），新实验从这里 warm start。
+→ 掩码实验两臂（空结果）。**链路末端 = `out/base_v3_intent2/last.pt`**（intent 线三轮中最优：v3_lang **4.5521** +
+intent_probe 20/28；第三轮 intent3 一次改太多变量而退化，已按判据**回退**，
+教训见 `dev-notes/86` §7——每轮只动一个变量；守卫指标要带 avg_len 上下界防"变短"钻空子），
+新实验从这里 warm start。
 ★ 验收任何新段都按 §5.12：**两把尺子**（本段自己的 val + 通用尺子 `v3_lang`，起点基线见
 `analysis/know2_stage_review.md`）+ **intent_probe 28 条**（对照数字：know2 0/28、掩码臂 4/28、
 对照臂与 B 段 5/28）+ 污染率 + 读生成原文。
