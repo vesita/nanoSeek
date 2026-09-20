@@ -1,0 +1,35 @@
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+val=data/chinese/val_char_v3_lang.bin (2,754,290 tok)  源=7  窗口/源=32  block=256  特殊id=2075
+  [对齐对照] c4_zh.txt                          token/raw_chars = 1.0027
+  [对齐对照] classical_poetry.txt               token/raw_chars = 1.0240
+参数量：75.15M
+
+=== step 3500  (out/base_v3_intent/last.pt) ===
+来源                                  组          real CE   top1%  shuf CE  unigram  real-uni   n_tok
+c4_zh.txt                           散文/语言       3.5959   37.32   5.5673   6.7309   -3.1350   8,116
+classical_poetry.txt                散文/语言       3.6083   37.12   5.7090   6.6962   -3.0879   8,150
+wikipedia_cn.txt                    散文/语言       3.5980   35.61   5.7170   6.6155   -3.0175   8,049
+三国演义.txt                            散文/语言       6.1453   13.47   7.0024   7.5190   -1.3737   7,915
+水浒传.txt                             散文/语言       5.9830   14.29   6.7765   7.4749   -1.4919   7,905
+红楼梦.txt                             散文/语言       6.3756   12.99   7.0831   7.6339   -1.2583   7,870
+西游记.txt                             散文/语言       6.6561   10.34   7.2457   7.5572   -0.9011   7,923
+参数量：75.15M
+
+=== step 3000  (out/base_v3_intent2/last.pt) ===
+来源                                  组          real CE   top1%  shuf CE  unigram  real-uni   n_tok
+c4_zh.txt                           散文/语言       3.6905   36.90   5.6698   6.7309   -3.0404   8,116
+classical_poetry.txt                散文/语言       3.7026   36.64   5.8346   6.6962   -2.9937   8,150
+wikipedia_cn.txt                    散文/语言       3.7013   34.80   5.8283   6.6155   -2.9141   8,049
+三国演义.txt                            散文/语言       5.0537   20.19   5.9512   7.5190   -2.4653   7,915
+水浒传.txt                             散文/语言       5.0277   20.37   5.8535   7.4749   -2.4472   7,905
+红楼梦.txt                             散文/语言       5.4567   17.83   6.1804   7.6339   -2.1773   7,870
+西游记.txt                             散文/语言       5.2990   18.04   6.0018   7.5572   -2.2582   7,923
+
+=== 分组汇总（token 加权）===
+   step         散文/语言        知识/长文           代码        数学/推理           对话
+   3500        5.1209            -            -            -            -
+   3000        4.5521            -            -            -            -
+
+=== 全库 token 加权（= 逐源明细的加权和，可与训练日志交叉核对）===
+  step   3500  real 5.1209   shuffled 6.4430   unigram 7.1701   n_tok 55,928
+  step   3000  real 4.5521   shuffled 5.9028   unigram 7.1701   n_tok 55,928
