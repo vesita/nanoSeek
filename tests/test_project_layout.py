@@ -315,6 +315,7 @@ V3_STAGE_STEPS = {
     'base_v3_mask_off.yaml': 3000,      # ★ 上者的**配对对照臂**（同起点/同语料/同步数，masking 关）
     'base_v3_intent.yaml': 3500,        # 意图跟随密集监督段（v3_intent + replay，masking 关）
     'base_v3_intent2.yaml': 3000,       # 意图跟随第二轮（新基点续训 + 黑名单/多样性/文言replay 修正）
+    'base_v3_intent3.yaml': 2500,       # 意图跟随第三轮（自然度修正：扩池+完整句过滤+背化守卫）
 }
 
 

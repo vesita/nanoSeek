@@ -21,8 +21,8 @@ cd "$(dirname "$0")/.." || exit 1
 #   默认值写死旧 run 的后果不是"少看几行日志"：
 #   新目录的归档 ckpt 不会被 prune（见第 49 行），**磁盘会被写满**。
 #   换 run 时**必须**同步改这两行；要巡检别的 run 就显式传参。
-OUT_DIR="${1:-out/base_v3_intent2}"
-LOG="${2:-out/base_v3_intent2_train.log}"
+OUT_DIR="${1:-out/base_v3_intent3}"
+LOG="${2:-out/base_v3_intent3_train.log}"
 SPARSE_EVERY="${3:-5000}"
 NEWEST_KEEP="${4:-2}"
 CONFIG_PAT="training/train.py"
