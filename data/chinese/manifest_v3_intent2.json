@@ -1,0 +1,146 @@
+{
+  "dataset": "chinese",
+  "created_at": "2026-09-20T10:01:02+08:00",
+  "prepare_args": {
+    "with_books": false,
+    "task_ratio": 1.0,
+    "insert_eos": true,
+    "pretrain": false,
+    "char_level": true,
+    "byte_level": false,
+    "val_all": true,
+    "val_ratio": 0.01,
+    "source_ratio": [],
+    "seed": 20260910,
+    "out_prefix": "v3_intent2",
+    "emit_offsets": true,
+    "source_dir": "data/chinese/stages/v3_intent2",
+    "argv": [
+      "data/chinese/prepare.py",
+      "--char-level",
+      "--val-all",
+      "--val-ratio",
+      "0.01",
+      "--seed",
+      "20260910",
+      "--source-dir",
+      "data/chinese/stages/v3_intent2",
+      "--out-prefix",
+      "v3_intent2",
+      "--emit-offsets"
+    ]
+  },
+  "tokenizer": {
+    "vocab_size": 8192,
+    "char_level": true,
+    "tokenizer_path": "char_tokenizer.json"
+  },
+  "counts": {
+    "train_samples": 6199,
+    "val_samples": 60,
+    "train_chars": 1030758,
+    "val_chars": 16505,
+    "train_tokens": 1014492,
+    "val_tokens": 16384
+  },
+  "source_files": [
+    {
+      "file": "intent_mined.txt",
+      "size_bytes": 336230,
+      "sha256": "2d5ab28236b1df9db04a9863a441025527db5b8fd276a56ba456bb59d9b49a2f",
+      "mtime": "2026-09-20T10:01:01"
+    },
+    {
+      "file": "intent_synth.txt",
+      "size_bytes": 26669,
+      "sha256": "7ba73ddb1fbc6fd2a4b4a5259902550cc3325731df0a659b81a9c7a211b01dfb",
+      "mtime": "2026-09-20T10:01:01"
+    },
+    {
+      "file": "replay_dlg.txt",
+      "size_bytes": 535044,
+      "sha256": "b3725156e7dd0ccf9dba88bbe0e68f275a1e76e46fd7aaa0e152e36e3f08775c",
+      "mtime": "2026-09-20T10:01:01"
+    },
+    {
+      "file": "replay_lang.txt",
+      "size_bytes": 1746532,
+      "sha256": "c92b313e8cc0644d4917e480b0b635a6a1ff56485a9d4047c743af2688393e1c",
+      "mtime": "2026-09-20T10:01:01"
+    }
+  ],
+  "source_breakdown": [
+    {
+      "file": "intent_mined.txt",
+      "size_bytes": 336230,
+      "blocks": 598,
+      "train_blocks": 593,
+      "val_blocks": 5,
+      "train_chars_raw": 180297,
+      "val_chars_raw": 1916,
+      "train_share": 0.180747,
+      "val_share": 0.118104
+    },
+    {
+      "file": "intent_synth.txt",
+      "size_bytes": 26669,
+      "blocks": 268,
+      "train_blocks": 266,
+      "val_blocks": 2,
+      "train_chars_raw": 8909,
+      "val_chars_raw": 60,
+      "train_share": 0.008931,
+      "val_share": 0.003698
+    },
+    {
+      "file": "replay_dlg.txt",
+      "size_bytes": 535044,
+      "blocks": 1761,
+      "train_blocks": 1744,
+      "val_blocks": 17,
+      "train_chars_raw": 183937,
+      "val_chars_raw": 905,
+      "train_share": 0.184396,
+      "val_share": 0.055785
+    },
+    {
+      "file": "replay_lang.txt",
+      "size_bytes": 1746532,
+      "blocks": 3632,
+      "train_blocks": 3596,
+      "val_blocks": 36,
+      "train_chars_raw": 624370,
+      "val_chars_raw": 13342,
+      "train_share": 0.625927,
+      "val_share": 0.822413
+    }
+  ],
+  "artifacts": {
+    "train_char_v3_intent2.bin": {
+      "size_bytes": 2028984,
+      "sha256": "70f11a0edc9b614ee6ea69e7497a0c6baaa40a97b7a5fd650869bb57f1e550bc"
+    },
+    "val_char_v3_intent2.bin": {
+      "size_bytes": 32768,
+      "sha256": "a5b46d6748914b946b000114c4abc6eb250bd317b9175d219230f92b76751d66"
+    },
+    "tokenizer.json": {
+      "size_bytes": 593448,
+      "sha256": "04ba03e90b6b0d2f7f23d5c1d5bb2e18bd58e2fb4c6b6538cc9fb87f7faf86b8"
+    },
+    "meta_char_v3_intent2.pkl": {
+      "size_bytes": 85,
+      "sha256": "a5e16acc691e0af348d520b8d006feb644820705d84ac6dba20f0daede380dd4"
+    },
+    "train_char_v3_intent2.off": {
+      "size_bytes": 49600,
+      "sha256": "338100a8f408f56b88c2d4a1eda9bc1a2220efa4543d20b24fd4c96c5b6ce78d",
+      "elements": 6200
+    },
+    "val_char_v3_intent2.off": {
+      "size_bytes": 488,
+      "sha256": "d27bdcb172a242fa1c9c1fa372879912fe760c31ba749e0721edb2db0f5b1c91",
+      "elements": 61
+    }
+  }
+}

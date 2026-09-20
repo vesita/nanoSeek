@@ -1,0 +1,49 @@
+# ============================================================================
+# v3 分段训练 · 意图跟随第二轮（v3_intent2，3k 步，从 v3_intent 基点继续）
+# ============================================================================
+# 用法：
+#     .venv/bin/python training/train.py configs/base_v3_intent2.yaml
+#
+# 依据：dev-notes/86 §5 下一轮修法，用户 2026-09-19 拍板「拿意图分析的结果作为新基点」。
+# 相对 v3_intent 的三处数据修正（build_intent_stage.py --stage-name v3_intent2 可复现）：
+#   ① IDENTITY_BLACKLIST 补 NexTalk/豆包/Kimi 等（86 验收发现模型自称 NexTalk）
+#   ② 合成池 prompt 每意图扩到 6~8 条（降模板记忆；合成 177→268 块）
+#   ③ replay 补西游记/水浒传各 100KB（修文言源 −0.6 级的租金）
+# 配方：起点=新基点；lr 减半到 5e-5（上一段 train loss 已压到 1.88，再高lr只会加深记忆）。
+#
+# 判据（启动前写死，事后不改；起点 = v3_intent 终态）：
+#   1. intent_probe 不回落：关键词 ≥ 14/28，且 §5.9 原文判读语义对 ≥ 10/28
+#      （上一段 17/28 关键词 / ≈9-10 语义；know2 0、掩码臂 4、对照臂与 B 段 5）
+#   2. v3_lang 全库 real 不劣于 5.1209 + 0.05，且四大名著逐源 Δ ≥ −0.1（文言租金应被 replay 顶回）
+#   3. 烟感器 wikipedia_cn / c4_zh 各自 +0.10 以内
+#   4. 自身 val：val_char_v3_intent2 相比起点应改善（上一段 +0.15 未过，本段 replay 占比更高）
+#   5. eval_multiturn 自开率 ≥ 5%（上一段 8%；不许回落到 0）且收尾率 ≥ 85%
+extends: base_v2.yaml
+
+# --- 1) 产物隔离（★ 铁律 12） ----------------------------------------------
+out_dir: out/base_v3_intent2
+
+# --- 2) 权重来源：用户拍板的新基点 -------------------------------------------
+init_from: out/base_v3_intent/last.pt
+
+# --- 3) 语料 + 打包（★ §5.10） ----------------------------------------------
+data_prefix: v3_intent2
+
+use_doc_packing: true
+pack_align: false
+use_loss_masking: false
+
+# --- 4) 学习率：5e-5 WSD（上一段已把 train loss 压到 1.88，低lr防继续加深记忆）-
+schedule: wsd
+stage: full
+learning_rate: 0.00005
+min_lr: 0.000005
+warmup_iters: 100
+stable_frac: 0.8
+
+# --- 5) 步数：bin ≈ 1.01M token，3000 步 ≈ 24 epoch（intent 部分约 11 遍）----
+max_iters: 3000
+lr_decay_iters: 3000
+
+# --- 6) 评估节律 -------------------------------------------------------------
+eval_interval: 500
