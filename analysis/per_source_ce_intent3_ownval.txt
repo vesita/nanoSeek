@@ -1,0 +1,31 @@
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+val=data/chinese/val_char_v3_intent3.bin (16,220 tok)  源=4  窗口/源=32  block=256  特殊id=2075
+  [对齐对照] 本 manifest 不含 v2 对照源名，改用其前 3 个源：['intent_mined.txt', 'intent_synth.txt', 'replay_dlg.txt']
+  [对齐对照] intent_mined.txt                   token/raw_chars = 1.0155
+  [对齐对照] intent_synth.txt                   token/raw_chars = 1.1149
+  [对齐对照] replay_dlg.txt                     token/raw_chars = 1.0751
+参数量：75.15M
+
+=== step 3000  (out/base_v3_intent2/last.pt) ===
+来源                                  组          real CE   top1%  shuf CE  unigram  real-uni   n_tok
+intent_mined.txt                    对话          2.2919   53.88   5.4047   6.7053   -4.4135   8,147
+intent_synth.txt                    对话          3.2802   40.60   5.7384   7.0862   -3.8059   8,097
+replay_dlg.txt                      对话          2.9302   43.28   5.6633   7.0681   -4.1378   8,114
+replay_lang.txt                     对话          3.0474   40.75   5.6623   6.9828   -3.9354   8,138
+参数量：75.15M
+
+=== step 2500  (out/base_v3_intent3/last.pt) ===
+来源                                  组          real CE   top1%  shuf CE  unigram  real-uni   n_tok
+intent_mined.txt                    对话          2.3960   52.45   5.5304   6.7053   -4.3094   8,147
+intent_synth.txt                    对话          3.3948   39.26   5.8886   7.0862   -3.6913   8,097
+replay_dlg.txt                      对话          3.0486   42.14   5.8211   7.0681   -4.0195   8,114
+replay_lang.txt                     对话          3.1693   39.67   5.8196   6.9828   -3.8135   8,138
+
+=== 分组汇总（token 加权）===
+   step         散文/语言        知识/长文           代码        数学/推理           对话
+   3000             -            -            -            -       2.8868
+   2500             -            -            -            -       3.0015
+
+=== 全库 token 加权（= 逐源明细的加权和，可与训练日志交叉核对）===
+  step   3000  real 2.8868   shuffled 5.6172   unigram 6.9603   n_tok 32,496
+  step   2500  real 3.0015   shuffled 5.7649   unigram 6.9603   n_tok 32,496
