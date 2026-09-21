@@ -316,6 +316,7 @@ V3_STAGE_STEPS = {
     'base_v3_intent.yaml': 3500,        # 意图跟随密集监督段（v3_intent + replay，masking 关）
     'base_v3_intent2.yaml': 3000,       # 意图跟随第二轮（新基点续训 + 黑名单/多样性/文言replay 修正）
     'base_v3_intent3.yaml': 2500,       # 意图跟随第三轮（自然度修正：扩池+完整句过滤+背化守卫）
+    'base_v3_intent4.yaml': 3000,       # 单变量实验：仅 replay 语料级身份清除（其余与 intent2 逐项相同）
 }
 
 

@@ -408,12 +408,27 @@ REPLAY_DLG = [('dailychat_dialogue.txt', 60_000), ('lccc_dialogue.txt', 50_000),
               ('belle_multiturn.txt', 60_000)]
 
 
-def head_blocks(path: str, limit: int) -> str:
-    """取文件前 limit 字节，截到最后一个块边界（空行）为止。"""
+def head_blocks(path: str, limit: int, drop_identity: bool = False) -> str:
+    """取文件前 limit 字节，截到最后一个块边界（空行）为止。
+
+    drop_identity：按块丢弃命中 IDENTITY_BLACKLIST 的"模型："行（86 §6：
+    黑名单只挡挖掘侧挡不住 replay —— NexTalk 自我介绍必须做**语料级清除**）。
+    """
     with open(path, encoding='utf-8') as f:
         txt = f.read(limit)
     cut = txt.rfind('\n\n')
-    return txt[:cut + 1] if cut > 0 else txt
+    txt = txt[:cut + 1] if cut > 0 else txt
+    if not drop_identity:
+        return txt
+    kept, dropped = [], 0
+    for blk in txt.split('\n\n'):
+        lines = [l for l in blk.split('\n') if l.strip()]
+        if any(BOT_RE.match(l) and IDENTITY_BLACKLIST.search(l) for l in lines):
+            dropped += 1
+            continue
+        kept.append(blk)
+    print(f'    身份清除: 丢 {dropped} 块 / 余 {len(kept)}')
+    return '\n\n'.join(kept)
 
 
 def build_stage(mined_txt: str, synth_txt: str, name: str = 'v3_intent'):
@@ -430,7 +445,7 @@ def build_stage(mined_txt: str, synth_txt: str, name: str = 'v3_intent'):
             if not os.path.exists(p):
                 print(f'  ⚠ replay 缺源跳过: {src}')
                 continue
-            parts.append(head_blocks(p, lim))
+            parts.append(head_blocks(p, lim, drop_identity=(group == 'replay_dlg.txt')))
         with open(os.path.join(stage, group), 'w', encoding='utf-8') as f:
             f.write('\n'.join(parts))
     for fn in sorted(os.listdir(stage)):
