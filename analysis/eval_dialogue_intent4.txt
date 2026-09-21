@@ -1,0 +1,18 @@
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+参数量：75.15M
+
+=== 评估 out/_eval_intent4 ===
+  avg_len=19.0 rep2=0.0215 rep3=0.0111 rep4=0.0 ws=0.0 d1=0.9443 d2=0.9892 turns=0.0 样式=none(给了 ab)
+  模型配置: mhc=False lse=False no_attn_layers=[] block_order=attn_ffn
+  [代表样本] prompt='A：你好\nB：'
+    → 你姓什么名字呀？
+
+
+======== 智能度对比汇总 ========
+模型                           |   len |   rep2 |   rep3 |   rep4 |    ws% |     d1 |     d2 | turns
+----------------------------------------------------------------------------------------------------
+out/_eval_intent4            |  19.0 | 0.0215 | 0.0111 |    0.0 |     0% | 0.9443 | 0.9892 |   0.0
+
+指标说明：repN=字符 n-gram 重复率(越低越好·重复坍缩) | ws%=空白占比(越低越好·loss骗低) | d1/d2=多样性(越高越好) | turns=对话轮次结构(越高越好·碎片拼贴反面)
+
+完整样本已写入 dev-notes/eval_dialogue_samples.json

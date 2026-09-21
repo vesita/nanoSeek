@@ -1,0 +1,27 @@
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+val=data/chinese/val_char_v3_intent4.bin (16,934 tok)  源=4  窗口/源=32  block=256  特殊id=2075
+  [对齐对照] 本 manifest 不含 v2 对照源名，改用其前 3 个源：['intent_mined.txt', 'intent_synth.txt', 'replay_dlg.txt']
+  [对齐对照] intent_mined.txt                   token/raw_chars = 1.0068
+  [对齐对照] intent_synth.txt                   token/raw_chars = 1.1000
+  [对齐对照] replay_dlg.txt                     token/raw_chars = 1.0480
+参数量：75.15M
+
+=== step 3000  (out/base_v3_intent2/last.pt) ===
+来源                                  组          real CE   top1%  shuf CE  unigram  real-uni   n_tok
+intent_mined.txt                    对话          2.5954   48.42   5.5416   6.8556   -4.2602   8,119
+replay_dlg.txt                      对话          2.6814   47.56   5.6070   6.9476   -4.2661   8,127
+replay_lang.txt                     对话          3.0627   41.11   5.7070   7.0266   -3.9639   8,108
+参数量：75.15M
+
+=== step 3000  (out/base_v3_intent4/last.pt) ===
+来源                                  组          real CE   top1%  shuf CE  unigram  real-uni   n_tok
+intent_mined.txt                    对话          2.8141   46.16   5.8253   6.8556   -4.0414   8,119
+replay_dlg.txt                      对话          2.9019   45.16   5.8905   6.9476   -4.0456   8,127
+replay_lang.txt                     对话          3.2995   38.48   6.0069   7.0266   -3.7271   8,108
+
+=== 分组汇总（token 加权）===
+   step         散文/语言        知识/长文           代码        数学/推理           对话
+   3000             -            -            -            -       3.0050
+
+=== 全库 token 加权（= 逐源明细的加权和，可与训练日志交叉核对）===
+  step   3000  real 3.0050   shuffled 5.9076   unigram 6.9432   n_tok 24,354
