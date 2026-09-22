@@ -102,6 +102,10 @@ class GPTConfig:
     # mHC 超连接：4 流并行残差（X_{l+1} = B·X_l + C·F(A·X_l)，A/C sigmoid 有界、B 双重随机）。
     use_mhc: bool = False
     hc_mult: int = 4            # 残差流数（V4 原版 = 4）
+    # 收敛-发散头（用户构型 2026-09-19）：主干之后接一个权重共享 Block 循环 cd_iters 次，
+    # 每圈一个独立线性适配器（破对称 + 防恒等退化）；发散端复用 ln_f/lm_head。
+    use_cd: bool = False
+    cd_iters: int = 6           # 循环圈数（有效深度 = n_layer + cd_iters）
     # Lightning Indexer：学习型块选择替代 CSA 的 raw top-k（256 上下文收益有限，先搭框架）。
     use_lightning_indexer: bool = False
     # Hash 路由：前 num_hash_layers 层用 hash(token_id)%n_experts 确定性分配（0 = 禁用）。

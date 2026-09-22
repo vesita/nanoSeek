@@ -190,6 +190,8 @@ sample_boundary_reset = True          # 样本边界重置与因果阻断：遇�
 use_attn_sink = True         # Attention Sinks：打破重复坍缩的必要条件（三重 A/B 验证）
 use_mhc = False              # mHC 超连接：4 流并行残差
 hc_mult = 4                  # mHC 残差流数（V4 原版 = 4）
+use_cd = False               # 收敛-发散头：主干后权重共享 Block 循环（用户构型 2026-09-19）
+cd_iters = 6                 # 收敛循环圈数
 use_lightning_indexer = False   # 学习型块选择替代 CSA raw top-k
 num_hash_layers = 0          # 前 N 层用 hash 路由（0 = 禁用）
 block_order = "attn_ffn"     # 计算图重排：块内子层顺序（attn_ffn | ffn_attn）
@@ -601,6 +603,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_csa_fused_qkv=use_csa_fused_qkv, use_csa_bmm=use_csa_bmm,
                   use_attn_sink=use_attn_sink,
                   use_mhc=use_mhc, hc_mult=hc_mult,
+                  use_cd=use_cd, cd_iters=cd_iters,
                   use_lightning_indexer=use_lightning_indexer, num_hash_layers=num_hash_layers,
                   block_order=block_order, no_attn_layers=no_attn_layers,
                   n_memory_tokens=n_memory_tokens,
@@ -637,7 +640,7 @@ def _build_model_from_checkpoint(checkpoint):
               'use_kv_memory', 'kv_memory_latent', 'kv_memory_chunk', 'kv_memory_checkpoint',
               'kv_memory_complement_gate', 'kv_memory_layers', 'kv_memory_block', 'kv_memory_delta',
               'kv_memory_output_gate', 'sample_boundary_reset',
-              'use_attn_sink', 'use_mhc', 'hc_mult',
+              'use_attn_sink', 'use_mhc', 'hc_mult', 'use_cd', 'cd_iters',
               'use_lightning_indexer', 'num_hash_layers', 'block_order', 'no_attn_layers',
               'n_memory_tokens', 'use_lse_residual', 'use_lse_gate',
                'use_qk_norm', 'z_loss_weight', 'factorized_emb_dim']:

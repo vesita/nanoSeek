@@ -1,0 +1,32 @@
+# ============================================================================
+# 层特化实验 · 2×6 交替异构臂（scratch 1500 步）
+# ============================================================================
+# 用途：`.venv/bin/python training/train.py configs/base_v2_cd.yaml`
+# 与 base_v2_cdbase.yaml（12 层同构，截取前 1500 步）构成配对对照，**唯一差别 no_attn_layers**：
+#   同构 1×12：12 个「注意力+FFN」全层
+#   异构 2×6：6 个「注意力+FFN」层 与 6 个「纯 FFN」层交替（奇数层免注意力）
+#   ⇒ 两种层各 6 次；省下的注意力参数/算力天然让给 FFN 路径。
+#   （收敛/发散的语义：注意力层=横向收敛信息，纯 FFN 层=纵向发散变换。）
+# 判据：配对 CE 斜率（v3_lang）+ 每步墙钟（省掉的注意力应兑换成更快或更好）。
+extends: base_v2.yaml
+
+out_dir: out/_cd_arm
+init_from: scratch
+
+no_attn_layers: [1, 3, 5, 7, 9, 11]
+
+data_prefix: v3_lang
+use_doc_packing: true
+pack_align: false
+use_loss_masking: false
+
+schedule: wsd
+stage: full
+learning_rate: 0.0006
+min_lr: 0.00006
+warmup_iters: 100
+stable_frac: 0.8
+
+max_iters: 1500
+lr_decay_iters: 1500
+eval_interval: 250

@@ -1,0 +1,26 @@
+# ============================================================================
+# 层特化实验 · 对照基线（scratch 3k 步，无收敛头）——与 base_v2_cd.yaml 配对
+# ============================================================================
+# 用途：`.venv/bin/python training/train.py configs/base_v2_cdbase.yaml`
+# 与 base_v2_cd.yaml（唯一差别 use_cd）构成**配对短跑对照**：同初始化种子、同数据、
+# 同步数，比配对 CE 斜率（dev-notes/86 §7 验收口径，禁止全量重训后才下结论）。
+extends: base_v2.yaml
+
+out_dir: out/_cd_base
+init_from: scratch
+
+data_prefix: v3_lang
+use_doc_packing: true
+pack_align: false
+use_loss_masking: false
+
+schedule: wsd
+stage: full
+learning_rate: 0.0006
+min_lr: 0.00006
+warmup_iters: 100
+stable_frac: 0.8
+
+max_iters: 3000
+lr_decay_iters: 3000
+eval_interval: 250

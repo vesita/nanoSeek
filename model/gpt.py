@@ -86,6 +86,15 @@ class GPT(nn.Module):
             if self.lm_head is not None:
                 self.mtp_head.weight = self.lm_head.weight
 
+        # 收敛-发散头（用户构型 2026-09-19）：权重共享 Block 循环 cd_iters 次。
+        # 每圈一个**独立随机初始化**的线性适配器（残差注入）：既破对称（86 §9 mHC 教训：
+        # 对称点可能是稳定鞍点），又避免零初始化把 Block 的梯度在第一步掐死。
+        if config.use_cd:
+            self.cd_block = Block(config, layer_idx=config.n_layer)
+            self.cd_adapters = nn.ModuleList([
+                nn.Linear(config.n_embd, config.n_embd, bias=False)
+                for _ in range(config.cd_iters)])
+
         # 初始化所有权重
         self.apply(self._init_weights)
         # 按照 GPT-2 论文，对残差投影应用特殊缩放的初始化
@@ -96,6 +105,12 @@ class GPT(nn.Module):
         # 同嵌入标准：N(0, 0.02)。K=16 时 16×80=1,280 参数，全参与训练。
         if config.n_memory_tokens > 0:
             torch.nn.init.normal_(self.memory_tokens, mean=0.0, std=0.02)
+        # CD 适配器：每圈 N(0, 0.02/sqrt(cd_iters))（残差注入口径，随圈数缩放）。
+        # _init_weights 已给过 N(0,0.02)，这里重缩放并确认各圈不同（破对称）。
+        if config.use_cd:
+            for t, ad in enumerate(self.cd_adapters):
+                torch.nn.init.normal_(ad.weight, mean=0.0,
+                                      std=0.02 / math.sqrt(config.cd_iters) * (0.5 + t / config.cd_iters))
 
         # 报告参数量
         print("参数量：%.2fM" % (self.get_num_params()/1e6,))
@@ -183,6 +198,15 @@ class GPT(nn.Module):
         if self.config.n_memory_tokens > 0:
             # 剥离记忆 token 前缀：它们不该喂给 lm_head/MTP（会生成无意义 token）
             x = x[:, self.config.n_memory_tokens:, :]
+        if self.config.use_cd:
+            # 收敛循环：同一 Block 权重共享走 cd_iters 圈，每圈经独立适配器残差注入。
+            # 诊断：每圈输出增量范数（相对残差流），供"圈是否在干活"审计（§9 空测试防线）。
+            self.last_cd_deltas = []
+            for ad in self.cd_adapters:
+                delta = ad(self.cd_block(x, rope_offset=rope_offset, is_eos=is_eos, sample_id=sample_id))
+                self.last_cd_deltas.append(delta.norm(dim=-1).mean().item()
+                                           if self.training or True else 0.0)
+                x = x + delta
         x = self.transformer.ln_f(x)
 
         if targets is not None:

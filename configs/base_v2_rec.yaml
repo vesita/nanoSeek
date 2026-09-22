@@ -1,0 +1,30 @@
+# ============================================================================
+# 层特化实验 · 收敛-发散递归臂（scratch 1500 步）
+# ============================================================================
+# 用户构型的"嵌套"实现：主干 ×12 后接 1 个权重共享 Block 循环 6 圈，
+# 每圈独立适配器残差注入（破对称）。与 cdbase/cd 两臂同数据同 lr 同种子。
+# NDB 内嵌检索已按审计结论（analysis/ngram_logitlens_intent2.txt：中间层无"表信息断层"）
+# 降优先级，本轮不接入。
+extends: base_v2.yaml
+
+out_dir: out/_cd_rec
+init_from: scratch
+
+use_cd: true
+cd_iters: 6
+
+data_prefix: v3_lang
+use_doc_packing: true
+pack_align: false
+use_loss_masking: false
+
+schedule: wsd
+stage: full
+learning_rate: 0.0006
+min_lr: 0.00006
+warmup_iters: 100
+stable_frac: 0.8
+
+max_iters: 1500
+lr_decay_iters: 1500
+eval_interval: 250
