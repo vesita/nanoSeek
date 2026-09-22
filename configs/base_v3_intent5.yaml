@@ -1,0 +1,48 @@
+# ============================================================================
+# v3 分段训练 · intent 线第五轮（v3_intent5）：**新能力轴 = 显式换话题**
+# ============================================================================
+# 用法：
+#     .venv/bin/python training/train.py configs/base_v3_intent5.yaml
+#
+# 依据：analysis/next_phase_options.md 选项 2 + dev-notes/86 §8（密集监督线收束，
+#   再提升靠新能力/新数据，不加轮次）。语料里"助手显式开新话题"供给 <0.4%（dev-notes/85），
+#   本段用 400 块合成多轮剧本直供这一维：<topic> 落在模型自己段首（loss 区间内）。
+#   数据 = v3_intent4 阶段（身份已清除，修法已验证）+ topic_switch.txt（400 块，见
+#   data/chinese/build_topic_stage.py，--dump 可复现抽样）。
+#
+# 判据（启动前写死，事后不改；起点 = v3_intent2 终态）：
+#   1. ★ 主判据：eval_multiturn 自开轮次率 ≥ 15%（基线 8%），收尾率 ≥ 85%，
+#      avg_len ∈ [20, 60]（intent3/intent4 教训：不许靠变短或漂移达标）
+#   2. intent_probe ≥ 18/28 且全文 NexTalk = 0（身份清除效果须保住）
+#   3. 通用尺子：v3_lang ≤ 4.62；烟感器 wiki/c4 ≤ +0.10
+#   4. 自身 val 上升 ≤ +0.10
+#   5. 读 5 个多轮样本原文：换话题处须有 <topic> 且衔接自然（§5.9）
+extends: base_v2.yaml
+
+# --- 1) 产物隔离（★ 铁律 12） ----------------------------------------------
+out_dir: out/base_v3_intent5
+
+# --- 2) 权重来源：intent 线最优 ---------------------------------------------
+init_from: out/base_v3_intent2/last.pt
+
+# --- 3) 语料 + 打包（★ §5.10） ----------------------------------------------
+data_prefix: v3_intent5
+
+use_doc_packing: true
+pack_align: false
+use_loss_masking: false
+
+# --- 4) 学习率：3e-5 WSD（小步数低速，压漂移） -------------------------------
+schedule: wsd
+stage: full
+learning_rate: 0.00003
+min_lr: 0.000003
+warmup_iters: 100
+stable_frac: 0.8
+
+# --- 5) 步数：bin ≈ 1.29M token，1500 步 ≈ 12 epoch（topic 块约 44 遍曝光）---
+max_iters: 1500
+lr_decay_iters: 1500
+
+# --- 6) 评估节律 -------------------------------------------------------------
+eval_interval: 500
