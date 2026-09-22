@@ -32,6 +32,14 @@ intent_probe 20/28；第三轮 intent3 一次改太多变量而退化，已按�
 `analysis/know2_stage_review.md`）+ **intent_probe 28 条**（对照数字：know2 0/28、掩码臂 4/28、
 对照臂与 B 段 5/28）+ 污染率 + 读生成原文。
 
+★ **层特化已试过并否决**（`dev-notes/87`，2026-09-20）：2×6 交替异构（`no_attn_layers` 奇数层）
+  与收敛-发散递归头（`use_cd`+`cd_iters`，代码保留可用）在**配对短跑 1500 步**下都没有增益：
+  rec 名义多降 1.4% 却付 +41% 墙钟/+9.9% 参数；2×6 +17% 墙钟/+13% 参数换来略差的 loss。
+  循环诊断确认"圈在干活"（每圈改变隐藏态 10~30%）⇒ 不是 bug，是拓扑不划算。
+  ★ 教训：`no_attn_layers` 的"等参数"注释是**标准注意力口径**，在 MLA 下净增 13% 参数 ——
+  改架构前先实测参数量。NDB 旁路（中层查表启发）经 logit-lens 审计**无中层断层**，
+  降优先级（`scripts/ngram_logitlens.py`）。
+
 **已定案、别再翻案**（证据在 analysis/ 与 dev-notes/）：
 - 站 1 人格段配方（小语料 ~86k token、高 lr、无 replay、~85 epoch）会造成灾难性遗忘；
   再跑人格/小语料段必须 **低 lr + 少 epoch + 通用 replay**。
@@ -257,6 +265,7 @@ loss masking 让 88% 语料白读；pack_align=True 让 67~73% token 永远采�
 | 语料清洗 | `data/chinese/clean_corpus.py`（默认 dry-run；别自己拍阈值）；独立验收 `verify_clean_corpus.py --selftest` |
 | 外部数据导入 | `data/chinese/import_external.py`（六种格式 + selftest）|
 | 分阶段切语料 + 建 bin | `data/chinese/build_stages.py`（`--extra` 默认 `[]`，新源必须显式给，否则静默漏掉；`--build` 后自动跑终止符位置验收；改文本层逻辑后必须重建 bin）|
+| **层特化 / 架构短跑** | 基线锚点 `out/_cd_base`（v3_lang 从零 1500 步）；配置 `configs/base_v2_{cdbase,cd,rec}.yaml`；循环诊断 `scripts/cd_loop_probe.py`；NDB 旁路审计 `scripts/ngram_logitlens.py`（★ K≥3 在 8192 词表命中率<0.4%，只能用 K=2）|
 | **意图跟随语料** | `data/chinese/build_intent_stage.py`（挖掘+合成+replay 一体；`--dump N` 抽样供 §5.9 判读；`--selftest`；`--stage` 产出 `stages/v3_intent/`）|
 | 样本打包 | `training/packing.py` + `--use_doc_packing`（必配 `pack_align=false`，§5.10）|
 
