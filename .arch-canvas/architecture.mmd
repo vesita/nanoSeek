@@ -1,0 +1,82 @@
+%% arch-canvas —— 由「架构画布」面板与 AI 共同维护（`%%!` 开头的是格式说明，不是图的内容）
+%%! @summary <一句话> 这张图讲的是什么 —— 会随每一步注入给 AI
+%%! @pos <节点id> <x> <y> 是画布坐标注释，@link <节点id> <图名> 是下钻到另一张图
+%%! @file <节点id> <路径> 是这个节点对应的源码文件（可带 #符号），一个节点可多条
+%%! 以上对 Mermaid 渲染都无任何影响，可忽略或手改
+%% @summary "nanoSeek-75M 模型框架：char-level Transformer 主干（MoE+MLA）+ 模型门控的 NDB 外挂"
+%% @pos tin 135 38
+%% @pos emb 135 150
+%% @pos lmh 162 420
+%% @pos ng 1166 358
+%% @pos gate 1166 150
+%% @pos wgate 1166 562
+%% @pos opt -235 262
+%% @pos pack -235 38
+%% @pos loss -224 420
+%% @pos attn 569 334
+%% @pos rope 569 231
+%% @pos moe 569 420
+%% @pos ln 569 150
+%% @pos n16 863 150
+%% @pos n14 569 562
+%% @pos n15 769 562
+%% @pos risk1 863 -66
+%% @pos risk2 1230 -14
+%% @pos risk3 1404 56
+flowchart TD
+  subgraph io["输入 / 输出"]
+    tin["字符输入（中文按字切）<br/>词表 8192 · 含机制符 &amp;lt;eos&amp;gt; &amp;lt;cont&amp;gt; &amp;lt;resp&amp;gt; &amp;lt;topic&amp;gt;"]
+    emb["Token Embedding 512 维<br/>与 lm_head 权重绑定（weight tying）"]
+    lmh["lm_head → 下一个字符分布<br/>75.15M 参数 · 每 token ≈3.4s/步（8G gfx1030）"]
+  end
+  subgraph ndb["NDB 外挂（no_grad · 不进 checkpoint）"]
+    ng["n-gram 表（在线累积）<br/>级数 8 · 槽位 2^28 · top_k 1"]
+    gate["读门控 g = σ(W·[h;槽统计])<br/>p = (1−g)·p_model + g·p_ngram"]
+    wgate["写权重 w = σ(W·h)<br/>observe 加权累积表（无梯度）"]
+  end
+  subgraph spec["层特化候选（讨论中 · 每轮单变量）"]
+  end
+  subgraph train["训练配方"]
+    opt["优化器：Muon（主体）+ AdamW（嵌入/门控）<br/>lr WSD 衰减 · 梯度累积"]
+    pack["数据：doc packing（块对角注意力掩码）<br/>★ pack_align=false：全域随机窗口，覆盖 ≈100%"]
+    loss["Loss：全 token 交叉熵<br/>（masking 只在 persona/eos_line 两处窄例外）"]
+  end
+  subgraph trunk["Transformer 主干 × 12 层"]
+    attn["MLA 注意力<br/>原理：KV 压缩到 latent（rank 64）<br/>省显存的大头"]
+    rope["RoPE 旋转位置编码"]
+    moe["MoE 前馈（SwiGLU, clamp 10）<br/>原理：4 专家选 2 · 辅助均衡 0.01<br/>同参数量下宽一档容量"]
+    ln["Pre-LayerNorm 残差流"]
+  end
+  subgraph 发散层["发散层"]
+    n16["层3"]
+  end
+  subgraph 收敛层["收敛层"]
+    n14["层1"]
+    n15["层2"]
+  end
+  risk1(["风险：mHC 式对称鞍点｜已验证：循环在干活（每圈改动隐藏态 10~30%、圈间余弦 0.04~0.11）——86 §9 的风险不成立"])
+  risk2(["代价核算：NDB 查表 ×6/步｜已量：递归头 +41% 墙钟 / +9.9% 参数（3.66→5.17 s/step）"])
+  risk3(["前置审计（零训练）：logit-lens 对齐 n-gram 表｜结论：层 0→11 一致率 3%→33.8% 平滑上升，**无中层断层** ⇒ 内嵌检索降优先级"])
+  verdict(["短跑结论（dev-notes/87）｜意图：给这版构型一个可判的答案｜原理：配对 1500 步（v3_lang，同种子/lr/数据）：1×12 基线 −4.2305 nats、2×6 异构 −4.2206、递归头 −4.2915；差值 ≤1.4% 在单 seed 无法区分，而同墙钟下基线最优 ⇒ 本版拓扑暂不采用，瓶颈回到数据侧"])
+  tin --> emb
+  emb --> ln
+  ln --> rope
+  rope --> attn
+  attn --> moe
+  moe -->|"最终隐状态 h"| lmh
+  wgate -.->|"加权写入"| ng
+  ng -.->|"槽统计量"| gate
+  pack --> tin
+  loss --> lmh
+  moe --> n14
+  n14 --> n15
+  n15 -->|"*6"| n16
+  n16 --> ln
+  n15 -->|"检索"| wgate
+  gate -->|"启发"| n16
+  n15 -.->|"价值点：NDB 从输出混合器变成内部工作记忆（全新假设，值得便宜验证）"| n14
+  n16 -.-> risk1
+  n16 -.-> risk2
+  n16 -.-> risk3
+  n15 -.-> verdict
+  n16 -.-> verdict
